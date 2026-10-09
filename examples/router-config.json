@@ -1,0 +1,26 @@
+{
+	"providers": {
+		"subscription": {
+			"base_url": "https://chatgpt.com/backend-api/codex",
+			"auth": "passthrough"
+		},
+		"inference": {
+			"base_url": "http://localhost:30000/v1",
+			"auth": "none",
+			"catalog_file": "codex-model-catalog.json"
+		}
+	},
+	"routes": [
+		{
+			"method": "GET",
+			"path": "/models",
+			"action": "catalog",
+			"provider": "subscription"
+		},
+		{
+			"path_prefix": "/responses",
+			"action": "model",
+			"provider": "subscription"
+		}
+	]
+}

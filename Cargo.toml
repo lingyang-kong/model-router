@@ -1,0 +1,30 @@
+[package]
+name = "model-router"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+async-compression = { version = "0.4.50", features = ["brotli", "gzip", "tokio", "zlib", "zstd"] }
+axum = "0.8.9"
+futures-util = "0.3.34"
+http-body = "1.1.0"
+http-body-util = "0.1.5"
+hyper = { version = "1.12.0", features = ["server"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+indexmap = "2.14.2"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sync_wrapper = "1.0.2"
+tokio = { version = "1.53.2", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7.19", features = ["io"] }
+url = { version = "2.5.8", features = ["serde"] }
+
+[dev-dependencies]
+axum = { version = "0.8.9", features = ["ws"] }
+futures-util = { version = "0.3.34", features = ["sink"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["gzip", "json", "stream"] }
+tempfile = "3.27.0"
+tokio-tungstenite = { version = "0.30.0", features = ["rustls-tls-webpki-roots"] }
