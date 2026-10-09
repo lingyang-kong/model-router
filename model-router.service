@@ -1,0 +1,14 @@
+[Unit]
+Description=Model router
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+WorkingDirectory=/srv/shared/model-router
+Environment=MODEL_ROUTER_CONFIG=examples/router-config.json
+ExecStart=/srv/shared/model-router/target/release/model-router
+Restart=always
+RestartSec=20s
+
+[Install]
+WantedBy=multi-user.target
