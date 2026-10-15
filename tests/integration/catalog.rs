@@ -8,6 +8,95 @@ use tokio::io::{AsyncReadExt, BufReader};
 use crate::common::*;
 
 #[tokio::test]
+async fn hidden_models_remain_routable_and_cannot_mask_ownership_conflicts() {
+    for format in ["codex", "openai", "anthropic"] {
+        let fixture = Fixture::new().await;
+        let (array, id) = if format == "codex" {
+            ("models", "slug")
+        } else {
+            ("data", "id")
+        };
+        *fixture.live.models.lock().unwrap() =
+            vec![json!({id: "visible-live"}), json!({id: "hidden-live"})];
+        std::fs::write(
+            fixture.root.path().join("models.json"),
+            json!({array: [{id: "visible-manual"}, {id: "hidden-manual"}]}).to_string(),
+        )
+        .unwrap();
+        let config = parse_config(
+            &json!({"providers": {
+                "live": {
+                    "base_url": fixture._live_server.url, "auth": "none",
+                    "hidden_models": ["hidden-{live,manual}", "visible-manual"]
+                },
+                "manual": {
+                    "base_url": fixture._manual_server.url, "auth": "none",
+                    "catalog": {"file": "models.json", "format": format},
+                    "hidden_models": ["h?dden-[mn]*", "visible-live"]
+                }
+            }, "routes": [
+                {"path": "/models", "action": "catalog", "format": format, "provider": "live"},
+                {"action": "model"}
+            ]})
+            .to_string(),
+            fixture.root.path(),
+        )
+        .unwrap();
+        let gateway = serve(router(config).unwrap()).await;
+        let catalog = || {
+            let request = fixture.client.get(gateway.url.clone() + "/models");
+            if format == "codex" {
+                request
+            } else {
+                request.header("x-catalog-data", "1")
+            }
+        };
+        let post = |model: &str| {
+            fixture
+                .client
+                .post(gateway.url.clone() + "/responses")
+                .json(&json!({"model": model}))
+        };
+        // A manually configured hidden model works before the first refresh.
+        assert_eq!(
+            post("hidden-manual").send().await.unwrap().status(),
+            StatusCode::OK
+        );
+        let document: Value = catalog().send().await.unwrap().json().await.unwrap();
+        assert_eq!(
+            document[array],
+            json!([{id: "visible-live"}, {id: "visible-manual"}])
+        );
+        if format != "codex" {
+            assert_eq!(document["extensions"], json!({"opaque": [1, 2]}));
+        }
+        for (model, provider) in [("hidden-live", "service-a"), ("hidden-manual", "service-b")] {
+            let response = post(model).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let response: Value = response.json().await.unwrap();
+            assert_eq!(response["provider"], provider);
+            assert_eq!(response["body"], json!({"model": model}).to_string());
+        }
+        *fixture.live.models.lock().unwrap() = vec![
+            json!({id: "uncommitted-live"}),
+            json!({id: "hidden-manual"}),
+        ];
+        assert_eq!(
+            catalog().send().await.unwrap().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            post("uncommitted-live").send().await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            post("hidden-live").send().await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+}
+
+#[tokio::test]
 async fn catalog_responses_extend_routing_without_reading_harness_files() {
     let fixture = Fixture::new().await;
     let cache = fixture.root.path().join("models_cache.json");

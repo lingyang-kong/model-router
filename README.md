@@ -62,6 +62,10 @@ catalog = { file = "codex-model-catalog.json", format = "codex" }
 
 Supply the client's required metadata. Only matching formats are merged; all manual IDs remain routable. Restart after manual edits.
 
+Set `hidden_models = ["gpt-{5.6-*,6-sol}"]` on a provider to omit matching IDs from merged catalogs. Patterns use [globset syntax](https://docs.rs/globset/0.4.20/globset/): `*`, `?`, character classes such as `[0-9]` and `[!0-9]`, and brace alternatives such as `{sol,astra}` or `{,-preview}`. Backslashes escape metacharacters; use TOML literal strings such as `'model-\*'` to match a literal `*`.
+
+Patterns match whole IDs case-sensitively, and `*` continues to match `/`. They are compiled once at startup; malformed patterns reject the configuration. Bash sequence expansion such as `{1..3}` and gitignore-style `!pattern` exceptions are not supported. Hidden models remain directly routable and still participate in ownership checks; this is a model-list preference, not access control. Forwarded catalogs are unchanged.
+
 Catalog rules share one live provider, which cannot also have a manual catalog. Refreshes learn new IDs; missing IDs remain routable until restart. Conflicting ownership rejects the whole refresh. The router never reads client cache files. It preserves catalog envelopes and pagination fields, so use a complete catalog endpoint.
 
 `x-router-client: codex` enables Codex's v1 metadata adjustment and WebSocket hint parser. Omit it for other clients. Unknown or conflicting markers and client/format mismatches are rejected.
@@ -86,6 +90,8 @@ sudo systemctl start model-router
 SIGINT and SIGTERM drain in-flight requests before shutdown.
 
 ## Development
+
+See the [feature plan](docs/roadmap.md) for discovery, aliases, and optional client compatibility work.
 
 ```sh
 cargo fmt --check

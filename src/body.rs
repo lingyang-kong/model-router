@@ -23,8 +23,7 @@ pub(crate) fn request_model(bytes: &[u8]) -> RouterResult<Option<String>> {
     if bytes.is_empty() {
         return Ok(None);
     }
-    let selector: ModelSelector =
-        serde_json::from_slice(bytes).map_err(|error| Error::bad_request(error.to_string()))?;
+    let selector: ModelSelector = serde_json::from_slice(bytes).map_err(Error::bad_request)?;
     if selector.model.as_deref() == Some("") {
         return Err(Error::bad_request("The model must be a nonempty string"));
     }
@@ -35,16 +34,13 @@ pub(crate) async fn inspect_body(
     body: Body,
     headers: &HeaderMap,
 ) -> RouterResult<(Option<String>, reqwest::Body)> {
-    let collected = body
-        .collect()
-        .await
-        .map_err(|error| Error::bad_request(error.to_string()))?;
+    let collected = body.collect().await.map_err(Error::bad_request)?;
     let trailers = collected.trailers().cloned();
     let bytes = collected.to_bytes();
     let model = if headers.contains_key("content-encoding") {
         let decoded = decode_body(std::io::Cursor::new(&bytes), headers)
             .await
-            .map_err(|error| Error::bad_request(error.to_string()))?;
+            .map_err(Error::bad_request)?;
         request_model(&decoded)?
     } else {
         request_model(&bytes)?

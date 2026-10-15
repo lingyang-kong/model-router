@@ -7,6 +7,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Uri};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Deserializer, de::Error as _};
 use url::{Host, Url};
 
@@ -38,6 +39,8 @@ pub(crate) struct Provider {
     #[serde(flatten)]
     auth: AuthMode,
     pub catalog: Option<ManualCatalog>,
+    #[serde(default, deserialize_with = "deserialize_hidden_models")]
+    pub hidden_models: GlobSet,
     #[serde(default, deserialize_with = "deserialize_static_headers")]
     http_headers: Vec<(HeaderName, HeaderValue)>,
     #[serde(default, deserialize_with = "deserialize_headers")]
@@ -77,6 +80,24 @@ pub(crate) enum RouteAction {
         provider: String,
         format: CatalogFormat,
     },
+}
+
+fn deserialize_hidden_models<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<GlobSet, D::Error> {
+    let invalid =
+        |error: globset::Error| D::Error::custom(format!("Invalid hidden_models: {error}"));
+    let mut builder = GlobSetBuilder::new();
+    for pattern in Vec::<String>::deserialize(deserializer)? {
+        builder.add(
+            GlobBuilder::new(&pattern)
+                .backslash_escape(true)
+                .empty_alternates(true)
+                .build()
+                .map_err(invalid)?,
+        );
+    }
+    builder.build().map_err(invalid)
 }
 
 fn deserialize_method<'de, D: Deserializer<'de>>(
@@ -376,5 +397,77 @@ pub(crate) fn sanitize_headers(headers: &mut HeaderMap) {
         "proxy-connection",
     ] {
         headers.remove(name);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_models_compile_globs_with_alternatives_and_escapes() {
+        let config = Config::from_toml(
+            r#"
+            [providers.test]
+            base_url = "http://localhost:30000"
+            auth = "none"
+            hidden_models = [
+                "gpt-{5.6-*,6-sol}", "vendor/model-?", "variant-[0-2]",
+                "letter-[!0-9]", "model{,-preview}", 'literal-\*',
+                "nested-{a,{b,c}}", "模型/*雪"
+            ]
+            [[routes]]
+            action = "forward"
+            provider = "test"
+            "#,
+            Path::new("."),
+        )
+        .unwrap();
+        let patterns = &config.providers["test"].hidden_models;
+        for (id, expected) in [
+            ("gpt-5.6-sol", true),
+            ("gpt-5.6-", true),
+            ("gpt-5.6-vendor/model", true),
+            ("prefix-gpt-5.6-sol", false),
+            ("gpt-6-sol", true),
+            ("gpt-6-sol-next", false),
+            ("GPT-6-sol", false),
+            ("vendor/model-a", true),
+            ("vendor/model-ab", false),
+            ("variant-2", true),
+            ("variant-3", false),
+            ("letter-x", true),
+            ("letter-2", false),
+            ("model", true),
+            ("model-preview", true),
+            ("model-other", false),
+            ("literal-*", true),
+            ("literal-x", false),
+            ("nested-c", true),
+            ("nested-d", false),
+            ("模型/小雪", true),
+        ] {
+            assert_eq!(patterns.is_match(id), expected, "{id}");
+        }
+    }
+
+    #[test]
+    fn malformed_hidden_model_patterns_fail_configuration_loading() {
+        for pattern in ["[", "[z-a]", "model-{a,b", "model-}", "model-\\"] {
+            let text = format!(
+                r#"
+                [providers.test]
+                base_url = "http://localhost:30000"
+                auth = "none"
+                hidden_models = [{}]
+                [[routes]]
+                action = "forward"
+                provider = "test"
+                "#,
+                toml::Value::String(pattern.to_owned())
+            );
+            let error = Config::from_toml(&text, Path::new(".")).err().unwrap();
+            assert!(format!("{error:#}").contains("Invalid hidden_models"));
+        }
     }
 }
