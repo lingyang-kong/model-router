@@ -4,7 +4,7 @@ Use GPT through your ChatGPT subscription and custom models through Responses-co
 
 ## Setup
 
-1. Adapt [router-config.toml](../examples/router-config.toml) and the [model catalog](../examples/codex-model-catalog.json) to your upstream and model. The supplied example connects ChatGPT and Qwen served by SGLang at `http://localhost:30000/v1`.
+1. Adapt [router-config.toml](../examples/router-config.toml) to your upstream and model. The supplied example discovers Qwen models from SGLang's OpenAI-compatible `http://localhost:30000/v1/models` endpoint and inherits a full model entry from the official ChatGPT catalog.
 2. [Start the router](../README.md#run).
 3. Merge the following into `~/.codex/config.toml`. Put `model_provider` before any tables and merge existing tables rather than duplicating them.
 
@@ -35,30 +35,19 @@ Tested with Codex 0.162.1 and the example Qwen deployment:
 - Keep request compression disabled as shown above. The client header selects v1 catalog settings for both parent and worker models; remove any configuration or launch option that forces v2.
 - Start a new Codex session after switching to v1. Restart the router and Codex after configuration or catalog edits; rebuild the router after code changes.
 
-## Qwen context handoffs
+## Model metadata
 
-The example Qwen catalog enables Codex 0.162.1's model-owned `model_messages.token_budget` mode. Fresh Qwen workers are instructed to return a final handoff when their working context budget is exhausted. The parent agent or user decides whether to start a fresh worker with that summary. GPT keeps its provider's remote compaction. Leave `features.token_budget` unset in client configuration, since an explicit setting overrides model-owned activation. Spawn Qwen workers without inherited history (`fork_turns = "none"`); full-history forks retain the parent's activation.
+The example puts `name`, `description`, and `reasoning_levels` under shared provider model settings. The running SGLang `/models` response does not advertise reasoning choices, so the list remains explicit. Optional `reasoning_level` replaces the inherited default; when omitted, the referenced model's default is kept. The Codex adapter translates these shared names to Codex's catalog fields. Metadata values are not semantically validated.
 
-The reminder and fallback adapt Codex's token-budget prompts from the cached GPT model catalog. Both preserve the context-window reminder wrapper and request the goal, decisions, progress, learnings, next steps, unresolved requests, and important actions/tool calls. The reminder reports the remaining budget; the fallback declares exhaustion, says not to continue the task, requests the handoff now, and prohibits tool calls. Notes storage, window/item references, and reset instructions are replaced with returning the summary as a final response that explains the context limit. Hosted Notes/History integration is disabled. `guidance_message` only asks a worker that has unexpectedly been reset to report the reset and request restoration of its task context.
+The example's `extends` reference copies the selected ChatGPT catalog row in full, including its instructions and native Codex settings, then applies local shared settings and discovered SGLang context metadata. Its display name remains the local model's configured name. An omitted name falls back to the local native model ID. Catalog references resolve directly against the current refresh: the source provider and exact native model ID must be present, inherited entries are not followed recursively, and hidden donor rows remain usable. A missing donor or invalid reference makes the refresh fail while preserving the previous routes. Generic native-field overrides are deferred; discovered capabilities can adjust selected fields, and the first GPT model identity in inherited instructions is rewritten for the local model.
 
-For the supplied 262,144-token model with Codex's default context settings:
+Output in another format can inherit shared donor metadata while preserving local source fields. Full catalog copying preserves arbitrary fields and prompt subtrees. GPT token-budget behavior has History/Notes dependencies and should not be assumed portable from normal compaction support alone.
 
-| Event | Active context tokens |
-| --- | --- |
-| Reminder (`reminder_threshold_tokens = 6144`) | 229,785, approximately 87.7% |
-| Fallback prompt | 235,929, the 90% compaction threshold |
-| Forced-reset boundary with a 16,384-token fallback buffer | 249,036, capped by Codex's 95% usable-context ceiling |
-| Advertised model context limit | 262,144 |
-
-`reminder_threshold_tokens` is a remaining-token trigger, not a context limit: the reminder is due when at most that many tokens remain before the compaction threshold. Codex 0.162.1 requires a positive value; `0` is invalid. The 6,144-token reminder (6 × 1,024) and 16,384-token fallback buffer (16 × 1,024) match the fixed values in the cached GPT model metadata. The client copies these values rather than deriving them from context size; no rationale for their selection was found in the inspected code. For Qwen, the reminder is due at `235929 - 6144 = 229785` tokens. The nominal buffered boundary is `235929 + 16384 = 252313`, but the 95% ceiling caps it at 249,036, allowing 13,107 tokens after the 90% threshold.
-
-The buffer reserves space for the handoff after the normal compaction threshold. It cannot move the forced-reset boundary beyond the usable-context ceiling. Thresholds are checked between model steps, so a large response or tool result can cross more than one boundary. A normal final response ends the worker turn; token-budget mode skips post-turn summarization. Reusing an exhausted worker can trigger a pre-turn reset, so continue in a fresh worker.
-
-This is a prompt-directed handoff, not an enforced stop mode: Codex can still reset a worker that keeps running past the boundary. The post-reset instruction limits the intended behavior but cannot guarantee compliance. A guaranteed stop before reset requires client-side enforcement.
+On each catalog request, the SGLang example queries model info, server info, and OpenAPI; it also fetches any needed advertised tool-list endpoints as part of that refresh. Its image-detail enum excludes `original`, so discovery sets `supports_image_detail_original` to false. Native tool-search remains inherited when no reliable declaration is available; a `tool_search` schema enum is not proof of runtime support. Other unknown capabilities also inherit from Luna. When the projected Codex row enables Responses Lite and discovery has not declared support, the router probes `base_url + /responses` using `input` items `[{"type":"additional_tools","role":"developer","tools":[]},{"type":"__model_router_capability_check__"}]`, `max_output_tokens: 1`, and `store: false`. Only an HTTP 400 or 422 with an error message beginning `Unsupported Responses API input item type: 'additional_tools'` marks it unsupported; all other outcomes remain unknown. The sentinel aims to trigger validation, though a loosely validating server could generate up to one token. Optional discovery calls time out after three seconds. A fresh negative tool-inventory declaration suppresses tool-list queries for that request.
 
 ## Text compaction
 
-Codex 0.162.1 can summarize context through an ordinary model request, without a router compaction endpoint. To use this instead of the handoff mode, merge these settings into the client configuration and start a new session:
+The router does not emulate remote compaction yet. Codex 0.162.1 can instead summarize context through an ordinary model request. To use that option, merge these settings into the client configuration and start a new session:
 
 ```toml
 [features.token_budget]
@@ -68,7 +57,7 @@ enabled = false
 remote_compaction = "unsupported"
 ```
 
-This selects text compaction for **every model using the router provider**, including GPT. Leave these settings unset to keep the example's Qwen handoffs and GPT compaction behavior. Summaries are lossy; they do not reproduce OpenAI's encrypted compaction state. See the [feature plan](roadmap.md#context-compaction) for the per-provider fallback work.
+This selects text compaction for **every model using the router provider**, including GPT. Without it, the setup requests remote compaction, which the tested SGLang endpoint does not provide; Qwen can fail when its context fills. Summaries are lossy and do not reproduce OpenAI's encrypted compaction state. See the [feature plan](roadmap.md#context-compaction) for the per-provider fallback work.
 
 ## WebSocket routing
 

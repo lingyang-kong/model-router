@@ -609,7 +609,7 @@ async fn manual_catalog_metadata_reloads_only_after_restart() {
 }
 
 #[test]
-fn rejects_multiple_catalog_providers_and_invalid_provider_settings() {
+fn validates_providers_and_allows_independent_catalog_sources() {
     let root = tempfile::tempdir().unwrap();
     let provider = json!({"base_url":"http://localhost","auth":"none"});
     let cases = [
@@ -618,17 +618,21 @@ fn rejects_multiple_catalog_providers_and_invalid_provider_settings() {
         json!({"providers":{"api":{"base_url":"http://localhost","auth":"invalid"}},"routes":[{"action":"forward","provider":"api"}]}),
         json!({"providers":{"api":{"base_url":"http://localhost?version=1","auth":"none"}},"routes":[{"action":"forward","provider":"api"}]}),
         json!({"providers":{"api":{"base_url":"http://localhost","auth":"none","catalog_url":"models"}},"routes":[{"action":"forward","provider":"api"}]}),
-        json!({"providers":{"first":provider,"second":provider},"routes":[
-            {"path":"/models","action":"catalog","format":"codex","provider":"first"},
-            {"path":"/other","action":"catalog","format":"codex","provider":"second"}
-        ]}),
-        json!({"providers":{"api":{"base_url":"http://localhost","auth":"none","catalog":{"file":"models.json","format":"codex"}}},"routes":[{"action":"catalog","format":"codex","provider":"api"}]}),
     ];
     for document in cases {
         assert!(
             parse_config(&document.to_string(), root.path()).is_err(),
             "accepted invalid configuration: {document}"
         );
+    }
+    for document in [
+        json!({"providers":{"first":provider,"second":provider},"routes":[
+            {"path":"/models","action":"catalog","format":"codex","provider":"first"},
+            {"path":"/other","action":"catalog","format":"codex","provider":"second"}
+        ]}),
+        json!({"providers":{"api":{"base_url":"http://localhost","auth":"none","catalog":{"file":"models.json","format":"codex"}}},"routes":[{"action":"catalog","format":"codex","provider":"api"}]}),
+    ] {
+        assert!(parse_config(&document.to_string(), root.path()).is_ok());
     }
 }
 
@@ -899,8 +903,14 @@ async fn client_adapters_and_catalog_formats_are_isolated_on_the_same_endpoint()
             .to_string(),
         )
         .unwrap();
-        providers[format] = json!({"base_url":fixture._manual_server.url,"auth":"none",
+        let mut provider = json!({"base_url":fixture._manual_server.url,"auth":"none",
             "catalog":{"file":file,"format":format}});
+        if format != "codex" {
+            provider["models"] = json!({(format.to_owned() + "/manual"):{
+                "extends":{"provider":"live","model":"gpt-6-luna"}
+            }});
+        }
+        providers[format] = provider;
     }
     let config = parse_config(
         &json!({"providers":providers,"routes":[
@@ -924,6 +934,13 @@ async fn client_adapters_and_catalog_formats_are_isolated_on_the_same_endpoint()
         };
         let mut live = json!({(id_key):format!("live/{client}"),"multi_agent_version":"v2"});
         *fixture.live.models.lock().unwrap() = vec![live.clone()];
+        let mut donor = json!({(id_key):"gpt-6-luna", "display_name":"GPT-6 Luna"});
+        if format == "codex" {
+            donor["model_messages"] = json!({
+                "instructions_template":"You are Codex, an agent based on GPT-6.\nTest instructions."
+            });
+        }
+        fixture.live.models.lock().unwrap().push(donor.clone());
         let mut request = fixture
             .client
             .get(gateway.url.clone() + "/models")
@@ -942,7 +959,44 @@ async fn client_adapters_and_catalog_formats_are_isolated_on_the_same_endpoint()
             live["multi_agent_version"] = json!("v1");
             manual["multi_agent_version"] = json!("v1");
         }
-        assert_eq!(response[key], json!([live, manual]));
+        if format == "codex" {
+            let models = response[key].as_array().unwrap();
+            assert_eq!(models[0], live);
+            assert!(models.contains(&manual));
+            assert_eq!(models.len(), 5);
+            for converted in ["openai/manual", "anthropic/manual"] {
+                let model = models
+                    .iter()
+                    .find(|model| model["slug"] == converted)
+                    .unwrap();
+                assert_eq!(
+                    model["multi_agent_version"],
+                    if client == "codex" {
+                        json!("v1")
+                    } else {
+                        Value::Null
+                    }
+                );
+                assert!(
+                    model["model_messages"]["instructions_template"]
+                        .as_str()
+                        .unwrap()
+                        .contains("based on Manual, not GPT")
+                );
+            }
+        } else {
+            let models = response[key].as_array().unwrap();
+            assert_eq!(models[0], live);
+            assert!(models.contains(&donor));
+            assert!(models.contains(&manual));
+            let linked_other = if format == "openai" {
+                "anthropic/manual"
+            } else {
+                "openai/manual"
+            };
+            assert!(models.iter().any(|model| model[id_key] == linked_other));
+            assert_eq!(models.len(), 4);
+        }
     }
     // Manual entries excluded from a particular catalog still select their provider.
     for format in ["codex", "openai", "anthropic"] {
