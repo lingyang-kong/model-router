@@ -63,7 +63,7 @@ impl RouterState {
             &self.client
         };
         let request = client
-            .request(parts.method.clone(), provider.upstream_url(&parts.uri))
+            .request(parts.method.clone(), provider.upstream_url(&parts.uri)?)
             .headers(provider.request_headers(&parts.headers)?)
             .body(body)
             .build()
