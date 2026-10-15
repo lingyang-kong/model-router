@@ -25,8 +25,8 @@ impl Error {
             format!("No configured provider for model: {model}"),
         )
     }
-    pub fn bad_request(message: impl Into<String>) -> Self {
-        Self(StatusCode::BAD_REQUEST, message.into())
+    pub fn bad_request(error: impl std::fmt::Display) -> Self {
+        Self(StatusCode::BAD_REQUEST, error.to_string())
     }
     pub fn service_unavailable(message: impl Into<String>) -> Self {
         Self(StatusCode::SERVICE_UNAVAILABLE, message.into())

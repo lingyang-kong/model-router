@@ -32,7 +32,7 @@ Replace `vendor/model` with the exact model ID in your catalog. Keep your ChatGP
 
 Tested with Codex 0.162.1 and the example Qwen deployment:
 
-- Keep v2 and request compression disabled as shown above. The client header enables the router's v1 catalog settings for both parent and worker models; remove any launch option that forces v2.
+- Keep request compression disabled as shown above. The client header selects v1 catalog settings for both parent and worker models; remove any configuration or launch option that forces v2.
 - Start a new Codex session after switching to v1. Restart the router and Codex after configuration or catalog edits; rebuild the router after code changes.
 
 ## Qwen context handoffs
@@ -55,6 +55,20 @@ For the supplied 262,144-token model with Codex's default context settings:
 The buffer reserves space for the handoff after the normal compaction threshold. It cannot move the forced-reset boundary beyond the usable-context ceiling. Thresholds are checked between model steps, so a large response or tool result can cross more than one boundary. A normal final response ends the worker turn; token-budget mode skips post-turn summarization. Reusing an exhausted worker can trigger a pre-turn reset, so continue in a fresh worker.
 
 This is a prompt-directed handoff, not an enforced stop mode: Codex can still reset a worker that keeps running past the boundary. The post-reset instruction limits the intended behavior but cannot guarantee compliance. A guaranteed stop before reset requires client-side enforcement.
+
+## Text compaction
+
+Codex 0.162.1 can summarize context through an ordinary model request, without a router compaction endpoint. To use this instead of the handoff mode, merge these settings into the client configuration and start a new session:
+
+```toml
+[features.token_budget]
+enabled = false
+
+[model_providers.router.capabilities]
+remote_compaction = "unsupported"
+```
+
+This selects text compaction for **every model using the router provider**, including GPT. Leave these settings unset to keep the example's Qwen handoffs and GPT compaction behavior. Summaries are lossy; they do not reproduce OpenAI's encrypted compaction state. See the [feature plan](roadmap.md#context-compaction) for the per-provider fallback work.
 
 ## WebSocket routing
 

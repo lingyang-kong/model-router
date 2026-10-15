@@ -31,11 +31,7 @@ pub(crate) fn load_manual_models(config: &Config) -> Result<ModelRegistry> {
         let models = format.models(&mut catalog)?;
         for metadata in std::mem::take(models) {
             let id = format.model_id(&metadata)?.to_owned();
-            if let Some(previous) = registry.get(&id)
-                && !Arc::ptr_eq(&previous.provider, provider)
-            {
-                return Err(ownership_conflict(&id));
-            }
+            validate_ownership(&registry, &id, provider)?;
             registry.insert(
                 id,
                 ModelEntry {
@@ -61,11 +57,7 @@ impl RouterState {
             .collect::<Result<Vec<_>>>()?;
         let mut registry = self.models.write().await;
         for id in &ids {
-            if let Some(previous) = registry.get(*id)
-                && !Arc::ptr_eq(&previous.provider, provider)
-            {
-                return Err(ownership_conflict(id));
-            }
+            validate_ownership(&registry, id, provider)?;
         }
         for id in ids {
             if !registry.contains_key(id) {
@@ -91,10 +83,27 @@ impl RouterState {
                 })
                 .filter_map(|entry| entry.metadata.clone()),
         );
+        // Hiding affects discovery, not ownership checks or direct model routing.
+        models.retain(|model| {
+            format
+                .model_id(model)
+                .is_ok_and(|id| !registry[id].provider.hidden_models.is_match(id))
+        });
         Ok(())
     }
 }
 
-fn ownership_conflict(model: &str) -> Error {
-    Error::service_unavailable(format!("Model belongs to multiple providers: {model}"))
+fn validate_ownership(
+    registry: &ModelRegistry,
+    model: &str,
+    provider: &Arc<Provider>,
+) -> Result<()> {
+    if let Some(previous) = registry.get(model)
+        && !Arc::ptr_eq(&previous.provider, provider)
+    {
+        return Err(Error::service_unavailable(format!(
+            "Model belongs to multiple providers: {model}"
+        )));
+    }
+    Ok(())
 }
