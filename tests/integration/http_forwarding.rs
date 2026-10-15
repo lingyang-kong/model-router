@@ -13,7 +13,7 @@ use axum::{
     response::Response,
 };
 use futures_util::StreamExt;
-use model_router::{Config, router};
+use model_router::router;
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, BufReader},
@@ -57,7 +57,7 @@ async fn streams_request_bodies_larger_than_the_removed_router_cap() {
     }
     let backend = serve(Router::new().fallback(count)).await;
     let root = tempfile::tempdir().unwrap();
-    let config=Config::from_json(&json!({"providers":{"backend":{"base_url":backend.url,"auth":"none"}},"routes":[{"action":"forward","provider":"backend"}]}).to_string(),root.path()).unwrap();
+    let config=parse_config(&json!({"providers":{"backend":{"base_url":backend.url,"auth":"none"}},"routes":[{"action":"forward","provider":"backend"}]}).to_string(),root.path()).unwrap();
     let gateway = serve(router(config).unwrap()).await;
     let chunk = Bytes::from(vec![b'x'; 1024 * 1024]);
     let stream =
@@ -121,7 +121,7 @@ async fn ordinary_compressed_responses_are_forwarded_byte_for_byte() {
     }
     let backend = serve(Router::new().fallback(endpoint).with_state(encoded.clone())).await;
     let root = tempfile::tempdir().unwrap();
-    let config = Config::from_json(&json!({"providers":{"api":{"base_url":backend.url,"auth":"none"}},"routes":[{"action":"forward","provider":"api"}]}).to_string(),root.path()).unwrap();
+    let config = parse_config(&json!({"providers":{"api":{"base_url":backend.url,"auth":"none"}},"routes":[{"action":"forward","provider":"api"}]}).to_string(),root.path()).unwrap();
     let gateway = serve(router(config).unwrap()).await;
     let response = reqwest::Client::builder()
         .no_proxy()
@@ -148,7 +148,7 @@ async fn opaque_requests_forward_before_the_rest_of_the_body_arrives() {
     }
     let backend = serve(Router::new().fallback(receive).with_state(arrived.clone())).await;
     let root = tempfile::tempdir().unwrap();
-    let config = Config::from_json(&json!({"providers":{"backend":{"base_url":backend.url,"auth":"none"}},"routes":[{"headers":{"x-target":"backend"},"action":"forward","provider":"backend"}]}).to_string(),root.path()).unwrap();
+    let config = parse_config(&json!({"providers":{"backend":{"base_url":backend.url,"auth":"none"}},"routes":[{"headers":{"x-target":"backend"},"action":"forward","provider":"backend"}]}).to_string(),root.path()).unwrap();
     let gateway = serve(router(config).unwrap()).await;
     let first = Bytes::from_static(b"opaque-prefix|");
     let remaining = futures_util::stream::once(async move {
@@ -176,7 +176,7 @@ async fn opaque_requests_forward_before_the_rest_of_the_body_arrives() {
 }
 
 async fn gateway(upstream: &Server, routes: Value) -> Server {
-    let config = Config::from_json(
+    let config = parse_config(
         &json!({
             "providers": {"api": {"base_url": upstream.url, "auth": "none"}},
             "routes": routes,
@@ -365,7 +365,7 @@ async fn rewritten_catalog_drops_stale_integrity_and_trailer_declarations() {
     let upstream = serve(Router::new().fallback(catalog)).await;
     let gateway = gateway(
         &upstream,
-        json!([{"path": "/models", "action": "catalog", "provider": "api"}]),
+        json!([{"path": "/models", "action": "catalog", "format": "codex", "provider": "api"}]),
     )
     .await;
     let response = reqwest::Client::builder()

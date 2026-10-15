@@ -7,7 +7,7 @@ use axum::{
     response::Response,
 };
 use futures_util::{SinkExt, StreamExt};
-use model_router::{Config, router};
+use model_router::router;
 use serde_json::{Value, json};
 use tokio::{io::AsyncReadExt, net::TcpListener, sync::oneshot, time::timeout};
 use tokio_tungstenite::{
@@ -71,10 +71,13 @@ async fn catalog_refresh_does_not_change_a_websocket_destination() {
 #[tokio::test]
 async fn model_websockets_select_a_provider_from_handshake_hints() {
     let fixture = Fixture::new().await;
-    let config=Config::from_json(&json!({"providers":{
+    let config=parse_config(&json!({"providers":{
         "live":{"base_url":fixture._live_server.url,"auth":"none"},
-        "manual":{"base_url":fixture._manual_server.url,"auth":"none","catalog_file":"models.json"}
-    },"routes":[{"method":"GET","path":"/models","action":"catalog","provider":"live"},{"action":"model"}]}).to_string(),fixture.root.path()).unwrap();
+        "manual":{"base_url":fixture._manual_server.url,"auth":"none","catalog":{"file":"models.json","format":"codex"}}
+    },"routes":[
+        {"method":"GET","path":"/models","action":"catalog","format":"codex","provider":"live"},
+        {"action":"model"}
+    ]}).to_string(),fixture.root.path()).unwrap();
     let gateway = serve(router(config).unwrap()).await;
     fixture
         .client
@@ -89,6 +92,9 @@ async fn model_websockets_select_a_provider_from_handshake_hints() {
         (Some("model="), 400),
     ] {
         let mut request = url.clone().into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("x-router-client", "codex".parse().unwrap());
         if let Some(hint) = hint {
             request
                 .headers_mut()
@@ -99,7 +105,37 @@ async fn model_websockets_select_a_provider_from_handshake_hints() {
         };
         assert_eq!(response.status().as_u16(), expected_status);
     }
+    // Without a client marker, the Codex header is not interpreted.
     let mut request = url.clone().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("x-codex-routing-hint", "model=gpt-test".parse().unwrap());
+    let tungstenite::Error::Http(response) = connect_async(request).await.unwrap_err() else {
+        panic!("Expected missing generic model hint");
+    };
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    for (header, value) in [
+        ("x-model", "gpt-test"),
+        ("x-codex-routing-hint", "model=gpt-test"),
+    ] {
+        let mut request = url.clone().into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("x-router-client", "codex".parse().unwrap());
+        request.headers_mut().append(
+            "x-codex-routing-hint",
+            "model=publisher/model".parse().unwrap(),
+        );
+        request.headers_mut().append(header, value.parse().unwrap());
+        let tungstenite::Error::Http(response) = connect_async(request).await.unwrap_err() else {
+            panic!("Expected conflicting model hints");
+        };
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    let mut request = url.clone().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("x-router-client", "codex".parse().unwrap());
     request.headers_mut().insert(
         "x-codex-routing-hint",
         "model=publisher/model;tier=priority".parse().unwrap(),
@@ -143,6 +179,10 @@ async fn model_websockets_select_a_provider_from_handshake_hints() {
     request
         .headers_mut()
         .insert("x-model", "gpt-test".parse().unwrap());
+    request.headers_mut().insert(
+        "x-codex-routing-hint",
+        "model=publisher/model".parse().unwrap(),
+    );
     let (mut socket, _) = connect_async(request).await.unwrap();
     socket
         .send(tungstenite::Message::Text(r#"{"model":7}"#.into()))
@@ -224,8 +264,8 @@ async fn rejects_duplicate_manual_ownership_and_unknown_websocket_providers() {
     let config = test_config(
         json!({
             "live":{"base_url":fixture._live_server.url,"auth":"none"},
-            "first":{"base_url":fixture._manual_server.url,"auth":"none","catalog_file":"models.json"},
-            "second":{"base_url":server.url,"auth":"none","catalog_file":"another.json"}
+            "first":{"base_url":fixture._manual_server.url,"auth":"none","catalog":{"file":"models.json","format":"codex"}},
+            "second":{"base_url":server.url,"auth":"none","catalog":{"file":"another.json","format":"codex"}}
         }),
         None,
         Some("live"),
@@ -338,8 +378,8 @@ async fn forwarding_rule_relays_non_json_websocket_frames() {
     }
     let backend = serve(Router::new().fallback(upgrade)).await;
     let root = tempfile::tempdir().unwrap();
-    let config = Config::from_json(
-        &json!({"providers":{"frames":{"base_url":backend.url,"auth":"none","catalog_file":"missing.json"}},"routes":[{"action":"forward","provider":"frames"}]})
+    let config = parse_config(
+        &json!({"providers":{"frames":{"base_url":backend.url,"auth":"none","catalog":{"file":"missing.json","format":"codex"}}},"routes":[{"action":"forward","provider":"frames"}]})
             .to_string(),
         root.path(),
     )

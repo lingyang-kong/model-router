@@ -1,0 +1,20 @@
+[providers.chatgpt]
+base_url = "https://chatgpt.com/backend-api/codex"
+auth = "passthrough"
+
+[providers.sglang]
+base_url = "http://localhost:30000/v1"
+auth = "none"
+catalog = { file = "codex-model-catalog.json", format = "codex" }
+
+[[routes]]
+method = "GET"
+path = "/models"
+action = "catalog"
+provider = "chatgpt"
+format = "codex"
+
+[[routes]]
+path_prefix = "/responses"
+action = "model"
+provider = "chatgpt"

@@ -7,7 +7,16 @@ use serde_json::json;
 
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Debug)]
 pub(crate) struct Error(StatusCode, String);
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.1)
+    }
+}
+
+impl std::error::Error for Error {}
 
 impl Error {
     pub fn unknown_model(model: &str) -> Self {
@@ -27,10 +36,6 @@ impl Error {
     }
     pub fn not_found(message: impl Into<String>) -> Self {
         Self(StatusCode::NOT_FOUND, message.into())
-    }
-
-    pub fn details(&self) -> (StatusCode, &str) {
-        (self.0, &self.1)
     }
 }
 

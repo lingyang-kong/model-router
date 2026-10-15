@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::{
     body::Body,
     extract::Request,
@@ -7,8 +9,9 @@ use axum::{
 use hyper_util::rt::TokioIo;
 
 use crate::{
+    adapters::{Client, ModelHint},
     body::stream_body,
-    config::{RouteAction, header_has_token, sanitize_headers},
+    config::{Provider, RouteAction, header_has_token, sanitize_headers},
     error::{Error, Result},
     router::{RouterState, stream_response},
 };
@@ -17,23 +20,21 @@ pub(crate) async fn forward(
     state: &RouterState,
     mut request: Request,
     action: &RouteAction,
+    origin: Option<&Arc<Provider>>,
+    adapter: Option<Client>,
 ) -> Result<Response> {
-    let provider_name = match action {
-        RouteAction::Forward { provider } => provider.clone(),
-        RouteAction::Model { provider } => {
-            let model = model_hint(request.headers())?;
-            state
-                .resolve_provider(Some(model), provider.as_deref())
-                .await?
-        }
+    let model = match action {
+        RouteAction::Forward { .. } => None,
+        RouteAction::Model { .. } => Some(model_hint(request.headers(), adapter)?),
         RouteAction::Catalog { .. } => {
             return Err(Error::bad_request("Catalog actions use HTTP requests"));
         }
     };
+    let provider = state.resolve_provider(model, origin).await?;
     let mut downstream = hyper::upgrade::on(&mut request);
     let (parts, body) = request.into_parts();
     let (client, mut request) =
-        state.prepare_request(&provider_name, action.provider(), &parts, stream_body(body))?;
+        state.prepare_request(&provider, origin, &parts, stream_body(body))?;
     restore_upgrade_headers(&parts.headers, request.headers_mut());
     *request.version_mut() = Version::HTTP_11;
     let opening = client.execute(request);
@@ -71,37 +72,16 @@ fn restore_upgrade_headers(original: &HeaderMap, headers: &mut HeaderMap) {
     }
 }
 
-fn model_hint(headers: &HeaderMap) -> Result<&str> {
-    let mut model = None;
+fn model_hint(headers: &HeaderMap, client: Option<Client>) -> Result<&str> {
+    let mut model = ModelHint::default();
     for value in headers.get_all("x-model") {
-        // OpenCode
         let value = value
             .to_str()
             .map_err(|_| Error::bad_request("Invalid WebSocket model hint"))?;
-        set_model(&mut model, value)?;
+        model.set(value)?;
     }
-    for value in headers.get_all("x-codex-routing-hint") {
-        // Codex
-        let value = value
-            .to_str()
-            .map_err(|_| Error::bad_request("Invalid WebSocket model hint"))?;
-        for field in value.split(';') {
-            if let Some(value) = field.trim().strip_prefix("model=") {
-                set_model(&mut model, value)?;
-            }
-        }
+    if let Some(client) = client {
+        client.model_hint(headers, &mut model)?;
     }
-    model.ok_or_else(|| {
-        Error::bad_request("WebSocket model routes require x-model or x-codex-routing-hint")
-    })
-}
-
-fn set_model<'a>(model: &mut Option<&'a str>, value: &'a str) -> Result<()> {
-    if value.is_empty() || model.is_some_and(|previous| previous != value) {
-        return Err(Error::bad_request(
-            "Empty or conflicting WebSocket model hints",
-        ));
-    }
-    *model = Some(value);
-    Ok(())
+    model.require()
 }

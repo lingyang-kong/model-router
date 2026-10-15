@@ -10,34 +10,33 @@ pub(crate) async fn decode_body<R: AsyncRead + Send + Unpin>(
     headers: &HeaderMap,
 ) -> io::Result<Vec<u8>> {
     let mut reader: Box<dyn AsyncRead + Send + Unpin + '_> = Box::new(reader);
-    let mut encodings = Vec::new();
-    for value in headers.get_all("content-encoding") {
-        encodings.extend(
-            value
-                .to_str()
-                .map_err(io::Error::other)?
-                .split(',')
-                .map(str::trim),
-        );
-    }
-    for encoding in encodings.into_iter().rev() {
-        let buffered = BufReader::new(reader);
-        reader = match encoding.to_ascii_lowercase().as_str() {
-            "identity" => Box::new(buffered),
-            "gzip" | "x-gzip" => {
-                let mut decoder = GzipDecoder::new(buffered);
-                decoder.multiple_members(true);
-                Box::new(decoder)
+    for value in headers.get_all("content-encoding").iter().rev() {
+        for encoding in value
+            .to_str()
+            .map_err(io::Error::other)?
+            .rsplit(',')
+            .map(str::trim)
+        {
+            if encoding.eq_ignore_ascii_case("identity") {
+                continue;
             }
-            "deflate" => Box::new(ZlibDecoder::new(buffered)),
-            "br" => Box::new(BrotliDecoder::new(buffered)),
-            "zstd" => {
-                let mut decoder = ZstdDecoder::new(buffered);
-                decoder.multiple_members(true);
-                Box::new(decoder)
-            }
-            _ => return Err(io::Error::other("Unsupported response encoding")),
-        };
+            let buffered = BufReader::new(reader);
+            reader = match encoding.to_ascii_lowercase().as_str() {
+                "gzip" | "x-gzip" => {
+                    let mut decoder = GzipDecoder::new(buffered);
+                    decoder.multiple_members(true);
+                    Box::new(decoder)
+                }
+                "deflate" => Box::new(ZlibDecoder::new(buffered)),
+                "br" => Box::new(BrotliDecoder::new(buffered)),
+                "zstd" => {
+                    let mut decoder = ZstdDecoder::new(buffered);
+                    decoder.multiple_members(true);
+                    Box::new(decoder)
+                }
+                _ => return Err(io::Error::other("Unsupported response encoding")),
+            };
+        }
     }
     let mut decoded = Vec::new();
     reader.read_to_end(&mut decoded).await?;

@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     env,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context, bail};
@@ -9,25 +10,34 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Uri};
 use serde::{Deserialize, Deserializer, de::Error as _};
 use url::{Host, Url};
 
-use crate::error::{Error, Result};
+use crate::{
+    adapters::CatalogFormat,
+    error::{Error, Result},
+};
 
-#[derive(Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Deserialize)]
+#[serde(tag = "auth", rename_all = "lowercase", deny_unknown_fields)]
 enum AuthMode {
-    Passthrough,
-    None,
-    Bearer,
+    Passthrough {},
+    None {},
+    Bearer { env_key: String },
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct ManualCatalog {
+    pub file: PathBuf,
+    pub format: CatalogFormat,
+}
+
+#[derive(Deserialize)]
 pub(crate) struct Provider {
     pub base_url: Url,
     #[serde(skip)]
     pub is_loopback: bool,
+    #[serde(flatten)]
     auth: AuthMode,
-    env_key: Option<String>,
-    pub catalog_file: Option<PathBuf>,
+    pub catalog: Option<ManualCatalog>,
     #[serde(default, deserialize_with = "deserialize_static_headers")]
     http_headers: Vec<(HeaderName, HeaderValue)>,
     #[serde(default, deserialize_with = "deserialize_headers")]
@@ -57,9 +67,16 @@ pub(crate) struct Route {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum RouteAction {
-    Forward { provider: String },
-    Model { provider: Option<String> },
-    Catalog { provider: String },
+    Forward {
+        provider: String,
+    },
+    Model {
+        provider: Option<String>,
+    },
+    Catalog {
+        provider: String,
+        format: CatalogFormat,
+    },
 }
 
 fn deserialize_method<'de, D: Deserializer<'de>>(
@@ -97,7 +114,7 @@ fn deserialize_static_headers<'de, D: Deserializer<'de>>(
 impl RouteAction {
     pub fn provider(&self) -> Option<&str> {
         match self {
-            Self::Forward { provider } | Self::Catalog { provider } => Some(provider),
+            Self::Forward { provider } | Self::Catalog { provider, .. } => Some(provider),
             Self::Model { provider } => provider.as_deref(),
         }
     }
@@ -130,33 +147,33 @@ impl Route {
 }
 
 pub struct Config {
-    pub(crate) providers: BTreeMap<String, Provider>,
+    pub(crate) providers: BTreeMap<String, Arc<Provider>>,
     pub(crate) routes: Vec<Route>,
 }
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        let (json, root) = match env::var_os("MODEL_ROUTER_CONFIG") {
+        let (text, root) = match env::var_os("MODEL_ROUTER_CONFIG") {
             Some(path) => {
                 let path = env::current_dir()?.join(path);
-                let json =
+                let text =
                     std::fs::read_to_string(&path).context("Cannot read MODEL_ROUTER_CONFIG")?;
-                (json, path.parent().unwrap().to_owned())
+                (text, path.parent().unwrap().to_owned())
             }
             None => (
-                env::var("MODEL_ROUTER_CONFIG_JSON")
-                    .context("Set MODEL_ROUTER_CONFIG or MODEL_ROUTER_CONFIG_JSON")?,
+                env::var("MODEL_ROUTER_CONFIG_TOML")
+                    .context("Set MODEL_ROUTER_CONFIG or MODEL_ROUTER_CONFIG_TOML")?,
                 env::current_dir()?,
             ),
         };
-        Self::from_json(&json, &root)
+        Self::from_toml(&text, &root)
     }
 
-    pub fn from_json(json: &str, root: &Path) -> anyhow::Result<Self> {
+    pub fn from_toml(text: &str, root: &Path) -> anyhow::Result<Self> {
         let ConfigDocument {
             mut providers,
             routes,
-        } = serde_json::from_str(json).context("Invalid router configuration")?;
+        } = toml::from_str(text).context("Invalid router configuration")?;
         if providers.is_empty() {
             bail!("Configure at least one provider");
         }
@@ -175,12 +192,13 @@ impl Config {
                 Some(Host::Ipv6(ip)) => ip.is_loopback(),
                 _ => false,
             };
-            if matches!(provider.auth, AuthMode::Bearer)
-                && provider.env_key.as_deref().is_none_or(str::is_empty)
+            if let AuthMode::Bearer { env_key } = &provider.auth
+                && env_key.is_empty()
             {
                 bail!("Bearer auth requires env_key naming the API key environment variable");
             }
-            if let Some(path) = &mut provider.catalog_file {
+            if let Some(catalog) = &mut provider.catalog {
+                let path = &mut catalog.file;
                 *path = if let Ok(relative) = path.strip_prefix("~") {
                     PathBuf::from(env::var_os("HOME").context("HOME is not set")?).join(relative)
                 } else {
@@ -206,20 +224,26 @@ impl Config {
                     bail!("Route paths must start with /");
                 }
             }
-            if let RouteAction::Catalog { provider } = &route.action {
+            if let RouteAction::Catalog { provider, .. } = &route.action {
                 if catalog_provider.is_some_and(|previous| previous != provider) {
                     bail!("Catalog rules must use one live provider");
                 }
-                if providers[provider].catalog_file.is_some() {
-                    bail!("Live catalog providers must not have a manual catalog_file");
+                if providers[provider].catalog.is_some() {
+                    bail!("Live catalog providers must not have a manual catalog");
                 }
                 catalog_provider = Some(provider);
             }
         }
-        Ok(Self { providers, routes })
+        Ok(Self {
+            providers: providers
+                .into_iter()
+                .map(|(name, provider)| (name, Arc::new(provider)))
+                .collect(),
+            routes,
+        })
     }
 
-    pub(crate) fn provider(&self, name: &str) -> Result<&Provider> {
+    pub(crate) fn provider(&self, name: &str) -> Result<&Arc<Provider>> {
         self.providers
             .get(name)
             .ok_or_else(|| Error::bad_request(format!("Unknown provider: {name}")))
@@ -234,8 +258,12 @@ impl Config {
 }
 
 impl Provider {
-    pub(crate) fn validate_credential_scope(&self, name: &str, origin: Option<&str>) -> Result<()> {
-        if matches!(self.auth, AuthMode::Passthrough) && origin.is_some_and(|origin| origin != name)
+    pub(crate) fn validate_credential_scope(
+        self: &Arc<Self>,
+        origin: Option<&Arc<Self>>,
+    ) -> Result<()> {
+        if matches!(self.auth, AuthMode::Passthrough {})
+            && origin.is_some_and(|origin| !Arc::ptr_eq(origin, self))
         {
             return Err(Error::bad_request(
                 "Passthrough credentials require the matching provider; configure destination credentials for cross-provider routing",
@@ -262,7 +290,7 @@ impl Provider {
             headers.insert("te", HeaderValue::from_static("trailers"));
             headers.insert("connection", HeaderValue::from_static("TE"));
         }
-        if !matches!(self.auth, AuthMode::Passthrough) {
+        if !matches!(self.auth, AuthMode::Passthrough {}) {
             let removed: Vec<_> = headers
                 .keys()
                 .filter(|name| {
@@ -284,8 +312,8 @@ impl Provider {
                 headers.remove(name);
             }
         }
-        if matches!(self.auth, AuthMode::Bearer) {
-            let key = required_env_var(self.env_key.as_deref().unwrap())?;
+        if let AuthMode::Bearer { env_key } = &self.auth {
+            let key = required_env_var(env_key)?;
             headers.insert(
                 "authorization",
                 HeaderValue::try_from(format!("Bearer {key}"))

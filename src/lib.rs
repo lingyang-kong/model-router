@@ -1,3 +1,4 @@
+mod adapters;
 mod body;
 mod catalog;
 mod compression;

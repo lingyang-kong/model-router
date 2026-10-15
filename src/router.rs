@@ -13,10 +13,11 @@ use tokio_util::io::StreamReader;
 
 use crate::{
     Config,
+    adapters::Client,
     body::{inspect_body, stream_body},
     catalog::{ModelRegistry, load_manual_models},
     compression::decode_body,
-    config::{RouteAction, sanitize_headers},
+    config::{Provider, RouteAction, sanitize_headers},
     error::{Error, Result},
     websocket,
 };
@@ -32,32 +33,30 @@ impl RouterState {
     pub async fn resolve_provider(
         &self,
         model: Option<&str>,
-        fallback: Option<&str>,
-    ) -> Result<String> {
-        match model {
-            Some(model) => self
-                .models
-                .read()
-                .await
-                .get(model)
-                .map(|entry| entry.provider.clone())
-                .or_else(|| fallback.map(str::to_owned))
-                .ok_or_else(|| Error::unknown_model(model)),
-            None => fallback
-                .map(str::to_owned)
-                .ok_or_else(|| Error::bad_request("A model is required for this route")),
+        fallback: Option<&Arc<Provider>>,
+    ) -> Result<Arc<Provider>> {
+        if let Some(model) = model
+            && let Some(entry) = self.models.read().await.get(model)
+        {
+            return Ok(Arc::clone(&entry.provider));
         }
+        if let Some(fallback) = fallback {
+            return Ok(Arc::clone(fallback));
+        }
+        Err(match model {
+            Some(model) => Error::unknown_model(model),
+            None => Error::bad_request("A model is required for this route"),
+        })
     }
 
     pub fn prepare_request(
         &self,
-        provider_name: &str,
-        origin: Option<&str>,
+        provider: &Arc<Provider>,
+        origin: Option<&Arc<Provider>>,
         parts: &Parts,
         body: reqwest::Body,
     ) -> Result<(&reqwest::Client, reqwest::Request)> {
-        let provider = self.config.provider(provider_name)?;
-        provider.validate_credential_scope(provider_name, origin)?;
+        provider.validate_credential_scope(origin)?;
         let client = if provider.is_loopback {
             &self.loopback_client
         } else {
@@ -79,8 +78,7 @@ pub fn router(config: Config) -> anyhow::Result<Router> {
         .iter()
         .any(|route| !matches!(route.action, RouteAction::Forward { .. }))
     {
-        load_manual_models(&config)
-            .map_err(|error| anyhow::anyhow!(error.details().1.to_owned()))?
+        load_manual_models(&config)?
     } else {
         ModelRegistry::new()
     };
@@ -112,57 +110,66 @@ async fn handle_request(
     State(state): State<Arc<RouterState>>,
     request: Request,
 ) -> Result<Response> {
+    let adapter = Client::from_headers(request.headers())?;
     let action = &state
         .config
         .route(request.method(), request.uri(), request.headers())?
         .action;
+    let origin = action
+        .provider()
+        .map(|name| state.config.provider(name))
+        .transpose()?;
     if request
         .headers()
         .get("upgrade")
         .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
     {
-        return websocket::forward(&state, request, action).await;
+        return websocket::forward(&state, request, action, origin, adapter).await;
     }
-    forward_http(&state, request, action).await
+    forward_http(&state, request, action, origin, adapter).await
 }
 
 async fn forward_http(
     state: &RouterState,
     request: Request,
     action: &RouteAction,
+    origin: Option<&Arc<Provider>>,
+    adapter: Option<Client>,
 ) -> Result<Response> {
+    if let (Some(adapter), RouteAction::Catalog { format, .. }) = (adapter, action)
+        && adapter.catalog_format() != *format
+    {
+        return Err(Error::bad_request(
+            "Catalog format does not match the client adapter",
+        ));
+    }
     let (parts, body) = request.into_parts();
-    let (provider_name, body) = match action {
-        RouteAction::Forward { provider } | RouteAction::Catalog { provider } => {
-            (provider.clone(), stream_body(body))
-        }
-        RouteAction::Model { provider } => {
-            let (model, body) = inspect_body(body, &parts.headers).await?;
-            (
-                state
-                    .resolve_provider(model.as_deref(), provider.as_deref())
-                    .await?,
-                body,
-            )
-        }
+    let (model, body) = match action {
+        RouteAction::Forward { .. } | RouteAction::Catalog { .. } => (None, stream_body(body)),
+        RouteAction::Model { .. } => inspect_body(body, &parts.headers).await?,
     };
-    let (client, mut request) =
-        state.prepare_request(&provider_name, action.provider(), &parts, body)?;
-    let catalog = matches!(action, RouteAction::Catalog { .. });
-    if catalog {
+    let provider = state.resolve_provider(model.as_deref(), origin).await?;
+    let (client, mut request) = state.prepare_request(&provider, origin, &parts, body)?;
+    if matches!(action, RouteAction::Catalog { .. }) {
         request.headers_mut().remove("if-none-match");
         request.headers_mut().remove("if-modified-since");
     }
     let response = client.execute(request).await.map_err(Error::bad_gateway)?;
-    if catalog && response.status() == StatusCode::OK {
+    if let RouteAction::Catalog { format, .. } = action
+        && response.status() == StatusCode::OK
+    {
         let (parts, body) = stream_response(response).into_parts();
         let mut headers = parts.headers;
         let reader = StreamReader::new(body.into_data_stream().map_err(io::Error::other));
         let decoded = decode_body(reader, &headers)
             .await
             .map_err(Error::bad_gateway)?;
-        let document = serde_json::from_slice(&decoded).map_err(Error::bad_gateway)?;
-        let document = state.merge_catalog(&provider_name, document).await?;
+        let mut document = serde_json::from_slice(&decoded).map_err(Error::bad_gateway)?;
+        let models = format.models(&mut document)?;
+        state.merge_catalog(&provider, models, *format).await?;
+        if let Some(adapter) = adapter {
+            adapter.prepare_catalog(models);
+        }
         // The rewritten JSON has its own encoding and body representation.
         for name in [
             "content-encoding",
