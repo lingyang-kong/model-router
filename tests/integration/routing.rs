@@ -5,18 +5,126 @@ use axum::{
     Json, Router,
     body::{Bytes, to_bytes},
     extract::{Request, State},
-    http::StatusCode,
+    http::{Method, StatusCode},
 };
 use futures_util::StreamExt;
 use model_router::router;
 use serde_json::{Value, json};
 use tokio::{
-    io::{AsyncReadExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    net::TcpStream,
     sync::oneshot,
     time::timeout,
 };
 
 use crate::common::*;
+
+#[tokio::test]
+async fn path_normalization_cannot_escape_route_or_provider_prefix() {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = seen.clone();
+    let backend = serve(Router::new().fallback(move |request: Request| {
+        let captured = captured.clone();
+        async move {
+            captured.lock().unwrap().push(request.uri().to_string());
+            StatusCode::OK
+        }
+    }))
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let config = parse_config(
+        &json!({"providers":{"api":{"base_url":format!("{}/v1",backend.url),"auth":"none","http_headers":{"authorization":"Bearer test-key"}}},"routes":[{"path_prefix":"/safe/","action":"forward","provider":"api"}]}).to_string(),
+        root.path(),
+    ).unwrap();
+    let gateway = serve(router(config).unwrap()).await;
+    // Raw HTTP avoids a client URL parser normalizing the path before sending it.
+    for (path, status) in [
+        ("/safe/ok?next=/../admin", 200),
+        ("/safe/a%2Fb", 200),
+        ("/admin", 404),
+        ("/safe/../../admin", 400),
+        ("/safe/%2e%2e/%2E%2E/admin", 400),
+        ("/safe/.%2e/%2e./admin", 400),
+        ("/safe/./ok", 400),
+        (r"/safe/..\..\admin", 400),
+    ] {
+        let mut stream = TcpStream::connect(gateway.url.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        timeout(Duration::from_secs(2), stream.read_to_string(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            response.starts_with(&format!("HTTP/1.1 {status} ")),
+            "{path}: {response}"
+        );
+    }
+    assert_eq!(
+        *seen.lock().unwrap(),
+        ["/v1/safe/ok?next=/../admin", "/v1/safe/a%2Fb"]
+    );
+}
+
+#[tokio::test]
+async fn empty_model_requests_use_only_the_configured_fallback() {
+    async fn capture(request: Request) -> Json<Value> {
+        let (parts, body) = request.into_parts();
+        let bytes = to_bytes(body, usize::MAX).await.unwrap();
+        Json(
+            json!({"method":parts.method.as_str(),"path":parts.uri.path(),"body":String::from_utf8_lossy(&bytes)}),
+        )
+    }
+    let backend = serve(Router::new().fallback(capture)).await;
+    let root = tempfile::tempdir().unwrap();
+    let config = parse_config(
+        &json!({"providers":{"api":{"base_url":backend.url,"auth":"none"}},"routes":[{"path":"/no-fallback","action":"model"},{"action":"model","provider":"api"}]}).to_string(),
+        root.path(),
+    ).unwrap();
+    let gateway = serve(router(config).unwrap()).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for (method, path) in [
+        (Method::GET, "/responses/id"),
+        (Method::DELETE, "/responses/id"),
+        (Method::POST, "/responses/id/cancel"),
+    ] {
+        let response = client
+            .request(method.clone(), gateway.url.clone() + path)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: Value = response.json().await.unwrap();
+        assert_eq!(
+            response,
+            json!({"method":method.as_str(),"path":path,"body":""})
+        );
+    }
+    for (path, body) in [
+        ("/no-fallback", ""),
+        ("/responses", " "),
+        ("/responses", "{bad"),
+    ] {
+        assert_eq!(
+            client
+                .post(gateway.url.clone() + path)
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+}
 
 #[tokio::test]
 async fn client_markers_are_validated_before_forwarding() {

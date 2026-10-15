@@ -20,6 +20,9 @@ struct ModelSelector {
 }
 
 pub(crate) fn request_model(bytes: &[u8]) -> RouterResult<Option<String>> {
+    if bytes.is_empty() {
+        return Ok(None);
+    }
     let selector: ModelSelector =
         serde_json::from_slice(bytes).map_err(|error| Error::bad_request(error.to_string()))?;
     if selector.model.as_deref() == Some("") {
