@@ -1,15 +1,19 @@
+use std::sync::Arc;
+
 use indexmap::IndexMap;
 use serde_json::Value;
 use tokio::sync::RwLockWriteGuard;
 
 use crate::{
     Config,
+    adapters::CatalogFormat,
+    config::Provider,
     error::{Error, Result},
     router::RouterState,
 };
 
 pub(crate) struct ModelEntry {
-    pub provider: String,
+    pub provider: Arc<Provider>,
     /// Manual metadata is cached; live metadata comes from each upstream refresh.
     pub metadata: Option<Value>,
 }
@@ -17,24 +21,25 @@ pub(crate) type ModelRegistry = IndexMap<String, ModelEntry>;
 
 pub(crate) fn load_manual_models(config: &Config) -> Result<ModelRegistry> {
     let mut registry = ModelRegistry::new();
-    for (provider, settings) in &config.providers {
-        let Some(path) = &settings.catalog_file else {
+    for provider in config.providers.values() {
+        let Some(settings) = &provider.catalog else {
             continue;
         };
-        let bytes = std::fs::read(path).map_err(Error::bad_gateway)?;
+        let bytes = std::fs::read(&settings.file).map_err(Error::bad_gateway)?;
         let mut catalog: Value = serde_json::from_slice(&bytes).map_err(Error::bad_gateway)?;
-        let (id_field, models) = model_array(&mut catalog)?;
+        let format = settings.format;
+        let models = format.models(&mut catalog)?;
         for metadata in std::mem::take(models) {
-            let id = model_id(&metadata, id_field)?.to_owned();
+            let id = format.model_id(&metadata)?.to_owned();
             if let Some(previous) = registry.get(&id)
-                && &previous.provider != provider
+                && !Arc::ptr_eq(&previous.provider, provider)
             {
                 return Err(ownership_conflict(&id));
             }
             registry.insert(
                 id,
                 ModelEntry {
-                    provider: provider.clone(),
+                    provider: Arc::clone(provider),
                     metadata: Some(metadata),
                 },
             );
@@ -44,25 +49,20 @@ pub(crate) fn load_manual_models(config: &Config) -> Result<ModelRegistry> {
 }
 
 impl RouterState {
-    pub(crate) async fn merge_catalog(&self, provider: &str, mut catalog: Value) -> Result<Value> {
-        let (id_field, models) = model_array(&mut catalog)?;
+    pub(crate) async fn merge_catalog(
+        &self,
+        provider: &Arc<Provider>,
+        models: &mut Vec<Value>,
+        format: CatalogFormat,
+    ) -> Result<()> {
         let ids = models
             .iter()
-            .map(|model| model_id(model, id_field))
+            .map(|model| format.model_id(model))
             .collect::<Result<Vec<_>>>()?;
         let mut registry = self.models.write().await;
-        for (id, entry) in registry.iter() {
-            if let Some(metadata) = &entry.metadata
-                && model_id(metadata, id_field)? != id
-            {
-                return Err(Error::bad_gateway(format!(
-                    "Manual model has an incompatible catalog identifier: {id}"
-                )));
-            }
-        }
         for id in &ids {
             if let Some(previous) = registry.get(*id)
-                && previous.provider != provider
+                && !Arc::ptr_eq(&previous.provider, provider)
             {
                 return Err(ownership_conflict(id));
             }
@@ -72,39 +72,27 @@ impl RouterState {
                 registry.insert(
                     id.to_owned(),
                     ModelEntry {
-                        provider: provider.to_owned(),
+                        provider: Arc::clone(provider),
                         metadata: None,
                     },
                 );
             }
         }
         let registry = RwLockWriteGuard::downgrade(registry);
-        models.extend(registry.values().filter_map(|entry| entry.metadata.clone()));
-        Ok(catalog)
+        models.extend(
+            registry
+                .values()
+                .filter(|entry| {
+                    entry
+                        .provider
+                        .catalog
+                        .as_ref()
+                        .is_some_and(|catalog| catalog.format == format)
+                })
+                .filter_map(|entry| entry.metadata.clone()),
+        );
+        Ok(())
     }
-}
-
-fn model_array(catalog: &mut Value) -> Result<(&'static str, &mut Vec<Value>)> {
-    let (key, id_field) = if catalog.get("models").is_some_and(Value::is_array) {
-        ("models", "slug")
-    } else {
-        ("data", "id")
-    };
-    catalog
-        .get_mut(key)
-        .and_then(Value::as_array_mut)
-        .map(|models| (id_field, models))
-        .ok_or_else(|| Error::bad_gateway("Catalog needs a models or data array"))
-}
-
-fn model_id<'a>(metadata: &'a Value, preferred: &str) -> Result<&'a str> {
-    let alternate = if preferred == "id" { "slug" } else { "id" };
-    metadata
-        .get(preferred)
-        .or_else(|| metadata.get(alternate))
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| Error::bad_gateway("Catalog models must have nonempty slug or id strings"))
 }
 
 fn ownership_conflict(model: &str) -> Error {

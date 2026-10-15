@@ -1,63 +1,65 @@
-# Connect Codex
+# Codex
 
-Use GPT through your ChatGPT subscription and custom models through any Responses-compatible upstream. Both appear in Codex's model picker.
+Use GPT through your ChatGPT subscription and custom models through Responses-compatible upstreams. Both appear in the model picker.
 
-## 1. Start the router
+## Setup
 
-Set the upstream URL in the [router configuration](../examples/router-config.json) and your model's exact ID and capabilities in the [Codex model catalog](../examples/codex-model-catalog.json). The supplied files use the [Qwen over SGLang example](#example-qwen-over-sglang) below. From the repository directory:
-
-```sh
-MODEL_ROUTER_CONFIG=examples/router-config.json cargo run --release --locked
-```
-
-The router listens on `localhost:8080`. For an existing [systemd service](../README.md#systemd), set `MODEL_ROUTER_CONFIG` to the absolute path of `examples/router-config.json` and restart it.
-
-## 2. Configure Codex
-
-Set `model_provider` before the first table in `~/.codex/config.toml`, then merge the provider table:
+1. Adapt [router-config.toml](../examples/router-config.toml) and the [model catalog](../examples/codex-model-catalog.json) to your upstream and model. The supplied example connects ChatGPT and Qwen served by SGLang at `http://localhost:30000/v1`.
+2. [Start the router](../README.md#run).
+3. Merge the following into `~/.codex/config.toml`. Put `model_provider` before any tables and merge existing tables rather than duplicating them.
 
 ```toml
 model_provider = "router"
 
+[agents]
+default_subagent_model = "vendor/model"
+
+[features]
+enable_request_compression = false
+
 [model_providers.router]
-name = "OpenAI" # for HTTP header key x-codex-routing-hint
+name = "OpenAI" # Enables Codex's WebSocket routing hint
 base_url = "http://localhost:8080"
 model_catalog_url = "http://localhost:8080/models"
 requires_openai_auth = true
 supports_websockets = true
+http_headers = { "x-router-client" = "codex" }
 ```
 
-Both provider flags default to `false` for custom providers. Keep your ChatGPT login, or run `codex login`. This setup needs no OpenAI API key. WebSockets require support from every selected upstream. Set `supports_websockets = false` if any upstream supports only HTTP Responses.
+Replace `vendor/model` with the exact model ID in your catalog. Keep your ChatGPT login, or run `codex login`; no OpenAI API key is needed. Start `codex` and use `/model` to select the main model. Workers default to the configured model unless an explicit model or agent-role setting overrides it.
 
-## 3. Start Codex
+## SGLang compatibility
 
-```sh
-codex
-```
+Tested with Codex 0.162.1 and the example Qwen deployment:
 
-Open `/model` and select a model. Requests use that model's registered upstream.
+- Keep v2 and request compression disabled as shown above. The client header enables the router's v1 catalog settings for both parent and worker models; remove any launch option that forces v2.
+- Start a new Codex session after switching to v1. Restart the router and Codex after configuration or catalog edits; rebuild the router after code changes.
 
-## Worker models
+## Qwen context handoffs
 
-To select a default worker model, merge this into `~/.codex/config.toml`, replacing `<model-id>` with its exact catalog ID:
+The example Qwen catalog enables Codex 0.162.1's model-owned `model_messages.token_budget` mode. Fresh Qwen workers are instructed to return a final handoff when their working context budget is exhausted. The parent agent or user decides whether to start a fresh worker with that summary. GPT keeps its provider's remote compaction. Leave `features.token_budget` unset in client configuration, since an explicit setting overrides model-owned activation. Spawn Qwen workers without inherited history (`fork_turns = "none"`); full-history forks retain the parent's activation.
 
-```toml
-[agents]
-default_subagent_model = "<model-id>"
-```
+The reminder and fallback adapt Codex's token-budget prompts from the cached GPT model catalog. Both preserve the context-window reminder wrapper and request the goal, decisions, progress, learnings, next steps, unresolved requests, and important actions/tool calls. The reminder reports the remaining budget; the fallback declares exhaustion, says not to continue the task, requests the handoff now, and prohibits tool calls. Notes storage, window/item references, and reset instructions are replaced with returning the summary as a final response that explains the context limit. Hosted Notes/History integration is disabled. `guidance_message` only asks a worker that has unexpectedly been reset to report the reset and request restoration of its task context.
 
-Workers inherit the router provider; explicit model choices and role settings can override this default. Set a reasoning effort only if that model supports it. Restart the router and Codex after manual catalog edits. GPT's catalog refreshes from the subscription service.
+For the supplied 262,144-token model with Codex's default context settings:
 
-## Example: Qwen over SGLang
+| Event | Active context tokens |
+| --- | --- |
+| Reminder (`reminder_threshold_tokens = 6144`) | 229,785, approximately 87.7% |
+| Fallback prompt | 235,929, the 90% compaction threshold |
+| Forced-reset boundary with a 16,384-token fallback buffer | 249,036, capped by Codex's 95% usable-context ceiling |
+| Advertised model context limit | 262,144 |
 
-The supplied configuration routes GPT to the ChatGPT subscription service and `nvidia/Qwen3.8-Flash-Next-NVFP4` to SGLang at `http://localhost:30000/v1`. Use that model ID in the worker setting above to run Qwen workers alongside a GPT main agent. If the SGLang endpoint supports only HTTP Responses, set `supports_websockets = false` in the Codex provider table.
+`reminder_threshold_tokens` is a remaining-token trigger, not a context limit: the reminder is due when at most that many tokens remain before the compaction threshold. Codex 0.162.1 requires a positive value; `0` is invalid. The 6,144-token reminder (6 × 1,024) and 16,384-token fallback buffer (16 × 1,024) match the fixed values in the cached GPT model metadata. The client copies these values rather than deriving them from context size; no rationale for their selection was found in the inspected code. For Qwen, the reminder is due at `235929 - 6144 = 229785` tokens. The nominal buffered boundary is `235929 + 16384 = 252313`, but the 95% ceiling caps it at 249,036, allowing 13,107 tokens after the 90% threshold.
 
-Qwen's catalog entry follows `gpt-6-luna` from Codex 0.162.1's bundled catalog, including code mode, client-side utility tools, and multi-agent v2. Its base instructions have model-identity and grammar corrections. The reference comes from `codex debug models --bundled`.
+The buffer reserves space for the handoff after the normal compaction threshold. It cannot move the forced-reset boundary beyond the usable-context ceiling. Thresholds are checked between model steps, so a large response or tool result can cross more than one boundary. A normal final response ends the worker turn; token-budget mode skips post-turn summarization. Reusing an exhausted worker can trigger a pre-turn reset, so continue in a fresh worker.
 
-The tested Qwen deployment supports `none`, `low`, `medium`, and `xhigh`, with `xhigh` as its default and a 262,144-token context limit. Its SGLang backend does not implement verbosity control, original image detail, native tool search, or Responses Lite, so those GPT settings are not enabled in this example. Adapt the catalog to your own model and serving backend.
+This is a prompt-directed handoff, not an enforced stop mode: Codex can still reset a worker that keeps running past the boundary. The post-reset instruction limits the intended behavior but cannot guarantee compliance. A guaranteed stop before reset requires client-side enforcement.
 
 ## WebSocket routing
 
-With WebSockets, Codex 0.162 uses `name = "OpenAI"` and ChatGPT sign-in to supply the model routing hint. Reconnect when changing providers; the destination is fixed for each connection.
+With WebSockets, Codex uses `name = "OpenAI"` and ChatGPT sign-in to supply the model routing hint.
+
+In the test, GPT can use WebSockets while Qwen falls back to HTTP after connection retries because SGLang doesn't support WebSocket. Set `supports_websockets = false` to avoid those retries and use HTTP for both. Reconnect when changing providers.
 
 [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)

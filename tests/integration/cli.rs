@@ -5,9 +5,9 @@ fn command() -> Command {
     command
         .env(
             "MODEL_ROUTER_CONFIG",
-            "/nonexistent/model-router-config.json",
+            "/nonexistent/model-router-config.toml",
         )
-        .env_remove("MODEL_ROUTER_CONFIG_JSON");
+        .env_remove("MODEL_ROUTER_CONFIG_TOML");
     command
 }
 
@@ -39,6 +39,47 @@ fn unsupported_arguments_fail_before_loading_configuration() {
                 .contains("Unsupported arguments")
         );
     }
+}
+
+#[test]
+fn file_configuration_resolves_catalog_paths_and_overrides_inline_configuration() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("models.json"), r#"{"data":[{"id":""}]}"#).unwrap();
+    let path = root.path().join("router-config.toml");
+    std::fs::write(
+        &path,
+        r#"
+[providers.api]
+base_url = "http://localhost"
+auth = "none"
+catalog = { file = "models.json", format = "openai" }
+
+[[routes]]
+action = "model"
+"#,
+    )
+    .unwrap();
+    let output = command()
+        .current_dir(std::env::temp_dir())
+        .env("MODEL_ROUTER_CONFIG", path)
+        .env("MODEL_ROUTER_CONFIG_TOML", "invalid inline TOML")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("catalog models need a nonempty id string")
+    );
+}
+
+#[tokio::test]
+async fn supplied_toml_configuration_loads_its_json_catalog() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    let text = std::fs::read_to_string(root.join("router-config.toml")).unwrap();
+    let config = model_router::Config::from_toml(&text, &root).unwrap();
+    assert!(model_router::router(config).is_ok());
+    assert!(model_router::Config::from_toml(r#"{"providers":{},"routes":[]}"#, &root).is_err());
 }
 
 #[cfg(unix)]
@@ -86,7 +127,10 @@ async fn sigterm_stops_accepting_and_drains_an_inflight_request() {
     let mut process = Process(
         command()
             .env_remove("MODEL_ROUTER_CONFIG")
-            .env("MODEL_ROUTER_CONFIG_JSON", config.to_string())
+            .env(
+                "MODEL_ROUTER_CONFIG_TOML",
+                toml::to_string(&config).unwrap(),
+            )
             .env("MODEL_ROUTER_PORT", "0")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())

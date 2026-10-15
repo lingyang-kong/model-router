@@ -1,7 +1,7 @@
 use std::{io::Cursor, sync::atomic::Ordering};
 
 use axum::{Json, Router, body::to_bytes, extract::Request, http::StatusCode};
-use model_router::{Config, router};
+use model_router::router;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, BufReader};
 
@@ -119,7 +119,7 @@ async fn catalog_refreshes_use_cached_manual_files_without_affecting_request_rou
     let config = test_config(
         json!({
             "live":{"base_url":fixture._live_server.url,"auth":"none"},
-            "manual":{"base_url":fixture._manual_server.url,"auth":"none","catalog_file":"models.json"}
+            "manual":{"base_url":fixture._manual_server.url,"auth":"none","catalog":{"file":"models.json","format":"codex"}}
         }),
         None,
         Some("live"),
@@ -263,11 +263,11 @@ async fn conflicting_catalogs_are_rejected_without_changing_header_routes() {
 #[tokio::test]
 async fn buffered_model_routes_use_native_ids_and_learn_catalog_updates_atomically() {
     let fixture = Fixture::new().await;
-    let config = Config::from_json(&json!({"providers":{
+    let config = parse_config(&json!({"providers":{
         "live":{"base_url":fixture._live_server.url,"auth":"passthrough"},
-        "manual":{"base_url":fixture._manual_server.url,"auth":"none","catalog_file":"models.json"}
+        "manual":{"base_url":fixture._manual_server.url,"auth":"none","catalog":{"file":"models.json","format":"codex"}}
     },"routes":[
-        {"method":"GET","path":"/models","action":"catalog","provider":"live"},
+        {"method":"GET","path":"/models","action":"catalog","format":"codex","provider":"live"},
         {"action":"model"}
     ]}).to_string(),fixture.root.path()).unwrap();
     let gateway = serve(router(config).unwrap()).await;
@@ -481,7 +481,7 @@ async fn manual_catalog_metadata_reloads_only_after_restart() {
     let config = test_config(
         json!({
             "live":{"base_url":fixture._live_server.url,"auth":"none"},
-            "manual":{"base_url":fixture._manual_server.url,"auth":"none","catalog_file":"models.json"}
+            "manual":{"base_url":fixture._manual_server.url,"auth":"none","catalog":{"file":"models.json","format":"codex"}}
         }),
         None,
         Some("live"),
@@ -530,15 +530,48 @@ fn rejects_multiple_catalog_providers_and_invalid_provider_settings() {
         json!({"providers":{"api":{"base_url":"http://localhost?version=1","auth":"none"}},"routes":[{"action":"forward","provider":"api"}]}),
         json!({"providers":{"api":{"base_url":"http://localhost","auth":"none","catalog_url":"models"}},"routes":[{"action":"forward","provider":"api"}]}),
         json!({"providers":{"first":provider,"second":provider},"routes":[
-            {"path":"/models","action":"catalog","provider":"first"},
-            {"path":"/other","action":"catalog","provider":"second"}
+            {"path":"/models","action":"catalog","format":"codex","provider":"first"},
+            {"path":"/other","action":"catalog","format":"codex","provider":"second"}
         ]}),
-        json!({"providers":{"api":{"base_url":"http://localhost","auth":"none","catalog_file":"models.json"}},"routes":[{"action":"catalog","provider":"api"}]}),
+        json!({"providers":{"api":{"base_url":"http://localhost","auth":"none","catalog":{"file":"models.json","format":"codex"}}},"routes":[{"action":"catalog","format":"codex","provider":"api"}]}),
     ];
     for document in cases {
         assert!(
-            Config::from_json(&document.to_string(), root.path()).is_err(),
+            parse_config(&document.to_string(), root.path()).is_err(),
             "accepted invalid configuration: {document}"
+        );
+    }
+}
+
+#[test]
+fn authentication_settings_require_credentials_only_for_bearer() {
+    let root = tempfile::tempdir().unwrap();
+    for (settings, valid) in [
+        (json!({"auth":"none"}), true),
+        (json!({"auth":"passthrough"}), true),
+        (json!({"auth":"bearer","env_key":"UPSTREAM_KEY"}), true),
+        (json!({"auth":"bearer"}), false),
+        (json!({"auth":"bearer","env_key":""}), false),
+        (json!({"auth":"bearer","env_key":null}), false),
+        (json!({"auth":"none","env_key":"UNUSED_KEY"}), false),
+        (json!({"auth":"passthrough","env_key":"UNUSED_KEY"}), false),
+        (json!({"auth":"none","unexpected":true}), false),
+        (json!({"auth":"passthrough","unexpected":true}), false),
+        (
+            json!({"auth":"bearer","env_key":"UPSTREAM_KEY","unexpected":true}),
+            false,
+        ),
+    ] {
+        let mut provider = settings.clone();
+        provider["base_url"] = json!("http://localhost");
+        let config = json!({"providers":{"api":provider},
+            "routes":[{"action":"forward","provider":"api"}]});
+        let result = parse_config(&config.to_string(), root.path());
+        assert_eq!(
+            result.is_ok(),
+            valid,
+            "settings: {settings}; error: {:?}",
+            result.err()
         );
     }
 }
@@ -558,7 +591,7 @@ async fn serves_messages_and_token_counting_without_a_catalog_source() {
     let config = test_config(
         json!({
             "messages":{"base_url":backend.url,"auth":"passthrough"},
-            "inference":{"base_url":local_backend.url,"auth":"none","catalog_file":"local.json"}
+            "inference":{"base_url":local_backend.url,"auth":"none","catalog":{"file":"local.json","format":"anthropic"}}
         }),
         Some("messages"),
         None,
@@ -638,45 +671,22 @@ async fn invalid_catalog_identifiers_do_not_change_header_routing() {
         StatusCode::OK
     );
 
-    // A manual entry's identity must stay consistent in the upstream envelope.
+    // The selected format's identifier is required; there is no alias fallback.
     std::fs::write(
         fixture.root.path().join("models.json"),
-        json!({"data":[{"id":"manual-id","slug":"different-alias"}]}).to_string(),
+        json!({"models":[{"id":"manual-id"}]}).to_string(),
     )
     .unwrap();
-    let config = test_config(
-        json!({
-            "live":{"base_url":fixture._live_server.url,"auth":"none"},
-            "manual":{"base_url":fixture._manual_server.url,"auth":"none","catalog_file":"models.json"}
-        }),
-        None,
-        Some("live"),
+    let config = parse_config(
+        &json!({"providers":{
+        "manual":{"base_url":fixture._manual_server.url,"auth":"none",
+            "catalog":{"file":"models.json","format":"codex"}}
+    },"routes":[{"action":"model"}]})
+        .to_string(),
         fixture.root.path(),
-    );
-    let gateway = serve(router(config).unwrap()).await;
-    *fixture.live.models.lock().unwrap() = vec![json!({"slug":"valid-new-model"})];
-    assert_eq!(
-        fixture
-            .client
-            .get(gateway.url.clone() + "/models")
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::BAD_GATEWAY
-    );
-    assert_eq!(
-        fixture
-            .client
-            .post(gateway.url.clone() + "/responses")
-            .header("x-route-provider", "live")
-            .json(&json!({"model":"valid-new-model"}))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::OK
-    );
+    )
+    .unwrap();
+    assert!(router(config).is_err());
 }
 
 #[tokio::test]
@@ -691,11 +701,11 @@ async fn catalog_requests_forward_native_method_path_query_and_body() {
     }
     let backend = serve(Router::new().fallback(endpoint)).await;
     let root = tempfile::tempdir().unwrap();
-    let config = Config::from_json(
+    let config = parse_config(
         &json!({"providers":{
             "api":{"base_url":format!("{}/gateway/",backend.url),"auth":"none"}
         },"routes":[
-            {"method":"POST","path":"/v1/models","action":"catalog","provider":"api"},
+            {"method":"POST","path":"/v1/models","action":"catalog","format":"codex","provider":"api"},
             {"action":"forward","provider":"api"}
         ]})
         .to_string(),
@@ -739,11 +749,11 @@ async fn native_catalog_envelopes_and_manual_fields_are_preserved() {
     // The entry's native fields are supplied by its author, not synthesized.
     std::fs::write(fixture.root.path().join("models.json"),
         json!({"data":[{"id":"publisher/model","display_name":"Native manual","extensions":{"opaque":[1,2]}}]}).to_string()).unwrap();
-    let config = Config::from_json(
+    let config = parse_config(
         &json!({"providers":{
         "source":{"base_url":fixture._live_server.url,"auth":"none"},
-        "manual":{"base_url":fixture._manual_server.url,"auth":"none","catalog_file":"models.json"}
-    },"routes":[{"path":"/models","action":"catalog","provider":"source"},{"action":"forward","provider":"source"}]})
+        "manual":{"base_url":fixture._manual_server.url,"auth":"none","catalog":{"file":"models.json","format":"openai"}}
+    },"routes":[{"path":"/models","action":"catalog","format":"openai","provider":"source"},{"action":"forward","provider":"source"}]})
         .to_string(),
         fixture.root.path(),
     )
@@ -774,10 +784,146 @@ async fn native_catalog_envelopes_and_manual_fields_are_preserved() {
 }
 
 #[test]
-fn rejects_obsolete_catalog_format() {
+fn rejects_unsupported_catalog_format() {
     let root = tempfile::tempdir().unwrap();
-    let mut descriptor = json!({"providers":{"api":{"base_url":"http://localhost","auth":"none"}},"routes":[{"action":"catalog","provider":"api"}]});
-    assert!(Config::from_json(&descriptor.to_string(), root.path()).is_ok());
+    let mut descriptor = json!({"providers":{"api":{"base_url":"http://localhost","auth":"none"}},"routes":[{"action":"catalog","format":"codex","provider":"api"}]});
+    assert!(parse_config(&descriptor.to_string(), root.path()).is_ok());
     descriptor["routes"][0]["format"] = json!("models");
-    assert!(Config::from_json(&descriptor.to_string(), root.path()).is_err());
+    assert!(parse_config(&descriptor.to_string(), root.path()).is_err());
+}
+
+#[tokio::test]
+async fn client_adapters_and_catalog_formats_are_isolated_on_the_same_endpoint() {
+    let fixture = Fixture::new().await;
+    let mut providers = json!({"live":{"base_url":fixture._live_server.url,"auth":"none"}});
+    for (format, key, id_key) in [
+        ("codex", "models", "slug"),
+        ("openai", "data", "id"),
+        ("anthropic", "data", "id"),
+    ] {
+        let file = format!("{format}.json");
+        std::fs::write(
+            fixture.root.path().join(&file),
+            json!({(key):[{
+                (id_key):format!("{format}/manual"),"display_name":"Manual"
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+        providers[format] = json!({"base_url":fixture._manual_server.url,"auth":"none",
+            "catalog":{"file":file,"format":format}});
+    }
+    let config = parse_config(
+        &json!({"providers":providers,"routes":[
+            {"path":"/models","headers":{"x-catalog-format":"openai"},
+             "action":"catalog","provider":"live","format":"openai"},
+            {"path":"/models","headers":{"x-catalog-format":"anthropic"},
+             "action":"catalog","provider":"live","format":"anthropic"},
+            {"path":"/models","action":"catalog","provider":"live","format":"codex"},
+            {"action":"model"}
+        ]})
+        .to_string(),
+        fixture.root.path(),
+    )
+    .unwrap();
+    let gateway = serve(router(config).unwrap()).await;
+    // A later generic request must not inherit metadata changed for Codex.
+    for client in ["codex", "openai", "anthropic", "generic", "codex"] {
+        let (format, key, id_key) = match client {
+            "openai" | "anthropic" => (client, "data", "id"),
+            _ => ("codex", "models", "slug"),
+        };
+        let mut live = json!({(id_key):format!("live/{client}"),"multi_agent_version":"v2"});
+        *fixture.live.models.lock().unwrap() = vec![live.clone()];
+        let mut request = fixture
+            .client
+            .get(gateway.url.clone() + "/models")
+            .header("x-catalog-format", format);
+        if client == "codex" {
+            request = request.header("x-router-client", "codex");
+        }
+        if key == "data" {
+            request = request.header("x-catalog-data", "1");
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: Value = response.json().await.unwrap();
+        let mut manual = json!({(id_key):format!("{format}/manual"),"display_name":"Manual"});
+        if client == "codex" {
+            live["multi_agent_version"] = json!("v1");
+            manual["multi_agent_version"] = json!("v1");
+        }
+        assert_eq!(response[key], json!([live, manual]));
+    }
+    // Manual entries excluded from a particular catalog still select their provider.
+    for format in ["codex", "openai", "anthropic"] {
+        let response: Value = fixture
+            .client
+            .post(gateway.url.clone() + "/responses")
+            .json(&json!({"model":format!("{format}/manual")}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(response["provider"], "service-b");
+        let file: Value = serde_json::from_slice(
+            &std::fs::read(fixture.root.path().join(format!("{format}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert!(!file.to_string().contains("multi_agent_version"));
+    }
+    // A Codex catalog response cannot silently switch to an OpenAI envelope.
+    let response = fixture
+        .client
+        .get(gateway.url.clone() + "/models")
+        .header("x-router-client", "codex")
+        .header("x-catalog-data", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    // Client/format mismatches are rejected before the upstream is called.
+    let seen = fixture.live.seen.lock().unwrap().len();
+    let response = fixture
+        .client
+        .get(gateway.url.clone() + "/models")
+        .header("x-router-client", "codex")
+        .header("x-catalog-format", "openai")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(fixture.live.seen.lock().unwrap().len(), seen);
+}
+
+#[test]
+fn rejects_ambiguous_catalog_and_client_configuration() {
+    let root = tempfile::tempdir().unwrap();
+    for route in [
+        json!({"action":"catalog","provider":"api"}),
+        json!({"action":"catalog","provider":"api","format":"openai","client":"codex"}),
+        json!({"action":"catalog","provider":"api","format":"codex","model_overrides":{}}),
+        json!({"action":"model","client":"unknown"}),
+    ] {
+        let config = json!({"providers":{"api":{"base_url":"http://localhost","auth":"none"}},
+            "routes":[route]});
+        assert!(parse_config(&config.to_string(), root.path()).is_err());
+    }
+    for settings in [
+        json!({"catalog":{"file":"models.json"}}),
+        json!({"catalog":{"format":"openai"}}),
+        json!({"catalog":{"file":"models.json","format":"unknown"}}),
+        json!({"catalog":{"file":"models.json","format":"openai","unexpected":true}}),
+        json!({"catalog_file":"models.json","catalog_format":"openai"}),
+    ] {
+        let mut provider = json!({"base_url":"http://localhost","auth":"none"});
+        provider
+            .as_object_mut()
+            .unwrap()
+            .extend(settings.as_object().unwrap().clone());
+        let config = json!({"providers":{"api":provider},"routes":[{"action":"model"}]});
+        assert!(parse_config(&config.to_string(), root.path()).is_err());
+    }
 }
