@@ -40,7 +40,7 @@ Rules can match `method`, `path` or `path_prefix`, `headers`, and `query`. All c
 | --- | --- |
 | `forward` | Stream to the named `provider`. |
 | `model` | Route by the top-level JSON `model`; optional `provider` handles empty bodies, missing HTTP models, or unknown IDs. |
-| `catalog` | Fetch from `provider` and merge manual entries using the required `format`. |
+| `catalog` | Fetch from `provider` and merge discovered provider models using the required output `format`. |
 
 A model route's fallback also identifies whose credentials arrived. Routing to another `passthrough` provider is rejected; configure that destination's credentials on the router.
 
@@ -48,11 +48,13 @@ The full incoming path is appended to `base_url`: `/v1` plus `/responses` become
 
 ## Catalogs
 
-Manual catalogs are JSON files, configured on a provider. For a Codex catalog:
+Provider catalogs can come from a remote endpoint or a JSON file. A remote OpenAI-compatible `/v1/models` endpoint can be configured as:
 
 ```toml
-catalog = { file = "codex-model-catalog.json", format = "codex" }
+catalog = { path = "/models", format = "openai" }
 ```
+
+The path is appended to the provider's `base_url`; for the example, SGLang is queried at `http://localhost:30000/v1/models`. A file source remains available, for example `catalog = { file = "models.json", format = "openai" }`. Read either source format independently of the catalog route's output format.
 
 | Format | Model array | Required ID field |
 | --- | --- | --- |
@@ -60,13 +62,41 @@ catalog = { file = "codex-model-catalog.json", format = "codex" }
 | `openai` | `data` | `id` |
 | `anthropic` | `data` | `id` |
 
-Supply the client's required metadata. Only matching formats are merged; all manual IDs remain routable. Restart after manual edits.
+Remote catalogs are refreshed on every catalog request, including the tools endpoint. The request uses the source provider's authentication and configured headers. File sources are read at startup and require a router restart after edits. Catalog inheritance copies a complete entry from another provider's current catalog, then applies local shared settings.
+
+Shared model metadata can fill or replace shared fields:
+
+```toml
+[providers.sglang.models."vendor/model"]
+name = "My coding model"
+description = "A coding assistant"
+extends = { provider = "chatgpt", model = "gpt-6-luna" }
+reasoning_levels = [
+  { level = "low", description = "Quick responses" },
+  { level = "high", description = "More reasoning" },
+]
+# reasoning_level = "high" # Optional default
+```
+
+Use `[providers.NAME.defaults]` and `[providers.NAME.models."native/id"]` for shared settings. `name`, `description`, `reasoning_level`, and `reasoning_levels` keep the same neutral names regardless of catalog format. `extends` identifies a provider and its exact native model ID separately; `/` inside a model ID is never interpreted as a provider prefix. The referenced entry is copied in full, then local shared settings are applied. Omitted description and reasoning settings inherit; an omitted name falls back to the local model ID in Codex output. Provider endpoint and authentication settings are never inherited. Generic native-field overrides are deferred; inherited native fields currently pass through unchanged.
+
+When returning the local source format with a different-format donor, inherit shared donor metadata and retain the local source fields. If neither format matches the output, omit that model while retaining its discovered routing ID. OpenAI source `max_model_len` supplies Codex `max_context_window` when present. Metadata values are not semantically validated. Structural and routing-ID checks still apply. Inference requests are forwarded unchanged.
+
+Inheritance is resolved directly from the catalogs fetched in the same refresh. Donor shared settings are included; the donor's own `extends` is not followed. A missing donor, unknown provider, or provider mismatch rejects the refresh and keeps the last successful routing data. Hidden donor entries remain available as inheritance sources. OpenAI rows without `extends` are not automatically added to Codex output. A provider default may contain `extends` to apply one base entry to all of that provider's models.
+
+Optional `discovery_urls` on a provider supply additional HTTP JSON information, such as model info, OpenAPI, and tool inventories. Every catalog request fetches these sources again; observations are not cached across requests. The router also follows same-origin tool-list GET paths advertised in OpenAPI. URLs are deduplicated within that refresh. A fresh negative tool-inventory declaration, provider-wide or covering every listed model, skips tool-list queries for that refresh.
+
+Explicit capability flags, model-scoped image support, native tool inventories, and closed image-detail enums can refine inherited Codex fields. Unknown capabilities inherit their donor settings. A fresh negative tool-inventory declaration suppresses tool-list queries. A tool type appearing in an OpenAPI enum alone does not establish runtime support. If a Codex-projected row enables Responses Lite and discovery has not declared support, the router optionally POSTs to `base_url + /responses` with `input` containing `[{"type":"additional_tools","role":"developer","tools":[]},{"type":"__model_router_capability_check__"}]`, `max_output_tokens: 1`, and `store: false`. Only an HTTP 400 or 422 whose error message begins `Unsupported Responses API input item type: 'additional_tools'` records unsupported; every other outcome remains unknown. The sentinel is intended to trigger validation, though a loosely validating server could generate up to one token. Discovery calls time out after three seconds. Queries use provider credentials only on the provider's origin; explicitly configured external URLs are queried anonymously.
+
+Remote model IDs are unknown to model routing until the first successful catalog refresh unless a fallback provider is configured. A failed refresh keeps the previous routing data. IDs missing from a later refresh remain routable until restart but are no longer displayed. Conflicting ownership rejects the refresh. The router preserves catalog envelopes and pagination fields, so use a complete catalog endpoint.
+
+When a catalog route's provider has no configured `catalog` source, the router forwards the client's original method, path, query, and body to that provider as before. This allows a Codex route to fetch the official ChatGPT catalog and use an exact catalog entry as an inheritance donor.
 
 Set `hidden_models = ["gpt-{5.6-*,6-sol}"]` on a provider to omit matching IDs from merged catalogs. Patterns use [globset syntax](https://docs.rs/globset/0.4.20/globset/): `*`, `?`, character classes such as `[0-9]` and `[!0-9]`, and brace alternatives such as `{sol,astra}` or `{,-preview}`. Backslashes escape metacharacters; use TOML literal strings such as `'model-\*'` to match a literal `*`.
 
 Patterns match whole IDs case-sensitively, and `*` continues to match `/`. They are compiled once at startup; malformed patterns reject the configuration. Bash sequence expansion such as `{1..3}` and gitignore-style `!pattern` exceptions are not supported. Hidden models remain directly routable and still participate in ownership checks; this is a model-list preference, not access control. Forwarded catalogs are unchanged.
 
-Catalog rules share one live provider, which cannot also have a manual catalog. Refreshes learn new IDs; missing IDs remain routable until restart. Conflicting ownership rejects the whole refresh. The router never reads client cache files. It preserves catalog envelopes and pagination fields, so use a complete catalog endpoint.
+Each rule selects the source whose catalog envelope is retained when its format matches the output. File sources contribute model rows only. Additional remote sources receive their own configured headers and credentials, without client headers. The router never reads client cache files.
 
 `x-router-client: codex` enables Codex's v1 metadata adjustment and WebSocket hint parser. Omit it for other clients. Unknown or conflicting markers and client/format mismatches are rejected.
 
