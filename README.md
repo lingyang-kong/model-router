@@ -39,12 +39,12 @@ Rules can match `method`, `path` or `path_prefix`, `headers`, and `query`. All c
 | Action | Behavior |
 | --- | --- |
 | `forward` | Stream to the named `provider`. |
-| `model` | Route by the top-level JSON `model`; optional `provider` handles missing HTTP models or unknown IDs. |
+| `model` | Route by the top-level JSON `model`; optional `provider` handles empty bodies, missing HTTP models, or unknown IDs. |
 | `catalog` | Fetch from `provider` and merge manual entries using the required `format`. |
 
 A model route's fallback also identifies whose credentials arrived. Routing to another `passthrough` provider is rejected; configure that destination's credentials on the router.
 
-The full incoming path is appended to `base_url`: `/v1` plus `/responses` becomes `/v1/responses`. Incoming queries are preserved; base URLs cannot contain queries.
+The full incoming path is appended to `base_url`: `/v1` plus `/responses` becomes `/v1/responses`. Paths changed by URL normalization (such as dot segments or backslashes) are rejected. Incoming queries are preserved; base URLs cannot contain queries.
 
 ## Catalogs
 

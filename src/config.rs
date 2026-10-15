@@ -272,15 +272,18 @@ impl Provider {
         Ok(())
     }
 
-    pub(crate) fn upstream_url(&self, incoming: &Uri) -> Url {
+    pub(crate) fn upstream_url(&self, incoming: &Uri) -> Result<Url> {
         let mut target = self.base_url.clone();
-        target.set_path(&format!(
-            "{}{}",
-            target.path().trim_end_matches('/'),
-            incoming.path()
-        ));
+        let path = format!("{}{}", target.path().trim_end_matches('/'), incoming.path());
+        target.set_path(&path);
+        // Reject normalization that could bypass the matched route.
+        if target.path() != path {
+            return Err(Error::bad_request(
+                "Request path requires URL normalization",
+            ));
+        }
         target.set_query(incoming.query());
-        target
+        Ok(target)
     }
 
     pub(crate) fn request_headers(&self, incoming: &HeaderMap) -> Result<HeaderMap> {
