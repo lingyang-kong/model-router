@@ -9,10 +9,10 @@ async fn main() -> anyhow::Result<()> {
         (Some(arg), None) if arg == "--help" || arg == "-h" => {
             println!(
                 "Usage: model-router [--help | --version]\n\n\
-                 Environment:\n  \
-                 MODEL_ROUTER_CONFIG       Path to the router JSON configuration\n  \
-                 MODEL_ROUTER_CONFIG_JSON  Inline JSON when no configuration path is set\n  \
-                 MODEL_ROUTER_PORT         Localhost port (default: 8080)"
+                 Environment:\n\t\
+                 MODEL_ROUTER_CONFIG\t\tPath to the router TOML configuration\n\t\
+                 MODEL_ROUTER_CONFIG_TOML\tInline TOML when no configuration path is set\n\t\
+                 MODEL_ROUTER_PORT\t\tLocalhost port (default: 8080)"
             );
             return Ok(());
         }

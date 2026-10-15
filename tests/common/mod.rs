@@ -213,7 +213,7 @@ pub(crate) fn test_config(
     let mut routes = Vec::new();
     if let Some(provider) = catalog_provider {
         routes
-            .push(json!({"method":"GET","path":"/models","action":"catalog","provider":provider}));
+            .push(json!({"method":"GET","path":"/models","action":"catalog","format":"codex","provider":provider}));
     }
     if providers.get("service-b").is_some() {
         routes.push(
@@ -228,11 +228,17 @@ pub(crate) fn test_config(
     if let Some(provider) = default_provider {
         routes.push(json!({"action":"forward","provider":provider}));
     }
-    Config::from_json(
+    parse_config(
         &json!({"providers":providers,"routes":routes}).to_string(),
         root,
     )
     .unwrap()
+}
+
+/// Keep JSON-shaped fixtures convenient while exercising the TOML configuration parser.
+pub(crate) fn parse_config(json: &str, root: &std::path::Path) -> anyhow::Result<Config> {
+    let document: Value = serde_json::from_str(json)?;
+    Config::from_toml(&toml::to_string(&document)?, root)
 }
 
 pub(crate) fn ws_request(url: String, provider: &str) -> tungstenite::handshake::client::Request {
@@ -255,7 +261,7 @@ impl Fixture {
         let config = test_config(
             json!({
                 "service-a":{"base_url":format!("{}/backend-api/codex",live_server.url),"auth":"passthrough"},
-                "service-b":{"base_url":manual_server.url,"auth":"none","catalog_file":"models.json","http_headers":{"x-api-key":"configured-key"}}
+                "service-b":{"base_url":manual_server.url,"auth":"none","catalog":{"file":"models.json","format":"codex"},"http_headers":{"x-api-key":"configured-key"}}
             }),
             None,
             Some("service-a"),

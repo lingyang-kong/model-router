@@ -8,7 +8,7 @@ use axum::{
     http::StatusCode,
 };
 use futures_util::StreamExt;
-use model_router::{Config, router};
+use model_router::router;
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt, BufReader},
@@ -17,6 +17,78 @@ use tokio::{
 };
 
 use crate::common::*;
+
+#[tokio::test]
+async fn client_markers_are_validated_before_forwarding() {
+    let fixture = Fixture::new().await;
+    for (markers, status) in [
+        (vec![], StatusCode::OK),
+        (vec!["codex"], StatusCode::OK),
+        (vec!["codex", "codex"], StatusCode::OK),
+        (vec![""], StatusCode::BAD_REQUEST),
+        (vec!["unknown"], StatusCode::BAD_REQUEST),
+        (vec!["codex", "unknown"], StatusCode::BAD_REQUEST),
+    ] {
+        let seen = fixture.live.seen.lock().unwrap().len();
+        let mut request = fixture
+            .client
+            .post(fixture.routed.url.clone() + "/responses")
+            .header("x-route-provider", "service-a")
+            .json(&json!({"model":"gpt-test"}));
+        for marker in markers {
+            request = request.header("x-router-client", marker);
+        }
+        assert_eq!(request.send().await.unwrap().status(), status);
+        assert_eq!(
+            fixture.live.seen.lock().unwrap().len(),
+            seen + usize::from(status.is_success())
+        );
+    }
+}
+
+#[tokio::test]
+async fn providers_sharing_an_endpoint_keep_distinct_credential_scopes() {
+    let fixture = Fixture::new().await;
+    let config = parse_config(
+        &json!({"providers":{
+            "first":{"base_url":fixture._live_server.url,"auth":"passthrough"},
+            "second":{"base_url":fixture._live_server.url,"auth":"passthrough",
+                "catalog":{"file":"models.json","format":"codex"}}
+        },"routes":[
+            {"path":"/direct","action":"forward","provider":"second"},
+            {"action":"model","provider":"first"}
+        ]})
+        .to_string(),
+        fixture.root.path(),
+    )
+    .unwrap();
+    let gateway = serve(router(config).unwrap()).await;
+    let seen = fixture.live.seen.lock().unwrap().len();
+    let response = fixture
+        .client
+        .post(gateway.url.clone() + "/responses")
+        .bearer_auth("first-token")
+        .json(&json!({"model":"publisher/model"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(fixture.live.seen.lock().unwrap().len(), seen);
+    for (path, model) in [("/responses", "unknown"), ("/direct", "publisher/model")] {
+        let response: Value = fixture
+            .client
+            .post(gateway.url.clone() + path)
+            .bearer_auth("own-token")
+            .json(&json!({"model":model}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(response["headers"]["authorization"], "Bearer own-token");
+    }
+}
 
 #[tokio::test]
 async fn routes_opaque_ids_and_keeps_request_bytes_and_credentials() {
@@ -84,10 +156,10 @@ async fn one_messages_client_can_route_main_and_workers_without_headers() {
         json!({"data":[{"id":"vendor/native"}]}).to_string(),
     )
     .unwrap();
-    let config = Config::from_json(
+    let config = parse_config(
         &json!({"providers":{
         "messages":{"base_url":messages.url,"auth":"passthrough"},
-        "inference":{"base_url":inference.url,"auth":"none","catalog_file":"models.json"}
+        "inference":{"base_url":inference.url,"auth":"none","catalog":{"file":"models.json","format":"anthropic"}}
     },"routes":[{"path_prefix":"/v1/messages","action":"model","provider":"messages"}]})
         .to_string(),
         root.path(),
@@ -144,7 +216,7 @@ async fn compressed_model_requests_route_without_reencoding_the_body() {
         json!({"data":[{"id":"native"}]}).to_string(),
     )
     .unwrap();
-    let config=Config::from_json(&json!({"providers":{"api":{"base_url":backend.url,"auth":"none","catalog_file":"models.json"}},"routes":[{"action":"model"}]}).to_string(),root.path()).unwrap();
+    let config=parse_config(&json!({"providers":{"api":{"base_url":backend.url,"auth":"none","catalog":{"file":"models.json","format":"openai"}}},"routes":[{"action":"model"}]}).to_string(),root.path()).unwrap();
     let gateway = serve(router(config).unwrap()).await;
     let response: Value = reqwest::Client::builder()
         .no_proxy()
@@ -174,7 +246,7 @@ async fn model_routing_waits_for_the_complete_body_without_rewriting_it() {
     }
     let backend = serve(Router::new().fallback(receive).with_state(arrived.clone())).await;
     let root = tempfile::tempdir().unwrap();
-    let config=Config::from_json(&json!({"providers":{"api":{"base_url":backend.url,"auth":"none"}},"routes":[{"action":"model","provider":"api"}]}).to_string(),root.path()).unwrap();
+    let config=parse_config(&json!({"providers":{"api":{"base_url":backend.url,"auth":"none"}},"routes":[{"action":"model","provider":"api"}]}).to_string(),root.path()).unwrap();
     let gateway = serve(router(config).unwrap()).await;
     let (release_tx, release_rx) = oneshot::channel();
     let (started_tx, started_rx) = oneshot::channel();
@@ -267,7 +339,7 @@ async fn bearer_keys_are_provider_scoped_and_missing_keys_return_503() {
     let descriptor = |variable: &str| {
         json!({
             "live":{"base_url":fixture._live_server.url,"auth":"none"},
-            "keyed":{"base_url":fixture._manual_server.url,"auth":"bearer","env_key":variable,"catalog_file":"models.json"}
+            "keyed":{"base_url":fixture._manual_server.url,"auth":"bearer","env_key":variable,"catalog":{"file":"models.json","format":"codex"}}
         })
     };
     // Use an existing non-secret variable so tests never mutate process-wide environment.
@@ -353,8 +425,8 @@ async fn forwarding_rules_support_arbitrary_paths_methods_and_binary_bodies() {
     }
     let backend = serve(Router::new().fallback(capture)).await;
     let root = tempfile::tempdir().unwrap();
-    let config = Config::from_json(
-        &json!({"providers":{"service":{"base_url":format!("{}/root/",backend.url),"auth":"none","catalog_file":"missing.json"}},"routes":[{"action":"forward","provider":"service"}]}).to_string(),
+    let config = parse_config(
+        &json!({"providers":{"service":{"base_url":format!("{}/root/",backend.url),"auth":"none","catalog":{"file":"missing.json","format":"codex"}}},"routes":[{"action":"forward","provider":"service"}]}).to_string(),
         root.path(),
     )
     .unwrap();
@@ -403,7 +475,7 @@ async fn ordered_rules_match_methods_paths_headers_and_queries() {
     }
     let server = serve(Router::new().fallback(backend)).await;
     let root = tempfile::tempdir().unwrap();
-    let config=Config::from_json(&json!({"providers":{
+    let config=parse_config(&json!({"providers":{
         "first":{"base_url":format!("{}/first",server.url),"auth":"none"},
         "second":{"base_url":format!("{}/second",server.url),"auth":"none"}
     },"routes":[
@@ -452,5 +524,5 @@ async fn ordered_rules_match_methods_paths_headers_and_queries() {
         StatusCode::NOT_FOUND
     );
     let invalid = json!({"providers":{"known":{"base_url":server.url,"auth":"none"}},"routes":[{"action":"forward","provider":"unknown"}]});
-    assert!(Config::from_json(&invalid.to_string(), root.path()).is_err());
+    assert!(parse_config(&invalid.to_string(), root.path()).is_err());
 }
