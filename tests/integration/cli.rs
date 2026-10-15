@@ -74,7 +74,7 @@ action = "model"
 }
 
 #[tokio::test]
-async fn supplied_toml_configuration_loads_its_json_catalog() {
+async fn supplied_discovery_configuration_loads_without_a_catalog_file() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
     let text = std::fs::read_to_string(root.join("router-config.toml")).unwrap();
     let config = model_router::Config::from_toml(&text, &root).unwrap();

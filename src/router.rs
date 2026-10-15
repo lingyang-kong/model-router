@@ -1,22 +1,19 @@
-use std::{io, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
-    Json, Router,
+    Router,
     body::Body,
     extract::{Request, State},
-    http::{StatusCode, request::Parts},
-    response::{IntoResponse, Response},
+    http::request::Parts,
+    response::Response,
 };
-use futures_util::TryStreamExt;
 use tokio::sync::RwLock;
-use tokio_util::io::StreamReader;
 
 use crate::{
     Config,
     adapters::Client,
     body::{inspect_body, stream_body},
     catalog::{ModelRegistry, load_manual_models},
-    compression::decode_body,
     config::{Provider, RouteAction, sanitize_headers},
     error::{Error, Result},
     websocket,
@@ -30,6 +27,20 @@ pub(crate) struct RouterState {
 }
 
 impl RouterState {
+    pub(crate) fn discovery_client(&self, url: &url::Url) -> &reqwest::Client {
+        let local = match url.host() {
+            Some(url::Host::Domain("localhost")) => true,
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            _ => false,
+        };
+        if local {
+            &self.loopback_client
+        } else {
+            &self.client
+        }
+    }
+
     pub async fn resolve_provider(
         &self,
         model: Option<&str>,
@@ -145,49 +156,23 @@ async fn forward_http(
     }
     let (parts, body) = request.into_parts();
     let (model, body) = match action {
-        RouteAction::Forward { .. } | RouteAction::Catalog { .. } => (None, stream_body(body)),
+        RouteAction::Catalog { format, .. } => {
+            return state
+                .catalog_response(
+                    parts,
+                    body,
+                    origin.expect("catalog requires a provider"),
+                    *format,
+                    adapter,
+                )
+                .await;
+        }
+        RouteAction::Forward { .. } => (None, stream_body(body)),
         RouteAction::Model { .. } => inspect_body(body, &parts.headers).await?,
     };
     let provider = state.resolve_provider(model.as_deref(), origin).await?;
-    let (client, mut request) = state.prepare_request(&provider, origin, &parts, body)?;
-    if matches!(action, RouteAction::Catalog { .. }) {
-        request.headers_mut().remove("if-none-match");
-        request.headers_mut().remove("if-modified-since");
-    }
+    let (client, request) = state.prepare_request(&provider, origin, &parts, body)?;
     let response = client.execute(request).await.map_err(Error::bad_gateway)?;
-    if let RouteAction::Catalog { format, .. } = action
-        && response.status() == StatusCode::OK
-    {
-        let (parts, body) = stream_response(response).into_parts();
-        let mut headers = parts.headers;
-        let reader = StreamReader::new(body.into_data_stream().map_err(io::Error::other));
-        let decoded = decode_body(reader, &headers)
-            .await
-            .map_err(Error::bad_gateway)?;
-        let mut document = serde_json::from_slice(&decoded).map_err(Error::bad_gateway)?;
-        let models = format.models(&mut document)?;
-        state.merge_catalog(&provider, models, *format).await?;
-        if let Some(adapter) = adapter {
-            adapter.prepare_catalog(models);
-        }
-        // The rewritten JSON has its own encoding and body representation.
-        for name in [
-            "content-encoding",
-            "content-type",
-            "etag",
-            "last-modified",
-            "content-md5",
-            "digest",
-            "content-digest",
-            "repr-digest",
-            "trailer",
-        ] {
-            headers.remove(name);
-        }
-        let mut merged = Json(document).into_response();
-        merged.headers_mut().extend(headers);
-        return Ok(merged);
-    }
     Ok(stream_response(response))
 }
 

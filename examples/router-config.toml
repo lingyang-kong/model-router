@@ -6,7 +6,23 @@ hidden_models = ["gpt-{5.6-*,6-sol}"]
 [providers.sglang]
 base_url = "http://localhost:30000/v1"
 auth = "none"
-catalog = { file = "codex-model-catalog.json", format = "codex" }
+catalog = { path = "/models", format = "openai" }
+discovery_urls = [
+	"http://localhost:30000/model_info",
+	"http://localhost:30000/server_info",
+	"http://localhost:30000/openapi.json",
+]
+
+[providers.sglang.models."nvidia/Qwen3.8-Flash-Next-NVFP4"]
+extends = { provider = "chatgpt", model = "gpt-6-luna" }
+name = "Qwen-3.8 Flash Next"
+description = "Zero-cost lightweight model with modest capabilities"
+reasoning_levels = [
+	{ level = "none", description = "Direct responses without a thinking phase for simple tasks" },
+	{ level = "low", description = "Fast responses with lighter reasoning" },
+	{ level = "medium", description = "Balances speed and reasoning depth for everyday tasks" },
+	{ level = "xhigh", description = "Maximum reasoning depth for complex problems" },
+]
 
 [[routes]]
 method = "GET"

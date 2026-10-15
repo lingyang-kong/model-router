@@ -9,6 +9,7 @@ use anyhow::{Context, bail};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Uri};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Deserializer, de::Error as _};
+use serde_json::{Map, Value};
 use url::{Host, Url};
 
 use crate::{
@@ -26,9 +27,23 @@ enum AuthMode {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct ManualCatalog {
-    pub file: PathBuf,
+pub(crate) struct CatalogSource {
+    pub file: Option<PathBuf>,
+    pub path: Option<String>,
     pub format: CatalogFormat,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ModelReference {
+    pub provider: String,
+    pub model: String,
+}
+
+#[derive(Default, Deserialize)]
+pub(crate) struct ModelSettings {
+    pub extends: Option<ModelReference>,
+    #[serde(flatten)]
+    pub metadata: Map<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -38,7 +53,13 @@ pub(crate) struct Provider {
     pub is_loopback: bool,
     #[serde(flatten)]
     auth: AuthMode,
-    pub catalog: Option<ManualCatalog>,
+    pub catalog: Option<CatalogSource>,
+    #[serde(default)]
+    pub discovery_urls: Vec<Url>,
+    #[serde(default)]
+    pub defaults: ModelSettings,
+    #[serde(default)]
+    pub models: BTreeMap<String, ModelSettings>,
     #[serde(default, deserialize_with = "deserialize_hidden_models")]
     pub hidden_models: GlobSet,
     #[serde(default, deserialize_with = "deserialize_static_headers")]
@@ -219,18 +240,35 @@ impl Config {
                 bail!("Bearer auth requires env_key naming the API key environment variable");
             }
             if let Some(catalog) = &mut provider.catalog {
-                let path = &mut catalog.file;
-                *path = if let Ok(relative) = path.strip_prefix("~") {
-                    PathBuf::from(env::var_os("HOME").context("HOME is not set")?).join(relative)
-                } else {
-                    root.join(&*path)
-                };
+                match (&mut catalog.file, &catalog.path) {
+                    (Some(path), None) => {
+                        *path = if let Ok(relative) = path.strip_prefix("~") {
+                            PathBuf::from(env::var_os("HOME").context("HOME is not set")?)
+                                .join(relative)
+                        } else {
+                            root.join(&*path)
+                        };
+                    }
+                    (None, Some(path)) => {
+                        let uri: Uri = path.parse().context("Invalid catalog endpoint path")?;
+                        if !path.starts_with('/')
+                            || uri.scheme().is_some()
+                            || uri.authority().is_some()
+                            || uri.query().is_some()
+                        {
+                            bail!(
+                                "Catalog endpoints must be paths starting with /, without queries"
+                            );
+                        }
+                        provider.upstream_url(&uri)?;
+                    }
+                    _ => bail!("Catalog sources require exactly one of file or path"),
+                }
             }
         }
         if routes.is_empty() {
             bail!("Configure at least one routing rule");
         }
-        let mut catalog_provider = None;
         for route in &routes {
             if let Some(name) = route.action.provider()
                 && !providers.contains_key(name)
@@ -244,15 +282,6 @@ impl Config {
                 if !path.starts_with('/') {
                     bail!("Route paths must start with /");
                 }
-            }
-            if let RouteAction::Catalog { provider, .. } = &route.action {
-                if catalog_provider.is_some_and(|previous| previous != provider) {
-                    bail!("Catalog rules must use one live provider");
-                }
-                if providers[provider].catalog.is_some() {
-                    bail!("Live catalog providers must not have a manual catalog");
-                }
-                catalog_provider = Some(provider);
             }
         }
         Ok(Self {
