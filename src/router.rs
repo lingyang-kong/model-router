@@ -13,7 +13,7 @@ use crate::{
     Config,
     adapters::Client,
     body::{inspect_body, stream_body},
-    catalog::{ModelRegistry, load_manual_models},
+    catalog::{CatalogState, ModelRegistry, load_manual_models},
     config::{Provider, RouteAction, sanitize_headers},
     error::{Error, Result},
     websocket,
@@ -21,7 +21,7 @@ use crate::{
 
 pub(crate) struct RouterState {
     pub config: Config,
-    pub models: RwLock<ModelRegistry>,
+    pub catalog: RwLock<CatalogState>,
     client: reqwest::Client,
     loopback_client: reqwest::Client,
 }
@@ -47,7 +47,7 @@ impl RouterState {
         fallback: Option<&Arc<Provider>>,
     ) -> Result<Arc<Provider>> {
         if let Some(model) = model
-            && let Some(entry) = self.models.read().await.get(model)
+            && let Some(entry) = self.catalog.read().await.models.get(model)
         {
             return Ok(Arc::clone(&entry.provider));
         }
@@ -93,9 +93,27 @@ pub fn router(config: Config) -> anyhow::Result<Router> {
     } else {
         ModelRegistry::new()
     };
+    let from_file = |provider: &Provider| {
+        provider
+            .catalog
+            .as_ref()
+            .is_some_and(|catalog| catalog.file.is_some())
+    };
+    let ready = config
+        .providers
+        .values()
+        .any(|provider| from_file(provider))
+        && config
+            .providers
+            .values()
+            .all(|provider| provider.catalog.is_none() || from_file(provider))
+        && config.routes.iter().all(|route| match &route.action {
+            RouteAction::Catalog { provider, .. } => from_file(&config.providers[provider]),
+            _ => true,
+        });
     let state = RouterState {
         config,
-        models: RwLock::new(models),
+        catalog: RwLock::new(CatalogState { models, ready }),
         client: build_http_client(false)?,
         loopback_client: build_http_client(true)?,
     };
@@ -163,11 +181,16 @@ async fn forward_http(
                     body,
                     origin.expect("catalog requires a provider"),
                     *format,
-                    adapter,
                 )
                 .await;
         }
         RouteAction::Forward { .. } => (None, stream_body(body)),
+        RouteAction::Model { .. } if adapter.is_some() => {
+            return adapter
+                .unwrap()
+                .forward_model(state, parts, body, origin)
+                .await;
+        }
         RouteAction::Model { .. } => inspect_body(body, &parts.headers).await?,
     };
     let provider = state.resolve_provider(model.as_deref(), origin).await?;

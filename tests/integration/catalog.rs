@@ -932,7 +932,7 @@ async fn client_adapters_and_catalog_formats_are_isolated_on_the_same_endpoint()
             "openai" | "anthropic" => (client, "data", "id"),
             _ => ("codex", "models", "slug"),
         };
-        let mut live = json!({(id_key):format!("live/{client}"),"multi_agent_version":"v2"});
+        let live = json!({(id_key):format!("live/{client}"),"multi_agent_version":"v2"});
         *fixture.live.models.lock().unwrap() = vec![live.clone()];
         let mut donor = json!({(id_key):"gpt-6-luna", "display_name":"GPT-6 Luna"});
         if format == "codex" {
@@ -954,11 +954,7 @@ async fn client_adapters_and_catalog_formats_are_isolated_on_the_same_endpoint()
         let response = request.send().await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let response: Value = response.json().await.unwrap();
-        let mut manual = json!({(id_key):format!("{format}/manual"),"display_name":"Manual"});
-        if client == "codex" {
-            live["multi_agent_version"] = json!("v1");
-            manual["multi_agent_version"] = json!("v1");
-        }
+        let manual = json!({(id_key):format!("{format}/manual"),"display_name":"Manual"});
         if format == "codex" {
             let models = response[key].as_array().unwrap();
             assert_eq!(models[0], live);
@@ -969,14 +965,7 @@ async fn client_adapters_and_catalog_formats_are_isolated_on_the_same_endpoint()
                     .iter()
                     .find(|model| model["slug"] == converted)
                     .unwrap();
-                assert_eq!(
-                    model["multi_agent_version"],
-                    if client == "codex" {
-                        json!("v1")
-                    } else {
-                        Value::Null
-                    }
-                );
+                assert_eq!(model["multi_agent_version"], Value::Null);
                 assert!(
                     model["model_messages"]["instructions_template"]
                         .as_str()

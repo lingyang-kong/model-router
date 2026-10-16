@@ -9,7 +9,17 @@ pub(crate) async fn decode_body<R: AsyncRead + Send + Unpin>(
     reader: R,
     headers: &HeaderMap,
 ) -> io::Result<Vec<u8>> {
-    let mut reader: Box<dyn AsyncRead + Send + Unpin + '_> = Box::new(reader);
+    let mut reader = decode_reader(reader, headers)?;
+    let mut decoded = Vec::new();
+    reader.read_to_end(&mut decoded).await?;
+    Ok(decoded)
+}
+
+pub(crate) fn decode_reader<'a, R: AsyncRead + Send + Unpin + 'a>(
+    reader: R,
+    headers: &HeaderMap,
+) -> io::Result<Box<dyn AsyncRead + Send + Unpin + 'a>> {
+    let mut reader: Box<dyn AsyncRead + Send + Unpin + 'a> = Box::new(reader);
     for value in headers.get_all("content-encoding").iter().rev() {
         for encoding in value
             .to_str()
@@ -38,9 +48,7 @@ pub(crate) async fn decode_body<R: AsyncRead + Send + Unpin>(
             };
         }
     }
-    let mut decoded = Vec::new();
-    reader.read_to_end(&mut decoded).await?;
-    Ok(decoded)
+    Ok(reader)
 }
 
 #[cfg(test)]

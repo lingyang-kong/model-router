@@ -105,7 +105,7 @@ async fn model_websockets_select_a_provider_from_handshake_hints() {
         };
         assert_eq!(response.status().as_u16(), expected_status);
     }
-    // Without a client marker, the Codex header is not interpreted.
+    // The Codex routing hint is ignored without its client marker.
     let mut request = url.clone().into_client_request().unwrap();
     request
         .headers_mut()
@@ -132,14 +132,36 @@ async fn model_websockets_select_a_provider_from_handshake_hints() {
         };
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
-    let mut request = url.clone().into_client_request().unwrap();
-    request
+    let mut codex_request = url.clone().into_client_request().unwrap();
+    codex_request
         .headers_mut()
         .insert("x-router-client", "codex".parse().unwrap());
-    request.headers_mut().insert(
+    codex_request.headers_mut().insert(
         "x-codex-routing-hint",
         "model=publisher/model;tier=priority".parse().unwrap(),
     );
+    let (mut codex_socket, _) = connect_async(codex_request).await.unwrap();
+    let codex_body = "{ \"model\" : \"publisher/model\", \"input\" : \"codex\" }";
+    codex_socket
+        .send(tungstenite::Message::Text(codex_body.into()))
+        .await
+        .unwrap();
+    let reply = timeout(Duration::from_secs(2), codex_socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_data();
+    let reply: Value = serde_json::from_slice(&reply).unwrap();
+    assert_eq!(reply["provider"], "service-b");
+    assert_eq!(reply["body"], codex_body);
+    codex_socket.close(None).await.unwrap();
+
+    // Generic x-model routing remains available and fixes the destination for the connection.
+    let mut request = url.clone().into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("x-model", "publisher/model".parse().unwrap());
     let (mut socket, _) = connect_async(request).await.unwrap();
     let original = "{ \"model\" : \"publisher/model\", \"input\" : \"preserved\" }";
     socket
