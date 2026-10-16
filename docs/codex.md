@@ -14,11 +14,8 @@ model_provider = "router"
 [agents]
 default_subagent_model = "vendor/model"
 
-[features]
-enable_request_compression = false
-
 [model_providers.router]
-name = "OpenAI" # Enables Codex's WebSocket routing hint
+name = "OpenAI"
 base_url = "http://localhost:8080"
 model_catalog_url = "http://localhost:8080/models"
 requires_openai_auth = true
@@ -28,12 +25,21 @@ http_headers = { "x-router-client" = "codex" }
 
 Replace `vendor/model` with the exact model ID in your catalog. Keep your ChatGPT login, or run `codex login`; no OpenAI API key is needed. Start `codex` and use `/model` to select the main model. Workers default to the configured model unless an explicit model or agent-role setting overrides it.
 
-## SGLang compatibility
+## Multi-agent v2 compatibility
 
-Tested with Codex 0.162.1 and the example Qwen deployment:
+For HTTP and WebSocket Model routes carrying `x-router-client: codex`, the router adapts Codex multi-agent v2 JSON messages for compatible Responses upstreams. It renames the `collaboration` tool namespace to `collaboration_compat` upstream, removes `message.encrypted` from `spawn_agent`, `send_message`, and `followup_task` schemas, then restores the original tool identities in returned calls. It maps collaboration tool identities in replayed input as well. Plaintext `agent_message` content is relabeled as `input_text`, including on marked requests whose upstream preserves native `agent_message` items. This does not decrypt `encrypted_content` or rewrite nested code-mode calls. Payloads that need no JSON edit retain their bytes. The WebSocket adaptation handles JSON messages only.
 
-- Keep request compression disabled as shown above. The client header selects v1 catalog settings for both parent and worker models; remove any configuration or launch option that forces v2.
-- Start a new Codex session after switching to v1. Restart the router and Codex after configuration or catalog edits; rebuild the router after code changes.
+When an actual input contains `agent_message`, the router validates support with a POST to the same provider, path, and model. If an HTTP request omits `model`, the probe omits it too so the provider chooses its default. The probe appends an invalid trailing sentinel and uses `max_output_tokens: 1` and `store: false`. Only an explicit HTTP 400 or 422 reporting unsupported `agent_message` causes conversion to an ordinary user-message envelope; other outcomes preserve native `agent_message` items. Validation runs when needed and is not cached. Mentions in text or unrelated nested fields do not trigger a probe.
+
+Subagent model listings use non-hidden entries from the latest successful catalog snapshots. Retired IDs remain routable but are not advertised. Before remote discovery succeeds, the client's cached model list is preserved; file-only catalogs are available at startup. A successful empty catalog clears the old choices, while a failed refresh preserves the previous listing.
+
+For WebSocket Model routes, the router reads `x-codex-routing-hint` during the handshake, selects the corresponding upstream provider, and keeps it fixed for that connection. The adapted handshake does not negotiate `permessage-deflate`, which the WebSocket library does not support; generic raw tunnels preserve negotiated extensions. Compression may remain enabled for HTTP requests; the adapter decodes and rewrites JSON when needed. Start a fresh Codex session after enabling this compatibility.
+
+The catalog retains the inherited `multi_agent_version`. Remove earlier v1 pins or configuration that disables Codex's multi-agent v2 feature.
+
+The isolated experiment observed correct initial task results in 4/4 runs for the full transformation. Same-child lifecycle replies completed in 2/3 runs; one delivered both messages but omitted the requested result. These results do not validate the router implementation or establish reliability. See [the experiment notes](../experiments/multiagent-v2/README.txt).
+
+The Rust adapter is covered by mock parent/worker exchanges, compressed JSON and streamed-event tests, and a live Qwen message-conversion check. A fresh GPT-to-Qwen delegation run through this adapter has not been repeated. Relabeling cannot decrypt ciphertext saved by an earlier session.
 
 ## Model metadata
 
@@ -63,6 +69,6 @@ This selects text compaction for **every model using the router provider**, incl
 
 With WebSockets, Codex uses `name = "OpenAI"` and ChatGPT sign-in to supply the model routing hint.
 
-In the test, GPT can use WebSockets while Qwen falls back to HTTP after connection retries because SGLang doesn't support WebSocket. Set `supports_websockets = false` to avoid those retries and use HTTP for both. Reconnect when changing providers.
+Keep `name = "OpenAI"` and ChatGPT sign-in so Codex supplies its routing hint. If the selected upstream rejects WebSockets, Codex may retry and fall back to HTTP; the previously tested SGLang endpoint rejected seven handshakes before that fallback. This is an endpoint limitation, and the router leaves the upstream handshake result intact. A provider is selected once per WebSocket connection, so reconnect after changing providers.
 
 [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)

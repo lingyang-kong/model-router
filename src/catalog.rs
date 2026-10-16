@@ -14,7 +14,7 @@ use tokio_util::io::StreamReader;
 
 use crate::{
     Config,
-    adapters::{CatalogFormat, Client},
+    adapters::CatalogFormat,
     body::stream_body,
     capabilities::{self, Discovery},
     compression::decode_body,
@@ -28,8 +28,16 @@ pub(crate) struct ModelEntry {
     pub format: CatalogFormat,
     /// Parsed source metadata, independent of the requesting client.
     pub metadata: Value,
+    /// False for retired IDs retained only for routing existing conversations.
+    pub listed: bool,
 }
 pub(crate) type ModelRegistry = IndexMap<String, ModelEntry>;
+
+pub(crate) struct CatalogState {
+    pub models: ModelRegistry,
+    /// Distinguishes an authoritative empty catalog from discovery not yet completed.
+    pub ready: bool,
+}
 
 /// Object fields combine recursively; arrays and scalar values replace the old value.
 pub(crate) fn overlay(target: &mut Value, fields: &Map<String, Value>) {
@@ -83,6 +91,7 @@ pub(crate) fn load_manual_models(config: &Config) -> Result<ModelRegistry> {
                     provider: Arc::clone(provider),
                     format: settings.format,
                     metadata,
+                    listed: true,
                 },
             );
         }
@@ -120,9 +129,10 @@ impl RouterState {
         if source.is_some_and(|source| source.file.is_some()) {
             let mut document = format.empty_catalog();
             format.models(&mut document)?.extend(
-                self.models
+                self.catalog
                     .read()
                     .await
+                    .models
                     .values()
                     .filter(|entry| Arc::ptr_eq(&entry.provider, provider))
                     .map(|entry| entry.metadata.clone()),
@@ -228,7 +238,6 @@ impl RouterState {
         body: Body,
         origin: &Arc<Provider>,
         output: CatalogFormat,
-        adapter: Option<Client>,
     ) -> Result<Response> {
         let incoming_headers = parts.headers.clone();
         let mut auxiliary = Vec::new();
@@ -267,6 +276,7 @@ impl RouterState {
                         provider: Arc::clone(&snapshot.provider),
                         format: snapshot.format,
                         metadata,
+                        listed: true,
                     },
                 );
             }
@@ -329,21 +339,27 @@ impl RouterState {
                 Ok(projected)
             }
         });
-        let mut models: Vec<_> = try_join_all(projections)
+        let models: Vec<_> = try_join_all(projections)
             .await?
             .into_iter()
             .flatten()
             .collect();
         // Validation and projection must succeed for every source before a refresh is visible.
-        let mut registry = self.models.write().await;
+        let mut catalog = self.catalog.write().await;
         for (id, entry) in &staged {
-            validate_ownership(&registry, id, &entry.provider)?;
+            validate_ownership(&catalog.models, id, &entry.provider)?;
         }
-        registry.extend(staged);
-        drop(registry);
-        if let Some(adapter) = adapter {
-            adapter.prepare_catalog(&mut models);
+        for entry in catalog.models.values_mut() {
+            if snapshots
+                .iter()
+                .any(|snapshot| Arc::ptr_eq(&snapshot.provider, &entry.provider))
+            {
+                entry.listed = false;
+            }
         }
+        catalog.models.extend(staged);
+        catalog.ready = true;
+        drop(catalog);
         let anchor = snapshots.into_iter().next().expect("catalog has an origin");
         let mut document = if anchor.format == output {
             anchor.document

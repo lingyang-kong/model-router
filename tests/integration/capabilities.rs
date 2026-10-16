@@ -292,7 +292,11 @@ async fn codex_slug_model_inventory_false_skips_tool_fetch_and_keeps_inherited_s
     for id in ["worker", "second-worker"] {
         assert!(models.iter().any(|model| model["slug"] == id));
     }
-    assert!(models.iter().all(|model| model["supports_search_tool"] == true));
+    assert!(
+        models
+            .iter()
+            .all(|model| model["supports_search_tool"] == true)
+    );
     assert_eq!(
         source
             .requests
