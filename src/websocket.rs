@@ -9,7 +9,7 @@ use axum::{
 use hyper_util::rt::TokioIo;
 
 use crate::{
-    adapters::{Client, ModelHint},
+    adapters::{Client, ModelHint, websocket::WebSocketContext},
     body::stream_body,
     config::{Provider, RouteAction, header_has_token, sanitize_headers},
     error::{Error, Result},
@@ -60,7 +60,7 @@ pub(crate) async fn forward(
     sanitize_headers(&mut headers);
     restore_upgrade_headers(response.headers(), &mut headers);
     let mut upstream = response.upgrade().await.map_err(Error::bad_gateway)?;
-    let context = crate::adapters::websocket::WebSocketContext {
+    let context = WebSocketContext {
         state: Arc::clone(state),
         provider: Arc::clone(&provider),
         headers: parts.headers,

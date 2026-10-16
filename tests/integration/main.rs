@@ -5,6 +5,7 @@ mod adapter_regressions;
 mod capabilities;
 mod catalog;
 mod cli;
+mod compaction;
 mod discovery;
 mod http_forwarding;
 mod model_listing;
