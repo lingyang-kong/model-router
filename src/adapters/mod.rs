@@ -1,4 +1,5 @@
 mod codex;
+pub(crate) mod websocket;
 
 use axum::http::HeaderMap;
 use serde::Deserialize;
@@ -231,9 +232,26 @@ impl Client {
         }
     }
 
-    pub fn prepare_catalog(self, models: &mut [Value]) {
+    pub async fn forward_model(
+        self,
+        state: &crate::router::RouterState,
+        parts: axum::http::request::Parts,
+        body: axum::body::Body,
+        origin: Option<&std::sync::Arc<crate::config::Provider>>,
+    ) -> Result<axum::response::Response> {
         match self {
-            Self::Codex => codex::prepare_catalog(models),
+            Self::Codex => codex::forward(state, parts, body, origin).await,
+        }
+    }
+
+    pub async fn adapt_websocket_message(
+        self,
+        message: tokio_tungstenite::tungstenite::Message,
+        request: bool,
+        context: &websocket::WebSocketContext,
+    ) -> tokio_tungstenite::tungstenite::Message {
+        match self {
+            Self::Codex => codex::adapt_websocket_message(message, request, context).await,
         }
     }
 

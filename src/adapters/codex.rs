@@ -5,6 +5,12 @@ use super::{CatalogLayout, ModelHint};
 use crate::capabilities::Capabilities;
 use crate::error::{Error, Result};
 
+mod multiagent;
+mod response;
+mod transport;
+
+pub(super) use transport::{adapt_websocket_message, forward};
+
 pub(super) const CATALOG: CatalogLayout = CatalogLayout {
     models: "models",
     id: "slug",
@@ -95,12 +101,6 @@ fn rewrite_identity(template: &str, model: &Value) -> Option<String> {
             .or_else(|| model.get("slug").and_then(Value::as_str))
             .unwrap_or("model"),
     ))
-}
-
-pub(super) fn prepare_catalog(models: &mut [Value]) {
-    for model in models {
-        model["multi_agent_version"] = Value::String("v1".into());
-    }
 }
 
 pub(super) fn model_hint<'a>(headers: &'a HeaderMap, hint: &mut ModelHint<'a>) -> Result<()> {

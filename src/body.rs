@@ -45,7 +45,11 @@ pub(crate) async fn inspect_body(
     } else {
         request_model(&bytes)?
     };
-    let body = if let Some(trailers) = trailers {
+    Ok((model, buffered_body(bytes, trailers)))
+}
+
+pub(crate) fn buffered_body(bytes: Bytes, trailers: Option<HeaderMap>) -> reqwest::Body {
+    if let Some(trailers) = trailers {
         // An exact size hint makes Hyper send Content-Length and omit the
         // trailing fields on HTTP/1.1 connections.
         let frames = [
@@ -55,8 +59,7 @@ pub(crate) async fn inspect_body(
         reqwest::Body::wrap(StreamBody::new(futures_util::stream::iter(frames)))
     } else {
         reqwest::Body::from(bytes)
-    };
-    Ok((model, body))
+    }
 }
 
 /// Adapts Axum's body to reqwest without inspecting or retaining frames.
