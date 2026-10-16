@@ -1,15 +1,96 @@
 use axum::http::HeaderMap;
 use serde_json::Value;
 
-use super::{CatalogLayout, ModelHint};
+use super::{catalog::CatalogLayout, client::ModelHint};
 use crate::capabilities::Capabilities;
 use crate::error::{Error, Result};
+use serde_json::Map;
 
+mod compaction;
+mod compaction_transport;
 mod multiagent;
 mod response;
 mod transport;
 
-pub(super) use transport::{adapt_websocket_message, forward};
+pub(super) use transport::{adapt_websocket_response, forward, websocket_request};
+
+fn rename_field(fields: &mut Map<String, Value>, from: &str, to: &str) {
+    if from != to
+        && let Some(value) = fields.remove(from)
+    {
+        fields.insert(to.to_owned(), value);
+    }
+}
+
+fn rename_reasoning_levels(value: Option<&mut Value>, from: &str, to: &str) {
+    if let Some(Value::Array(levels)) = value {
+        for level in levels {
+            if let Value::Object(fields) = level {
+                rename_field(fields, from, to);
+            }
+        }
+    }
+}
+
+pub(super) fn settings(fields: &Map<String, Value>) -> Map<String, Value> {
+    let mut fields = fields.clone();
+    for (shared, wire) in [
+        ("name", "display_name"),
+        ("description", "description"),
+        ("reasoning_level", "default_reasoning_level"),
+        ("reasoning_levels", "supported_reasoning_levels"),
+    ] {
+        rename_field(&mut fields, shared, wire);
+    }
+    rename_reasoning_levels(
+        fields.get_mut("supported_reasoning_levels"),
+        "level",
+        "effort",
+    );
+    fields
+}
+
+pub(super) fn shared_metadata(model: &Value) -> Map<String, Value> {
+    let fields = [
+        ("name", "display_name"),
+        ("description", "description"),
+        ("reasoning_level", "default_reasoning_level"),
+        ("reasoning_levels", "supported_reasoning_levels"),
+    ];
+    let mut result: Map<String, Value> = fields
+        .iter()
+        .filter_map(|&(shared, wire)| {
+            model
+                .get(wire)
+                .or_else(|| model.get(shared))
+                .map(|value| (shared.to_owned(), value.clone()))
+        })
+        .collect();
+    rename_reasoning_levels(result.get_mut("reasoning_levels"), "effort", "level");
+    result
+}
+
+pub(super) fn apply_context_window(
+    result: &mut Value,
+    source: super::catalog::CatalogFormat,
+    model: &Value,
+) {
+    if let Some(context) = source.context_window(model) {
+        result.as_object_mut().unwrap().remove("context_window");
+        result["max_context_window"] = context.clone();
+    }
+}
+
+pub(super) fn apply_projection_metadata(
+    result: &mut Value,
+    has_base: bool,
+    local_shared: &Map<String, Value>,
+    target_id: &str,
+) {
+    if has_base && !local_shared.contains_key("name") {
+        result["display_name"] = Value::String(target_id.to_owned());
+    }
+}
 
 pub(super) const CATALOG: CatalogLayout = CatalogLayout {
     models: "models",
