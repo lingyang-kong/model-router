@@ -1,7 +1,7 @@
 [providers.chatgpt]
 base_url = "https://chatgpt.com/backend-api/codex"
 auth = "passthrough"
-hidden_models = ["gpt-{5.6-*,6-sol}"]
+hidden_models = ["gpt-{reserve,5.6-*,6-sol}"]
 
 [providers.sglang]
 base_url = "http://localhost:30000/v1"

@@ -159,7 +159,7 @@ async fn handle_request(
 }
 
 async fn forward_http(
-    state: &RouterState,
+    state: &Arc<RouterState>,
     request: Request,
     action: &RouteAction,
     origin: Option<&Arc<Provider>>,

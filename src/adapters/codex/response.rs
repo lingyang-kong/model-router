@@ -86,7 +86,7 @@ fn response_from_parts(
     response
 }
 
-fn clean_rewritten_headers(headers: &mut HeaderMap) {
+pub(super) fn clean_rewritten_headers(headers: &mut HeaderMap) {
     for name in [
         "content-encoding",
         "content-length",
