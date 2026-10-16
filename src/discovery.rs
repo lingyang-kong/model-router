@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, io, sync::Arc, time::Duration};
 
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode, request::Parts};
 use futures_util::{TryStreamExt, future::join_all};
 use tokio_util::io::StreamReader;
 use url::Url;
@@ -22,27 +22,59 @@ impl RouterState {
         incoming: &HeaderMap,
         model: &str,
     ) -> Option<bool> {
-        provider.validate_credential_scope(Some(origin)).ok()?;
-        let url = provider.upstream_url(&"/responses".parse().ok()?).ok()?;
-        let headers = discovery_headers(provider, incoming, &url)?;
+        let (mut parts, _) = axum::http::Request::builder()
+            .uri("/responses")
+            .body(())
+            .ok()?
+            .into_parts();
+        parts.headers = incoming.clone();
+        self.probe_response_item(
+            provider,
+            Some(origin),
+            &parts,
+            Some(model),
+            serde_json::json!({"type":"additional_tools","role":"developer","tools":[]}),
+        )
+        .await
+    }
+
+    /// Only rejection of the tested item establishes missing support. The invalid
+    /// trailing item prevents normal generation; other outcomes remain unknown.
+    pub(crate) async fn probe_response_item(
+        &self,
+        provider: &Arc<Provider>,
+        origin: Option<&Arc<Provider>>,
+        parts: &Parts,
+        model: Option<&str>,
+        item: serde_json::Value,
+    ) -> Option<bool> {
+        provider.validate_credential_scope(origin).ok()?;
+        let item_type = item.get("type")?.as_str()?.to_owned();
+        let url = provider.upstream_url(&parts.uri).ok()?;
+        let mut headers = discovery_headers(provider, &parts.headers, &url)?;
+        for header in [
+            "sec-websocket-key",
+            "sec-websocket-version",
+            "sec-websocket-protocol",
+            "sec-websocket-extensions",
+        ] {
+            headers.remove(header);
+        }
+        let mut body = serde_json::json!({
+            "input": [item, {"type":"__model_router_capability_check__"}],
+            "max_output_tokens": 1,
+            "store": false,
+        });
+        if let Some(model) = model {
+            body["model"] = serde_json::Value::String(model.to_owned());
+        }
         tokio::time::timeout(Duration::from_secs(3), async {
             let response = self
                 .discovery_client(&url)
-                .post(url)
+                .request(Method::POST, url)
                 .headers(headers)
                 .header("content-type", "application/json")
-                .body(
-                    serde_json::json!({
-                        "model": model,
-                        "input": [
-                            {"type": "additional_tools", "role": "developer", "tools": []},
-                            {"type": "__model_router_capability_check__"}
-                        ],
-                        "max_output_tokens": 1,
-                        "store": false
-                    })
-                    .to_string(),
-                )
+                .body(body.to_string())
                 .send()
                 .await
                 .ok()?;
@@ -56,7 +88,9 @@ impl RouterState {
             document
                 .pointer("/error/message")?
                 .as_str()?
-                .starts_with("Unsupported Responses API input item type: 'additional_tools'")
+                .starts_with(&format!(
+                    "Unsupported Responses API input item type: '{item_type}'"
+                ))
                 .then_some(false)
         })
         .await
@@ -159,6 +193,7 @@ fn discovery_headers(provider: &Provider, incoming: &HeaderMap, url: &Url) -> Op
         HeaderMap::new()
     };
     for name in [
+        "idempotency-key",
         "if-none-match",
         "if-modified-since",
         "content-encoding",

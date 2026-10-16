@@ -57,6 +57,123 @@ async fn unchanged_head_responses_preserve_representation_length() {
 }
 
 #[tokio::test]
+async fn head_response_headers_survive_generic_and_codex_forwarding_for_json_and_sse() {
+    async fn endpoint(request: Request) -> Response {
+        let content_type = match request.uri().path() {
+            "/json" => "application/json",
+            "/sse" => "text/event-stream",
+            _ => unreachable!(),
+        };
+        Response::builder()
+            .header("content-length", "4096")
+            .header("content-encoding", "gzip")
+            .header("content-type", content_type)
+            .header("content-md5", "old-md5")
+            .header("digest", "sha-256=old")
+            .header("content-digest", "sha-256=:b2xk:")
+            .header("repr-digest", "sha-256=:b2xk:")
+            .header("etag", "\"head-representation\"")
+            .body(Body::empty())
+            .unwrap()
+    }
+    let upstream = serve(Router::new().fallback(endpoint)).await;
+    let generic_gateway =
+        gateway(&upstream, json!([{"action": "forward", "provider": "api"}])).await;
+    let codex_gateway = gateway(&upstream, json!([{"action": "model", "provider": "api"}])).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .no_gzip()
+        .build()
+        .unwrap();
+
+    for path in ["json", "sse"] {
+        for codex in [false, true] {
+            let gateway = if codex {
+                &codex_gateway
+            } else {
+                &generic_gateway
+            };
+            let mut request = client.head(format!("{}/{path}", gateway.url));
+            if codex {
+                request = request.header("originator", "codex_cli_rs");
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}, codex={codex}");
+            assert_eq!(
+                response.headers()["content-length"],
+                "4096",
+                "{path}, codex={codex}"
+            );
+            assert_eq!(
+                response.headers()["content-encoding"],
+                "gzip",
+                "{path}, codex={codex}"
+            );
+            assert_eq!(
+                response.headers()["content-type"],
+                if path == "json" {
+                    "application/json"
+                } else {
+                    "text/event-stream"
+                },
+                "{path}, codex={codex}"
+            );
+            for (name, value) in [
+                ("content-md5", "old-md5"),
+                ("digest", "sha-256=old"),
+                ("content-digest", "sha-256=:b2xk:"),
+                ("repr-digest", "sha-256=:b2xk:"),
+                ("etag", "\"head-representation\""),
+            ] {
+                assert_eq!(
+                    response.headers()[name],
+                    value,
+                    "{name}, {path}, codex={codex}"
+                );
+            }
+            assert!(
+                response.bytes().await.unwrap().is_empty(),
+                "{path}, codex={codex}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn bodyless_success_responses_preserve_representation_headers() {
+    for status in [StatusCode::NO_CONTENT, StatusCode::RESET_CONTENT] {
+        for content_type in ["application/json", "text/event-stream"] {
+            let upstream = serve(Router::new().fallback(move || async move {
+                Response::builder()
+                    .status(status)
+                    .header("content-type", content_type)
+                    .header("content-encoding", "gzip")
+                    .header("etag", "\"representation\"")
+                    .body(Body::empty())
+                    .unwrap()
+            }))
+            .await;
+            let gateway = gateway(&upstream, json!([{"action": "model"}])).await;
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .no_gzip()
+                .build()
+                .unwrap()
+                .get(format!("{}/responses", gateway.url))
+                .header("originator", "codex_cli_rs")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers()["content-type"], content_type);
+            assert_eq!(response.headers()["content-encoding"], "gzip");
+            assert_eq!(response.headers()["etag"], "\"representation\"");
+            assert!(response.bytes().await.unwrap().is_empty());
+        }
+    }
+}
+
+#[tokio::test]
 async fn streams_responses_without_waiting_for_completion() {
     let fixture = Fixture::new().await;
     let started = Instant::now();

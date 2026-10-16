@@ -1,6 +1,6 @@
 # Model router
 
-A local HTTP/WebSocket proxy that routes requests by rules or native model IDs. Upstreams must implement the client's API; request bodies are forwarded unchanged.
+A local HTTP/WebSocket proxy that routes requests by rules or native model IDs. Upstreams must implement the client's API; request bodies are forwarded unchanged except for configured or client-specific transformations such as the Codex multi-agent adapter.
 
 ## Run
 
@@ -88,7 +88,7 @@ Optional `discovery_urls` on a provider supply additional HTTP JSON information,
 
 Explicit capability flags, model-scoped image support, native tool inventories, and closed image-detail enums can refine inherited Codex fields. Unknown capabilities inherit their donor settings. A fresh negative tool-inventory declaration suppresses tool-list queries. A tool type appearing in an OpenAPI enum alone does not establish runtime support. If a Codex-projected row enables Responses Lite and discovery has not declared support, the router optionally POSTs to `base_url + /responses` with `input` containing `[{"type":"additional_tools","role":"developer","tools":[]},{"type":"__model_router_capability_check__"}]`, `max_output_tokens: 1`, and `store: false`. Only an HTTP 400 or 422 whose error message begins `Unsupported Responses API input item type: 'additional_tools'` records unsupported; every other outcome remains unknown. The sentinel is intended to trigger validation, though a loosely validating server could generate up to one token. Discovery calls time out after three seconds. Queries use provider credentials only on the provider's origin; explicitly configured external URLs are queried anonymously.
 
-Remote model IDs are unknown to model routing until the first successful catalog refresh unless a fallback provider is configured. A failed refresh keeps the previous routing data. IDs missing from a later refresh remain routable until restart but are no longer displayed. Conflicting ownership rejects the refresh. The router preserves catalog envelopes and pagination fields, so use a complete catalog endpoint.
+Remote model IDs are unknown to model routing until the first successful catalog refresh unless a fallback provider is configured. A failed refresh keeps the previous routing data and subagent listing. IDs missing from a later refresh remain routable until restart but are excluded from both catalog responses and subagent listings. Before remote discovery succeeds, the client's cached model list is preserved; file-only catalogs are available at startup. Conflicting ownership rejects the refresh. The router preserves catalog envelopes and pagination fields, so use a complete catalog endpoint.
 
 When a catalog route's provider has no configured `catalog` source, the router forwards the client's original method, path, query, and body to that provider as before. This allows a Codex route to fetch the official ChatGPT catalog and use an exact catalog entry as an inheritance donor.
 
@@ -98,13 +98,15 @@ Patterns match whole IDs case-sensitively, and `*` continues to match `/`. They 
 
 Each rule selects the source whose catalog envelope is retained when its format matches the output. File sources contribute model rows only. Additional remote sources receive their own configured headers and credentials, without client headers. The router never reads client cache files.
 
-`x-router-client: codex` enables Codex's v1 metadata adjustment and WebSocket hint parser. Omit it for other clients. Unknown or conflicting markers and client/format mismatches are rejected.
+`x-router-client: codex` selects Codex metadata handling and routing hints. On HTTP and WebSocket Model routes it also enables the multi-agent v2 JSON transformations: rename collaboration tools upstream and restore their identities, remove the `message.encrypted` schema property from the three task functions, and map replayed tool identities. Unchanged payload bytes pass through; JSON payloads are rewritten only when an adaptation applies. Plaintext `agent_message` content relabeled as `input_text` remains marked Codex traffic; this relabeling does not decrypt `encrypted_content` or rewrite nested code-mode calls. For each actual input `agent_message`, the router validates support with a POST to the same provider, path, and model, using an invalid trailing sentinel, `max_output_tokens: 1`, and `store: false`. Only an explicit HTTP 400 or 422 reporting unsupported `agent_message` converts it to an ordinary user-message envelope; other outcomes preserve the native item. The probe runs on each applicable request, with no acceptance cache. Subagent model listings come from non-hidden models in the routing catalog, regardless of provider flags or whether a model is native or custom; they are learned during the existing catalog refresh. Marked WebSocket routes select a provider from `x-codex-routing-hint` during the upstream handshake and keep that provider for the connection. The adapted handshake does not negotiate `permessage-deflate`; generic raw WebSocket routes preserve extensions. Request compression may stay enabled. See [Codex setup and limits](docs/codex.md#multi-agent-v2-compatibility). Unknown or conflicting markers and client/format mismatches are rejected.
 
 ## Transport
 
+The Codex adapter shares a conservative byte scan across WebSocket, HTTP JSON, and SSE before building a JSON tree. Messages without relevant protocol names skip adaptation parsing. Any JSON escape triggers the parsing path so escaped names cannot bypass rewriting. WebSocket framing, HTTP model selection, and decompression where required still apply.
+
 HTTP model routing buffers the request to read `model`; responses stream. Unchanged traffic preserves bytes and trailers. Rewritten catalogs discard stale encoding, integrity, and cache validators. The router adds no payload or concurrency cap.
 
-WebSocket model routes need `x-model: <native ID>` or a [Codex routing hint](docs/codex.md#websockets). After the handshake, bytes are tunneled without inspecting messages. Reconnect to change providers.
+WebSocket model routes need `x-model: <native ID>` or a [Codex routing hint](docs/codex.md#websocket-routing). Generic routes tunnel bytes after the handshake. Marked Codex routes adapt JSON messages and keep the selected provider fixed for the connection. Reconnect to change providers.
 
 Loopback upstreams bypass proxy environment variables; remote upstreams honor them.
 
