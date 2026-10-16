@@ -1,6 +1,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod adapter_regressions;
 mod capabilities;
 mod catalog;
 mod cli;
