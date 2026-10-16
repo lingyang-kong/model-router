@@ -100,6 +100,8 @@ Each rule selects the source whose catalog envelope is retained when its format 
 
 `x-router-client: codex` selects Codex metadata handling and routing hints. On HTTP and WebSocket Model routes it also enables the multi-agent v2 JSON transformations: rename collaboration tools upstream and restore their identities, remove the `message.encrypted` schema property from the three task functions, and map replayed tool identities. Unchanged payload bytes pass through; JSON payloads are rewritten only when an adaptation applies. Plaintext `agent_message` content relabeled as `input_text` remains marked Codex traffic; this relabeling does not decrypt `encrypted_content` or rewrite nested code-mode calls. For each actual input `agent_message`, the router validates support with a POST to the same provider, path, and model, using an invalid trailing sentinel, `max_output_tokens: 1`, and `store: false`. Only an explicit HTTP 400 or 422 reporting unsupported `agent_message` converts it to an ordinary user-message envelope; other outcomes preserve the native item. The probe runs on each applicable request, with no acceptance cache. Subagent model listings come from non-hidden models in the routing catalog, regardless of provider flags or whether a model is native or custom; they are learned during the existing catalog refresh. Marked WebSocket routes select a provider from `x-codex-routing-hint` during the upstream handshake and keep that provider for the connection. The adapted handshake does not negotiate `permessage-deflate`; generic raw WebSocket routes preserve extensions. Request compression may stay enabled. See [Codex setup and limits](docs/codex.md#multi-agent-v2-compatibility). Unknown or conflicting markers and client/format mismatches are rejected.
 
+Codex compaction is handled when a normal Responses request contains an actual `compaction_trigger` input item. The router checks that provider's Responses endpoint on each trigger; it does not infer support from `/responses/compact` or probe ordinary requests, checkpoints, or text mentions. Supported providers handle compaction natively. When the endpoint explicitly rejects the trigger item with HTTP 400 or 422, the router generates a synthetic text summary; other probe outcomes leave handling native. Router-owned checkpoints are hydrated on later inference requests, while unknown opaque checkpoints pass through. See [Codex compaction behavior](docs/codex.md#remote-v2-compaction).
+
 ## Transport
 
 The Codex adapter shares a conservative byte scan across WebSocket, HTTP JSON, and SSE before parsing relevant protocol envelopes. Messages without relevant protocol names skip adaptation parsing. Any JSON escape triggers the parsing path so escaped names cannot bypass rewriting. WebSocket framing, HTTP model selection, and decompression where required still apply.
@@ -126,6 +128,8 @@ SIGINT and SIGTERM drain in-flight requests before shutdown.
 ## Development
 
 See the [feature plan](docs/roadmap.md) for discovery, aliases, and optional client compatibility work.
+
+A clean first build fetches the pinned Codex compaction prompt templates and license into Cargo's `OUT_DIR` using `curl`; it needs network access. Cargo's build cache avoids fetching them again on incremental builds. `cargo --offline` controls Cargo dependency resolution and does not provide uncached prompt files.
 
 ```sh
 cargo fmt --check
