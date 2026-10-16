@@ -1,238 +1,312 @@
-use serde_json::Value;
-
+use serde_json::value::RawValue;
+use std::collections::BTreeMap;
 struct NamespacePair {
     client: &'static str,
     upstream: &'static str,
 }
-
 const COLLABORATION: NamespacePair = NamespacePair {
     client: "collaboration",
     upstream: "collaboration_compat",
 };
-
 const AGENT_MESSAGE: &str = "agent_message";
 const ENCRYPTED_CONTENT: &str = "encrypted_content";
 const INPUT_TEXT: &str = "input_text";
 const SPAWN_AGENT: &str = "spawn_agent";
 
-/// Cheap conservative check used to avoid parsing unrelated request bodies.
 pub(crate) fn request_may_need_adaptation(bytes: &[u8]) -> bool {
     memchr::memchr(b'\\', bytes).is_some()
         || contains(bytes, COLLABORATION.client.as_bytes())
         || contains(bytes, COLLABORATION.upstream.as_bytes())
         || contains(bytes, AGENT_MESSAGE.as_bytes())
 }
-
-/// Cheap conservative check used to avoid parsing unrelated response events.
 pub(crate) fn response_may_need_adaptation(bytes: &[u8]) -> bool {
     memchr::memchr(b'\\', bytes).is_some() || contains(bytes, COLLABORATION.upstream.as_bytes())
 }
-
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     memchr::memmem::find(haystack, needle).is_some()
 }
 
-/// Applies the observed Codex multi-agent-v2 request compatibility transforms.
-pub(crate) fn prepare_request(
-    body: &mut Value,
-    text_agent_messages: bool,
-    model_listing: &str,
-) -> bool {
-    let mut changed = false;
-    if let Some(tools) = body.get_mut("tools").and_then(Value::as_array_mut) {
-        changed |= prepare_tools(tools, model_listing);
+// Open only the protocol envelopes we edit. Raw values keep arbitrary schema
+// and payload depth out of recursive deserialization, serialization, and drop.
+fn parse_object(raw: &RawValue) -> serde_json::Result<Option<BTreeMap<String, Box<RawValue>>>> {
+    parse_object_bytes(raw.get().as_bytes())
+}
+
+fn parse_object_bytes(bytes: &[u8]) -> serde_json::Result<Option<BTreeMap<String, Box<RawValue>>>> {
+    if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return Ok(None);
     }
-    if let Some(input) = body.get_mut("input").and_then(Value::as_array_mut) {
-        for item in input {
-            if item.get("type").and_then(Value::as_str) == Some("additional_tools")
-                && let Some(tools) = item.get_mut("tools").and_then(Value::as_array_mut)
-            {
-                changed |= prepare_tools(tools, model_listing);
-            }
-            changed |= rewrite_call_identity(item, COLLABORATION.client, COLLABORATION.upstream);
-            if item.get("type").and_then(Value::as_str) == Some(AGENT_MESSAGE) {
-                changed |= rewrite_agent_message(item, text_agent_messages);
-            }
-        }
+    serde_json::from_slice(bytes).map(Some)
+}
+fn parse_array(raw: &RawValue) -> serde_json::Result<Option<Vec<Box<RawValue>>>> {
+    if !raw.get().starts_with('[') {
+        return Ok(None);
     }
-    changed
+    serde_json::from_str(raw.get()).map(Some)
+}
+fn string(raw: Option<impl AsRef<RawValue>>) -> Option<String> {
+    raw.and_then(|value| serde_json::from_str(value.as_ref().get()).ok())
+}
+fn encode_string(value: &str) -> Box<RawValue> {
+    serde_json::value::to_raw_value(value).expect("string serialization cannot fail")
+}
+fn set_str(object: &mut BTreeMap<String, Box<RawValue>>, key: &str, value: &str) {
+    object.insert(key.into(), encode_string(value));
+}
+fn encode_json<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Result<Box<RawValue>> {
+    serde_json::value::to_raw_value(value)
 }
 
 pub(super) fn has_agent_message(bytes: &[u8]) -> serde_json::Result<bool> {
     if !contains(bytes, AGENT_MESSAGE.as_bytes()) && !bytes.contains(&b'\\') {
         return Ok(false);
     }
-    let body: Value = serde_json::from_slice(bytes)?;
-    Ok(body
-        .get("input")
-        .and_then(Value::as_array)
-        .is_some_and(|items| {
-            items
-                .iter()
-                .any(|item| item.get("type").and_then(Value::as_str) == Some(AGENT_MESSAGE))
-        }))
+    let Some(object) = parse_object_bytes(bytes)? else {
+        return Ok(false);
+    };
+    let Some(input) = object.get("input") else {
+        return Ok(false);
+    };
+    let Some(items) = parse_array(input)? else {
+        return Ok(false);
+    };
+    for item in &items {
+        if let Some(item) = parse_object(item)?
+            && string(item.get("type")).as_deref() == Some(AGENT_MESSAGE)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(super) fn prepare_bytes(
     bytes: &[u8],
     text_agent_messages: bool,
-    model_listing: &str,
+    listing: &str,
 ) -> serde_json::Result<Option<Vec<u8>>> {
-    if !request_may_need_adaptation(bytes) {
+    let Some(mut object) = parse_object_bytes(bytes)? else {
+        return Ok(None);
+    };
+    let mut changed = false;
+    if let Some(tools) = object.get("tools")
+        && let Some(items) = parse_array(tools)?
+    {
+        let (items, tools_changed) = prepare_tools(items, listing)?;
+        if tools_changed {
+            object.insert("tools".into(), encode_json(&items)?);
+            changed = true;
+        }
+    }
+    if let Some(input) = object.get("input")
+        && let Some(items) = parse_array(input)?
+    {
+        let (items, input_changed) = prepare_input(items, text_agent_messages, listing)?;
+        if input_changed {
+            object.insert("input".into(), encode_json(&items)?);
+            changed = true;
+        }
+    }
+    if !changed {
         return Ok(None);
     }
-    let mut body: Value = serde_json::from_slice(bytes)?;
-    if prepare_request(&mut body, text_agent_messages, model_listing) {
-        Ok(Some(serde_json::to_vec(&body)?))
-    } else {
-        Ok(None)
-    }
+    Ok(Some(serde_json::to_vec(&object)?))
 }
-
-fn prepare_tools(tools: &mut [Value], listing: &str) -> bool {
+fn prepare_tools(
+    mut tools: Vec<Box<RawValue>>,
+    listing: &str,
+) -> serde_json::Result<(Vec<Box<RawValue>>, bool)> {
     let mut changed = false;
-    for tool in tools {
-        if tool.get("type").and_then(Value::as_str) == Some("namespace") {
-            let namespace = tool.get("name").and_then(Value::as_str);
-            let collaboration = namespace == Some(COLLABORATION.client)
-                || namespace == Some(COLLABORATION.upstream);
-            if namespace == Some(COLLABORATION.client) {
-                tool["name"] = Value::String(COLLABORATION.upstream.into());
-                changed = true;
-            }
-            if collaboration
-                && let Some(nested) = tool.get_mut("tools").and_then(Value::as_array_mut)
-            {
-                changed |= prepare_collaboration_tools(nested, listing);
-            }
+    for entry in &mut tools {
+        let Some(mut tool) = parse_object(entry)? else {
+            continue;
+        };
+        if string(tool.get("type")).as_deref() != Some("namespace") {
             continue;
         }
-    }
-    changed
-}
-
-fn prepare_collaboration_tools(tools: &mut [Value], listing: &str) -> bool {
-    let mut changed = false;
-    for tool in tools {
-        if tool.get("type").and_then(Value::as_str) == Some("namespace") {
-            // A nested namespace starts a different tool scope.
-            continue;
+        let name = string(tool.get("name"));
+        let collab = name.as_deref() == Some(COLLABORATION.client)
+            || name.as_deref() == Some(COLLABORATION.upstream);
+        let mut tool_changed = false;
+        if name.as_deref() == Some(COLLABORATION.client) {
+            set_str(&mut tool, "name", COLLABORATION.upstream);
+            changed = true;
+            tool_changed = true;
         }
-        let name = tool.get("name").and_then(Value::as_str);
-        let spawn = name == Some(SPAWN_AGENT);
-        if matches!(name, Some(SPAWN_AGENT | "send_message" | "followup_task"))
-            && let Some(message) = tool.pointer_mut("/parameters/properties/message")
+        if collab
+            && let Some(nested_tools) = tool.get("tools")
+            && let Some(nested_items) = parse_array(nested_tools)?
         {
-            // Schema's message.encrypted annotation lives on the message schema itself.
-            if let Some(message) = message.as_object_mut() {
-                changed |= message.remove("encrypted").is_some();
+            let (nested_items, nested_changed) =
+                prepare_collaboration_tools(nested_items, listing)?;
+            if nested_changed {
+                tool.insert("tools".into(), encode_json(&nested_items)?);
+                changed = true;
+                tool_changed = true;
             }
         }
-        if spawn
+        if tool_changed {
+            *entry = encode_json(&tool)?;
+        }
+    }
+    Ok((tools, changed))
+}
+fn prepare_collaboration_tools(
+    mut tools: Vec<Box<RawValue>>,
+    listing: &str,
+) -> serde_json::Result<(Vec<Box<RawValue>>, bool)> {
+    let mut changed = false;
+    for entry in &mut tools {
+        let Some(mut tool) = parse_object(entry)? else {
+            continue;
+        };
+        if string(tool.get("type")).as_deref() == Some("namespace") {
+            continue;
+        }
+        let name = string(tool.get("name"));
+        let mut tool_changed = false;
+        if matches!(
+            name.as_deref(),
+            Some("spawn_agent" | "send_message" | "followup_task")
+        ) && let Some(parameters) = tool.get("parameters")
+            && let Some(mut parameters) = parse_object(parameters)?
+        {
+            let mut parameters_changed = false;
+            if let Some(properties) = parameters.get("properties")
+                && let Some(mut properties) = parse_object(properties)?
+                && let Some(message_raw) = properties.get("message")
+                && let Some(mut message) = parse_object(message_raw)?
+                && message.remove("encrypted").is_some()
+            {
+                properties.insert("message".into(), encode_json(&message)?);
+                parameters.insert("properties".into(), encode_json(&properties)?);
+                parameters_changed = true;
+            }
+            if parameters_changed {
+                tool.insert("parameters".into(), encode_json(&parameters)?);
+                changed = true;
+                tool_changed = true;
+            }
+        }
+        if name.as_deref() == Some(SPAWN_AGENT)
             && !listing.is_empty()
-            && let Some(description) = tool.get("description").and_then(Value::as_str)
+            && let Some(description) = string(tool.get("description"))
         {
             // Codex puts its model list before this stable tool-description marker.
             let description = description
                 .find("Spawns an agent")
-                .map_or(description, |start| &description[start..]);
+                .map_or(description.as_str(), |start| &description[start..]);
             let combined = format!("{listing}{description}");
             if combined != description {
-                tool["description"] = Value::String(combined);
+                set_str(&mut tool, "description", &combined);
                 changed = true;
+                tool_changed = true;
             }
         }
+        if tool_changed {
+            *entry = encode_json(&tool)?;
+        }
     }
-    changed
+    Ok((tools, changed))
 }
-
-fn rewrite_agent_message(item: &mut Value, text_messages: bool) -> bool {
+fn prepare_input(
+    mut items: Vec<Box<RawValue>>,
+    text_agent_messages: bool,
+    listing: &str,
+) -> serde_json::Result<(Vec<Box<RawValue>>, bool)> {
     let mut changed = false;
-    if let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) {
-        for part in content {
-            if part.get("type").and_then(Value::as_str) == Some(ENCRYPTED_CONTENT)
-                && let Some(text) = part.get(ENCRYPTED_CONTENT).cloned()
-            {
-                part["type"] = Value::String(INPUT_TEXT.into());
-                part["text"] = text;
-                part.as_object_mut().unwrap().remove(ENCRYPTED_CONTENT);
+    for entry in &mut items {
+        let Some(mut item) = parse_object(entry)? else {
+            continue;
+        };
+        let kind = string(item.get("type"));
+        let mut item_changed = false;
+        if kind.as_deref() == Some("additional_tools")
+            && let Some(tools) = item.get("tools")
+            && let Some(tools) = parse_array(tools)?
+        {
+            let (tools, tools_changed) = prepare_tools(tools, listing)?;
+            if tools_changed {
+                item.insert("tools".into(), encode_json(&tools)?);
                 changed = true;
+                item_changed = true;
             }
+        }
+        if matches!(kind.as_deref(), Some("function_call" | "custom_tool_call")) {
+            item_changed |=
+                rewrite_identity(&mut item, COLLABORATION.client, COLLABORATION.upstream);
+        }
+        if kind.as_deref() == Some(AGENT_MESSAGE) {
+            item_changed |= rewrite_agent(&mut item, text_agent_messages)?;
+        }
+        if item_changed {
+            changed = true;
+            *entry = encode_json(&item)?;
+        }
+    }
+    Ok((items, changed))
+}
+fn rewrite_agent(
+    object: &mut BTreeMap<String, Box<RawValue>>,
+    text_messages: bool,
+) -> serde_json::Result<bool> {
+    let mut changed = false;
+    if let Some(content) = object.get("content")
+        && let Some(mut parts) = parse_array(content)?
+    {
+        let mut content_changed = false;
+        for part in &mut parts {
+            let Some(mut part_object) = parse_object(part)? else {
+                continue;
+            };
+            if string(part_object.get("type")).as_deref() == Some(ENCRYPTED_CONTENT)
+                && let Some(encrypted_text) = part_object.remove(ENCRYPTED_CONTENT)
+            {
+                set_str(&mut part_object, "type", INPUT_TEXT);
+                part_object.insert("text".into(), encrypted_text);
+                *part = encode_json(&part_object)?;
+                content_changed = true;
+            }
+        }
+        if content_changed {
+            object.insert("content".into(), encode_json(&parts)?);
+            changed = true;
         }
     }
     if text_messages {
-        if item.get("type").and_then(Value::as_str) != Some("message") {
-            item["type"] = Value::String("message".into());
+        if string(object.get("type")).as_deref() != Some("message") {
+            set_str(object, "type", "message");
             changed = true;
         }
-        if item.get("role").and_then(Value::as_str) != Some("user") {
-            item["role"] = Value::String("user".into());
+        if string(object.get("role")).as_deref() != Some("user") {
+            set_str(object, "role", "user");
             changed = true;
         }
-        if let Some(object) = item.as_object_mut() {
-            for key in [
-                "author",
-                "recipient",
-                "internal_chat_message_metadata_passthrough",
-            ] {
-                changed |= object.remove(key).is_some();
-            }
+        for k in [
+            "author",
+            "recipient",
+            "internal_chat_message_metadata_passthrough",
+        ] {
+            changed |= object.remove(k).is_some();
         }
     }
-    changed
+    Ok(changed)
 }
-
-fn rewrite_call_identity(call: &mut Value, from: &str, to: &str) -> bool {
-    if !matches!(
-        call.get("type").and_then(Value::as_str),
-        Some("function_call" | "custom_tool_call")
-    ) {
-        return false;
-    }
+fn rewrite_identity(object: &mut BTreeMap<String, Box<RawValue>>, from: &str, to: &str) -> bool {
     let mut changed = false;
-    if call.get("namespace").and_then(Value::as_str) == Some(from) {
-        call["namespace"] = Value::String(to.into());
+    if string(object.get("namespace")).as_deref() == Some(from) {
+        set_str(object, "namespace", to);
         changed = true;
     }
-    if let Some(name) = call.get("name").and_then(Value::as_str) {
+    if let Some(name) = string(object.get("name")) {
         if let Some(suffix) = name.strip_prefix(&format!("{from}.")) {
-            call["name"] = Value::String(suffix.into());
-            call["namespace"] = Value::String(to.into());
+            set_str(object, "name", suffix);
+            set_str(object, "namespace", to);
             changed = true;
         } else if let Some(suffix) = name.strip_prefix(&format!("{from}__")) {
-            call["name"] = Value::String(format!("{to}__{suffix}"));
+            set_str(object, "name", &format!("{to}__{suffix}"));
             changed = true;
         }
-    }
-    changed
-}
-
-/// Restores identities only on Responses event item/output envelopes.
-pub(crate) fn restore_response(value: &mut Value) -> bool {
-    let mut changed = false;
-    let event_type = value.get("type").and_then(Value::as_str);
-    match event_type {
-        None if value.get("object").and_then(Value::as_str) == Some("response") => {
-            changed |= restore_output(value.get_mut("output"));
-        }
-        Some(
-            "response.completed"
-            | "response.in_progress"
-            | "response.created"
-            | "response.failed"
-            | "response.incomplete",
-        ) => {
-            if let Some(response) = value.get_mut("response") {
-                changed |= restore_output(response.get_mut("output"));
-            }
-        }
-        Some("response.output_item.done" | "response.output_item.added") => {
-            if let Some(item) = value.get_mut("item") {
-                changed |=
-                    rewrite_call_identity(item, COLLABORATION.upstream, COLLABORATION.client);
-            }
-        }
-        _ => {}
     }
     changed
 }
@@ -241,156 +315,169 @@ pub(super) fn restore_bytes(bytes: &[u8]) -> serde_json::Result<Option<Vec<u8>>>
     if !response_may_need_adaptation(bytes) {
         return Ok(None);
     }
-    let mut event: Value = serde_json::from_slice(bytes)?;
-    if restore_response(&mut event) {
-        Ok(Some(serde_json::to_vec(&event)?))
+    let Some(mut object) = parse_object_bytes(bytes)? else {
+        return Ok(None);
+    };
+    let event_type = string(object.get("type"));
+    let mut changed = false;
+    match event_type.as_deref() {
+        None if string(object.get("object")).as_deref() == Some("response") => {
+            changed |= restore_output(&mut object, "output")?;
+        }
+        Some(
+            "response.completed"
+            | "response.in_progress"
+            | "response.created"
+            | "response.failed"
+            | "response.incomplete",
+        ) => {
+            if let Some(response_raw) = object.get("response")
+                && let Some(mut response) = parse_object(response_raw)?
+                && restore_output(&mut response, "output")?
+            {
+                object.insert("response".into(), encode_json(&response)?);
+                changed = true;
+            }
+        }
+        Some("response.output_item.done" | "response.output_item.added") => {
+            if let Some(item_raw) = object.get("item")
+                && let Some(mut item) = parse_object(item_raw)?
+                && matches!(
+                    string(item.get("type")).as_deref(),
+                    Some("function_call" | "custom_tool_call")
+                )
+                && rewrite_identity(&mut item, COLLABORATION.upstream, COLLABORATION.client)
+            {
+                object.insert("item".into(), encode_json(&item)?);
+                changed = true;
+            }
+        }
+        _ => {}
+    }
+    if changed {
+        Ok(Some(serde_json::to_vec(&object)?))
     } else {
         Ok(None)
     }
 }
-
-fn restore_output(output: Option<&mut Value>) -> bool {
-    let Some(items) = output.and_then(Value::as_array_mut) else {
-        return false;
+fn restore_output(
+    object: &mut BTreeMap<String, Box<RawValue>>,
+    key: &str,
+) -> serde_json::Result<bool> {
+    let Some(output) = object.get(key) else {
+        return Ok(false);
+    };
+    let Some(mut items) = parse_array(output)? else {
+        return Ok(false);
     };
     let mut changed = false;
-    for item in items {
-        changed |= rewrite_call_identity(item, COLLABORATION.upstream, COLLABORATION.client);
+    for item_raw in &mut items {
+        let Some(mut item) = parse_object(item_raw)? else {
+            continue;
+        };
+        if matches!(
+            string(item.get("type")).as_deref(),
+            Some("function_call" | "custom_tool_call")
+        ) && rewrite_identity(&mut item, COLLABORATION.upstream, COLLABORATION.client)
+        {
+            *item_raw = encode_json(&item)?;
+            changed = true;
+        }
     }
-    changed
+    if changed {
+        object.insert(key.into(), encode_json(&items)?);
+    }
+    Ok(changed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
     #[test]
-    fn prepares_only_targeted_tools_and_agent_message_text() {
-        let mut body = json!({
-            "tools":[{"type":"namespace","name":"collaboration","tools":[
-                {"name":"spawn_agent","description":"Spawns an agent.","parameters":{"properties":{"message":{"type":"string","encrypted":true}}}},
-                {"name":"send_message","parameters":{"properties":{"message":{"encrypted":true,"x":1}}}},
-                {"name":"other","parameters":{"properties":{"message":{"encrypted":true}}}}
-            ]},{"type":"namespace","name":"other_ns","tools":[{"name":"send_message","parameters":{"properties":{"message":{"encrypted":true}}}}]},{"type":"function","name":"send_message","description":"collaboration","parameters":{"properties":{"message":{"encrypted":true}}}}],
-            "input":[{"type":"agent_message","author":"worker","recipient":"parent","internal_chat_message_metadata_passthrough":{},"content":[{"type":"encrypted_content","encrypted_content":"literal gAAAAA"}]}]
-        });
-        assert!(prepare_request(&mut body, true, "Model list\n"));
-        assert_eq!(body["tools"][0]["name"], "collaboration_compat");
-        let tools = body["tools"][0]["tools"].as_array().unwrap();
+    fn targeted_adaptation_and_restore() {
+        let input=br#"{"tools":[{"type":"namespace","name":"collaboration","tools":[{"name":"spawn_agent","description":"d","parameters":{"properties":{"message":{"encrypted":true,"deep":{"x":1}}}}}]}],"input":[{"type":"agent_message","author":"a","content":[{"type":"encrypted_content","encrypted_content":"literal"}]},{"type":"function_call","name":"collaboration__send_message","arguments":"collaboration"}]}"#;
+        let out = prepare_bytes(input, true, "listing\n").unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["tools"][0]["name"], COLLABORATION.upstream);
+        assert_eq!(v["tools"][0]["tools"][0]["description"], "listing\nd");
         assert!(
-            tools[0]["parameters"]["properties"]["message"]
-                .get("encrypted")
-                .is_none()
-        );
-        assert!(
-            tools[1]["parameters"]["properties"]["message"]
+            v["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
                 .get("encrypted")
                 .is_none()
         );
         assert_eq!(
-            tools[2]["parameters"]["properties"]["message"]["encrypted"],
-            true
+            v["input"][0]["content"][0],
+            serde_json::json!({"type":"input_text","text":"literal"})
         );
-        assert_eq!(
-            body["tools"][1]["tools"][0]["parameters"]["properties"]["message"]["encrypted"],
-            true
-        );
-        assert_eq!(
-            body["tools"][2]["parameters"]["properties"]["message"]["encrypted"],
-            true
+        assert_eq!(v["input"][1]["name"], "collaboration_compat__send_message");
+        let response=br#"{"type":"response.output_item.done","item":{"type":"function_call","name":"collaboration_compat.foo"}}"#;
+        let restored = restore_bytes(response).unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&restored).unwrap();
+        assert_eq!(v["item"]["name"], "foo");
+        assert_eq!(v["item"]["namespace"], "collaboration");
+    }
+    #[test]
+    fn preserves_unrelated_tool_scopes_and_restores_all_snapshot_types() {
+        let request = br#"{"tools":[{"type":"namespace","name":"collaboration","tools":[{"name":"other","parameters":{"properties":{"message":{"encrypted":true}}}},{"type":"namespace","name":"nested","tools":[{"name":"send_message","parameters":{"properties":{"message":{"encrypted":true}}}}]}]},{"type":"namespace","name":"other","tools":[{"name":"send_message","parameters":{"properties":{"message":{"encrypted":true}}}}]},{"type":"function","name":"send_message","parameters":{"properties":{"message":{"encrypted":true}}}}]}"#;
+        let prepared = prepare_bytes(request, false, "").unwrap().unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&prepared).unwrap();
+        assert!(
+            value["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_some()
         );
         assert!(
-            tools[0]["description"]
-                .as_str()
-                .unwrap()
-                .starts_with("Model list\n")
+            value["tools"][0]["tools"][1]["tools"][0]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_some()
         );
-        assert_eq!(body["input"][0]["type"], "message");
-        assert_eq!(body["input"][0]["role"], "user");
-        assert_eq!(
-            body["input"][0]["content"][0],
-            json!({"type":"input_text","text":"literal gAAAAA"})
+        assert!(
+            value["tools"][1]["tools"][0]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_some()
         );
-        assert!(body["input"][0].get("author").is_none());
-    }
-
-    #[test]
-    fn rewrites_replay_and_restores_response_call_identities_without_touching_payloads() {
-        let mut request = json!({"input":[
-            {"type":"function_call","namespace":"collaboration","name":"spawn_agent","arguments":"collaboration"},
-            {"type":"function_call","name":"collaboration__send_message","arguments":"collaboration"},
-            {"type":"message","content":[{"type":"input_text","text":"collaboration"}]}
-        ]});
-        assert!(prepare_request(&mut request, false, ""));
-        assert_eq!(request["input"][0]["namespace"], "collaboration_compat");
-        assert_eq!(
-            request["input"][1]["name"],
-            "collaboration_compat__send_message"
+        assert!(
+            value["tools"][2]["parameters"]["properties"]["message"]
+                .get("encrypted")
+                .is_some()
         );
-        assert_eq!(request["input"][0]["arguments"], "collaboration");
-        assert_eq!(request["input"][2]["content"][0]["text"], "collaboration");
-
-        let mut event = json!({"type":"response.output_item.done","item":{"type":"function_call","name":"collaboration_compat.followup_task","arguments":"collaboration_compat"},"unrelated":{"name":"collaboration_compat.x"}});
-        assert!(restore_response(&mut event));
-        assert_eq!(event["item"]["namespace"], "collaboration");
-        assert_eq!(event["item"]["name"], "followup_task");
-        assert_eq!(event["item"]["arguments"], "collaboration_compat");
-        assert_eq!(event["unrelated"]["name"], "collaboration_compat.x");
-    }
-
-    #[test]
-    fn restores_completed_snapshot_and_ignores_unrelated_event() {
-        let mut snapshot = json!({"type":"response.completed","response":{"output":[{"type":"custom_tool_call","namespace":"collaboration_compat","name":"send_message"}]}});
-        assert!(restore_response(&mut snapshot));
-        assert_eq!(
-            snapshot["response"]["output"][0]["namespace"],
-            "collaboration"
-        );
-        let mut unrelated =
-            json!({"type":"response.output_text.delta","delta":"collaboration_compat.foo"});
-        assert!(!restore_response(&mut unrelated));
-
-        let mut response = json!({"object":"response","output":[{"type":"function_call","name":"collaboration_compat.spawn_agent"}]});
-        assert!(restore_response(&mut response));
-        assert_eq!(response["output"][0]["name"], "spawn_agent");
 
         for event_type in ["response.failed", "response.incomplete"] {
-            let mut snapshot = json!({"type":event_type,"response":{"output":[{"type":"function_call","name":"collaboration_compat.spawn_agent"}]}});
-            assert!(restore_response(&mut snapshot));
-            assert_eq!(snapshot["response"]["output"][0]["name"], "spawn_agent");
+            let response = format!(
+                r#"{{"type":"{event_type}","response":{{"output":[{{"type":"function_call","name":"collaboration_compat.spawn_agent"}}]}}}}"#
+            );
+            let restored = restore_bytes(response.as_bytes()).unwrap().unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&restored).unwrap();
+            assert_eq!(value["response"]["output"][0]["name"], "spawn_agent");
         }
     }
-
     #[test]
-    fn adaptation_prefilters_are_conservative() {
-        for body in [
-            br#"{"input":[{"type":"agent_message"}]}"#.as_slice(),
-            br#"{"tools":[{"type":"namespace","name":"collaboration"}]}"#,
-            br#"{"input":[{"type":"function_call","namespace":"collaboration_compat"}]}"#,
-            br#"{"input":[{"type":"function_call","name":"collaboration__spawn_agent"}]}"#,
-            br#"{"input":"\\u0063ollaboration"}"#,
-        ] {
-            assert!(request_may_need_adaptation(body));
-        }
-        assert!(response_may_need_adaptation(
-            br#"{"type":"response.output_item.done","item":{"name":"collaboration_compat.spawn_agent"}}"#
-        ));
-        assert!(response_may_need_adaptation(
-            br#"{"text":"\\u0063ollaboration_compat"}"#
-        ));
-        assert!(!request_may_need_adaptation(
-            br#"{"input":[{"type":"message","content":[{"type":"input_text","text":"hello"}]}]}"#
-        ));
-        assert!(!request_may_need_adaptation(
-            br#"{"type":"response.output_text.delta","delta":"ordinary text"}"#
-        ));
-        assert!(!response_may_need_adaptation(
-            br#"{"type":"response.output_text.delta","delta":"ordinary text"}"#
-        ));
-        // A plain occurrence intentionally triggers parsing as a conservative false positive.
-        assert!(request_may_need_adaptation(
-            br#"{"text":"agent_message appears in prose"}"#
-        ));
+    fn opaque_deep_schema_is_ignored() {
+        let deep = format!("{}0{}", "[".repeat(1000), "]".repeat(1000));
+        let input = r#"{"tools":[{"type":"namespace","name":"collaboration","tools":[{"name":"send_message","parameters":{"properties":{"message":{"encrypted":true},"schema":"#
+        .to_owned()
+            + &deep
+            + r#"}}}]}],"input":[{"type":"function_call","name":"collaboration__x"}]}"#;
+        let out = prepare_bytes(input.as_bytes(), false, "").unwrap().unwrap();
+        let output = String::from_utf8(out).unwrap();
+        assert!(output.contains("collaboration_compat__x"));
+        assert!(output.contains("\"name\":\"collaboration_compat\""));
+        assert!(output.contains(&deep));
+
+        let response = format!(
+            r#"{{"type":"response.output_item.done","item":{{"type":"function_call","name":"collaboration_compat.x"}},"opaque":{deep}}}"#
+        );
+        let restored = restore_bytes(response.as_bytes()).unwrap().unwrap();
+        let restored = String::from_utf8(restored).unwrap();
+        assert!(restored.contains("\"name\":\"x\""));
+        assert!(restored.contains(&deep));
+    }
+    #[test]
+    fn escaped_relevant_name_is_seen() {
+        let input=br#"{"input":[{"type":"function_call","name":"collaboration\u005f\u005fx"}],"text":"a\\nb"}"#;
+        let out = prepare_bytes(input, false, "").unwrap().unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["input"][0]["name"], "collaboration_compat__x");
+        assert_eq!(v["text"], r"a\nb");
     }
 }

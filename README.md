@@ -102,7 +102,9 @@ Each rule selects the source whose catalog envelope is retained when its format 
 
 ## Transport
 
-The Codex adapter shares a conservative byte scan across WebSocket, HTTP JSON, and SSE before building a JSON tree. Messages without relevant protocol names skip adaptation parsing. Any JSON escape triggers the parsing path so escaped names cannot bypass rewriting. WebSocket framing, HTTP model selection, and decompression where required still apply.
+The Codex adapter shares a conservative byte scan across WebSocket, HTTP JSON, and SSE before parsing relevant protocol envelopes. Messages without relevant protocol names skip adaptation parsing. Any JSON escape triggers the parsing path so escaped names cannot bypass rewriting. WebSocket framing, HTTP model selection, and decompression where required still apply.
+
+Codex SSE framing is normalized to LF, with comments forwarded promptly. Rewritten JSON data loses literal CR/LF whitespace so it fits on one `data:` line; string contents and escaped newlines are preserved. Unmarked SSE streams pass through unchanged.
 
 HTTP model routing buffers the request to read `model`; responses stream. Unchanged traffic preserves bytes and trailers. Rewritten catalogs discard stale encoding, integrity, and cache validators. The router adds no payload or concurrency cap.
 
