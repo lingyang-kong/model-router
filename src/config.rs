@@ -14,6 +14,7 @@ use url::{Host, Url};
 
 use crate::{
     adapters::CatalogFormat,
+    capabilities::Capabilities,
     error::{Error, Result},
 };
 
@@ -56,6 +57,8 @@ pub(crate) struct Provider {
     pub catalog: Option<CatalogSource>,
     #[serde(default)]
     pub discovery_urls: Vec<Url>,
+    #[serde(default)]
+    pub capabilities: Capabilities,
     #[serde(default)]
     pub defaults: ModelSettings,
     #[serde(default)]
