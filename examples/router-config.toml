@@ -22,7 +22,6 @@ extends = { provider = "chatgpt", model = "gpt-6-luna" }
 name = "Qwen3.8-Flash-Next"
 description = "Zero-cost lightweight model with modest capabilities"
 reasoning_levels = [
-	{ level = "none", description = "Direct responses without a thinking phase for simple tasks" },
 	{ level = "low", description = "Fast responses with lighter reasoning" },
 	{ level = "medium", description = "Balances speed and reasoning depth for everyday tasks" },
 	{ level = "xhigh", description = "Extra high reasoning depth for complex problems" },
