@@ -126,13 +126,13 @@ impl CatalogFormat {
 
         let target_id = source.model_id(model)?.to_owned();
         if self == Self::Codex {
+            codex::apply_capabilities(&mut result, capabilities);
             codex::apply_projection_metadata(
                 &mut result,
                 base.is_some(),
                 &local_shared,
                 &target_id,
             );
-            codex::apply_capabilities(&mut result, capabilities);
         }
         let layout_id = self.layout().id;
         result[layout_id] = Value::String(target_id.clone());
@@ -351,16 +351,17 @@ mod tests {
             image_detail_original: Some(false),
             images: Some(false),
             tool_inventory: Some(false),
+            ..Default::default()
         };
         let got = CatalogFormat::Codex
             .project(&local, CatalogFormat::Codex, None, &caps)
             .unwrap()
             .unwrap();
-        assert_eq!(got["use_responses_lite"], false);
-        assert_eq!(got["supports_search_tool"], false);
-        assert_eq!(got["supports_image_detail_original"], false);
+        assert!(got.get("use_responses_lite").is_none());
         assert_eq!(got["input_modalities"], json!(["text"]));
         assert!(got.get("tool_inventory").is_none());
+        assert!(got.get("supports_search_tool").is_none());
+        assert!(got.get("supports_image_detail_original").is_none());
     }
 
     #[test]
@@ -416,5 +417,77 @@ mod tests {
             .unwrap();
         assert_eq!(got["input_modalities"], json!(["text", "audio", "image"]));
         assert!(got.get("supports_search_tool").is_none());
+    }
+
+    #[test]
+    fn access_choices_follow_provider_capabilities_not_catalog_format() {
+        let donor = json!({
+            "slug":"donor", "available_access_programs":{"cyber":["standard"]}
+        });
+        let local = json!({"id":"local"});
+        let project = |capabilities: &Capabilities| {
+            CatalogFormat::Codex
+                .project(
+                    &local,
+                    CatalogFormat::Openai,
+                    Some((&donor, CatalogFormat::Codex)),
+                    capabilities,
+                )
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(
+            project(&Capabilities::default())["available_access_programs"],
+            json!({"cyber":["standard"]})
+        );
+        assert_eq!(
+            project(&Capabilities {
+                access_programs: Some(false),
+                ..Default::default()
+            })["available_access_programs"],
+            json!({"cyber":[]})
+        );
+        assert_eq!(
+            project(&Capabilities {
+                access_programs: Some(true),
+                ..Default::default()
+            })["available_access_programs"],
+            json!({"cyber":["standard"]})
+        );
+
+        let native = json!({"slug":"native","available_access_programs":{"cyber":["standard"]}});
+        let native_got = CatalogFormat::Codex
+            .project(
+                &native,
+                CatalogFormat::Codex,
+                None,
+                &Capabilities::default(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            native_got["available_access_programs"],
+            json!({"cyber":["standard"]})
+        );
+    }
+
+    #[test]
+    fn explicit_reasoning_settings_override_template() {
+        let donor = json!({"slug":"donor", "default_reasoning_level":"old"});
+        let local = json!({"id":"local", "reasoning_level":"custom", "reasoning_levels":[{"level":"custom","description":"User choice"}]});
+        let row = CatalogFormat::Codex
+            .project(
+                &local,
+                CatalogFormat::Openai,
+                Some((&donor, CatalogFormat::Codex)),
+                &Capabilities::default(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(row["default_reasoning_level"], "custom");
+        assert_eq!(
+            row["supported_reasoning_levels"],
+            json!([{"effort":"custom","description":"User choice"}])
+        );
     }
 }

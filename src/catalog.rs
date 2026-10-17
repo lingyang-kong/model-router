@@ -108,7 +108,7 @@ struct CatalogSnapshot {
 }
 
 enum CatalogReply {
-    Catalog(CatalogSnapshot),
+    Catalog(Box<CatalogSnapshot>),
     Rejected(Response),
 }
 
@@ -147,13 +147,13 @@ impl RouterState {
                     format,
                 )
                 .await;
-            return Ok(CatalogReply::Catalog(CatalogSnapshot {
+            return Ok(CatalogReply::Catalog(Box::new(CatalogSnapshot {
                 provider: Arc::clone(provider),
                 format,
                 document,
                 headers: HeaderMap::new(),
                 discovery,
-            }));
+            })));
         }
 
         let (mut parts, body) = match source.and_then(|source| source.path.as_deref()) {
@@ -223,13 +223,13 @@ impl RouterState {
                 format,
             )
             .await;
-        Ok(CatalogReply::Catalog(CatalogSnapshot {
+        Ok(CatalogReply::Catalog(Box::new(CatalogSnapshot {
             provider: Arc::clone(provider),
             format,
             document,
             headers: parts.headers,
             discovery,
-        }))
+        })))
     }
 
     pub(crate) async fn catalog_response(
@@ -259,7 +259,7 @@ impl RouterState {
         while let Some(replies) = requests.next().await {
             for reply in replies? {
                 match reply {
-                    CatalogReply::Catalog(snapshot) => snapshots.push(snapshot),
+                    CatalogReply::Catalog(snapshot) => snapshots.push(*snapshot),
                     CatalogReply::Rejected(response) => return Ok(response),
                 }
             }
@@ -293,6 +293,7 @@ impl RouterState {
                     .expect("staged model source");
                 let mut capabilities = snapshot.discovery.for_model(id);
                 capabilities.merge(capabilities::parse(&entry.metadata).for_model(id));
+                capabilities.merge(snapshot.provider.capabilities.clone());
                 let settings = entry.provider.models.get(id);
                 let reference = settings
                     .and_then(|settings| settings.extends.as_ref())
@@ -314,24 +315,79 @@ impl RouterState {
                     .transpose()?;
                 let mut projected =
                     output.project(&entry.metadata, entry.format, base, &capabilities)?;
-                if output == CatalogFormat::Codex
-                    && capabilities.responses_lite.is_none()
-                    && projected
-                        .as_ref()
-                        .is_some_and(|model| model["use_responses_lite"] == true)
-                    && !entry.provider.hidden_models.is_match(id)
-                {
-                    let empty = HeaderMap::new();
-                    let headers = if Arc::ptr_eq(&entry.provider, origin) {
-                        incoming_headers
-                    } else {
-                        &empty
-                    };
-                    capabilities.responses_lite = self
-                        .probe_responses_lite(&entry.provider, origin, headers, id)
-                        .await;
-                    projected =
-                        output.project(&entry.metadata, entry.format, base, &capabilities)?;
+                if output == CatalogFormat::Codex && !entry.provider.hidden_models.is_match(id) {
+                    let probe_responses_lite = capabilities.responses_lite.is_none()
+                        && projected
+                            .as_ref()
+                            .is_some_and(|model| model["use_responses_lite"] == true);
+                    let probe_tool_search = capabilities.tool_search.is_none()
+                        && projected
+                            .as_ref()
+                            .is_some_and(|model| model["supports_search_tool"] == true);
+                    if probe_responses_lite || probe_tool_search {
+                        let empty = HeaderMap::new();
+                        let headers = if Arc::ptr_eq(&entry.provider, origin) {
+                            incoming_headers
+                        } else {
+                            &empty
+                        };
+                        let lite = async {
+                            if probe_responses_lite {
+                                self.probe_catalog_item(
+                                    &entry.provider,
+                                    origin,
+                                    headers,
+                                    id,
+                                    serde_json::json!({
+                                        "type":"additional_tools",
+                                        "role":"developer",
+                                        "tools":[],
+                                    }),
+                                )
+                                .await
+                            } else {
+                                None
+                            }
+                        };
+                        let search = async {
+                            if probe_tool_search {
+                                self.probe_catalog_item(
+                                    &entry.provider,
+                                    origin,
+                                    headers,
+                                    id,
+                                    serde_json::json!({
+                                        "type":"tool_search_output",
+                                        "call_id":"model_router_probe",
+                                        "status":"completed",
+                                        "execution":"client",
+                                        "tools":[],
+                                    }),
+                                )
+                                .await
+                            } else {
+                                None
+                            }
+                        };
+                        let (responses_lite, tool_search) = tokio::join!(lite, search);
+                        let mut changed = false;
+                        if let Some(value) = responses_lite {
+                            capabilities.responses_lite = Some(value);
+                            changed = true;
+                        }
+                        if let Some(value) = tool_search {
+                            capabilities.tool_search = Some(value);
+                            changed = true;
+                        }
+                        if changed {
+                            projected = output.project(
+                                &entry.metadata,
+                                entry.format,
+                                base,
+                                &capabilities,
+                            )?;
+                        }
+                    }
                 }
                 if entry.provider.hidden_models.is_match(id) {
                     return Ok(None);
