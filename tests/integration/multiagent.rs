@@ -61,7 +61,7 @@ async fn omitted_model_uses_provider_default_for_probe_and_actual_request() {
         .build()
         .unwrap()
         .post(format!("{}/responses", gateway.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .json(&json!({"input":[{"type":"agent_message","author":"/root",
             "content":[{"type":"input_text","text":"task"}]}]}))
         .send()
@@ -341,7 +341,7 @@ async fn codex_multiagent_requests_are_rewritten_and_responses_restored() {
     ]}]}]});
     let response = client
         .post(format!("{}/responses", gateway.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .header("content-encoding", "gzip")
         .header("digest", "sha-256=stale")
         .body(
@@ -366,7 +366,7 @@ async fn codex_multiagent_requests_are_rewritten_and_responses_restored() {
     let worker_message = json!({"model":"worker-model","input":[{"type":"agent_message","author":"worker-1","recipient":"parent","internal_chat_message_metadata_passthrough":{"opaque":true},"content":[{"type":"input_text","text":"finished"}]}]});
     let response = client
         .post(format!("{}/responses", gateway.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .header("idempotency-key", "retain-on-inference")
         .json(&worker_message)
         .send()
@@ -386,7 +386,7 @@ async fn codex_multiagent_requests_are_rewritten_and_responses_restored() {
     let replay = json!({"model":"parent-model","input":[{"type":"function_call","namespace":"collaboration","name":"spawn_agent","call_id":"call-1","arguments":"{}"},{"type":"function_call_output","call_id":"call-1","output":"done"}]});
     client
         .post(format!("{}/responses", gateway.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .json(&replay)
         .send()
         .await
@@ -461,7 +461,7 @@ async fn codex_multiagent_requests_are_rewritten_and_responses_restored() {
     let native = json!({"model":"parent-model","input":[{"type":"agent_message","author":"worker-1","content":[{"type":"encrypted_content","encrypted_content":"plain payload"}]}]});
     client
         .post(format!("{}/responses", gateway.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .json(&native)
         .send()
         .await
@@ -478,7 +478,7 @@ async fn codex_multiagent_requests_are_rewritten_and_responses_restored() {
     let unmarked = json!({"model":"worker-model","input":[{"type":"agent_message","author":"worker-1","content":[{"type":"input_text","text":"native"}]}]});
     client
         .post(format!("{}/responses", gateway.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .json(&unmarked)
         .send()
         .await
@@ -493,7 +493,7 @@ async fn codex_multiagent_requests_are_rewritten_and_responses_restored() {
     let ordinary = json!({"model":"worker-model","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"agent_message is just prose"}]},{"type":"function_call_output","output":{"type":"agent_message"}}]});
     client
         .post(format!("{}/responses", gateway.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .json(&ordinary)
         .send()
         .await
@@ -506,7 +506,7 @@ async fn codex_multiagent_requests_are_rewritten_and_responses_restored() {
     for _ in 0..2 {
         let response = client
             .post(format!("{}/responses", gateway.url))
-            .header("x-router-client", "codex")
+            .header("originator", "codex_cli_rs")
             .json(&unknown_message)
             .send()
             .await
@@ -568,7 +568,7 @@ async fn codex_multiagent_requests_are_rewritten_and_responses_restored() {
     ] {
         let response = client
             .request(method, format!("{}{}", gateway.url, path))
-            .header("x-router-client", "codex")
+            .header("originator", "codex_cli_rs")
             .send()
             .await
             .unwrap();

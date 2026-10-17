@@ -84,7 +84,7 @@ pub(crate) fn load_manual_models(config: &Config) -> Result<ModelRegistry> {
         for model in settings.format.models(&mut document)? {
             let metadata = resolve_metadata(provider, model, settings.format)?;
             let id = settings.format.model_id(&metadata)?.to_owned();
-            validate_ownership(&registry, &id, provider)?;
+            validate_ownership(config, &registry, &id, provider)?;
             registry.insert(
                 id,
                 ModelEntry {
@@ -269,7 +269,7 @@ impl RouterState {
         for snapshot in &mut snapshots {
             for metadata in std::mem::take(snapshot.format.models(&mut snapshot.document)?) {
                 let id = snapshot.format.model_id(&metadata)?.to_owned();
-                validate_ownership(&staged, &id, &snapshot.provider)?;
+                validate_ownership(&self.config, &staged, &id, &snapshot.provider)?;
                 staged.insert(
                     id,
                     ModelEntry {
@@ -347,7 +347,7 @@ impl RouterState {
         // Validation and projection must succeed for every source before a refresh is visible.
         let mut catalog = self.catalog.write().await;
         for (id, entry) in &staged {
-            validate_ownership(&catalog.models, id, &entry.provider)?;
+            validate_ownership(&self.config, &catalog.models, id, &entry.provider)?;
         }
         for entry in catalog.models.values_mut() {
             if snapshots
@@ -396,14 +396,22 @@ fn validate_complete_catalog(document: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Catalog entries and each provider's explicit `models` table both establish
+/// ownership, so a refresh cannot transfer a model to another provider.
 fn validate_ownership(
+    config: &Config,
     registry: &ModelRegistry,
     model: &str,
     provider: &Arc<Provider>,
 ) -> Result<()> {
-    if let Some(previous) = registry.get(model)
-        && !Arc::ptr_eq(&previous.provider, provider)
-    {
+    let claimed_elsewhere = registry
+        .get(model)
+        .is_some_and(|previous| !Arc::ptr_eq(&previous.provider, provider))
+        || config
+            .providers
+            .values()
+            .any(|other| !Arc::ptr_eq(other, provider) && other.models.contains_key(model));
+    if claimed_elsewhere {
         return Err(Error::service_unavailable(format!(
             "Model belongs to multiple providers: {model}"
         )));

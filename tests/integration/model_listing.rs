@@ -13,7 +13,7 @@ async fn forwarded_description(fixture: &Fixture, gateway: &Server, model: &str)
     let response: Value = fixture
         .client
         .post(gateway.url.clone() + "/responses")
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .json(&json!({
             "model": model,
             "tools": [{"type":"namespace", "name":"collaboration", "tools":[{

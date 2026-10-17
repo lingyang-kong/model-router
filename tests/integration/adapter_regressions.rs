@@ -76,7 +76,7 @@ async fn marked_http_request_with_only_ordinary_deep_schema_forwards_exactly() {
         .build()
         .unwrap()
         .post(format!("{}/responses", gateway.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .body(body.clone())
         .send()
         .await
@@ -121,7 +121,7 @@ async fn marked_http_requests_adapt_collaboration_and_preserve_deep_ordinary_sch
         .build()
         .unwrap()
         .post(format!("{}/responses", gateway.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .body(body)
         .send()
         .await
@@ -179,7 +179,7 @@ async fn marked_websocket_response_create_adapts_collaboration_beside_deep_schem
         .unwrap();
     request
         .headers_mut()
-        .insert("x-router-client", "codex".parse().unwrap());
+        .insert("originator", "codex_cli_rs".parse().unwrap());
     request.headers_mut().insert(
         "x-codex-routing-hint",
         "model=publisher/model".parse().unwrap(),
@@ -229,7 +229,7 @@ async fn http_response_restoration_preserves_deep_opaque_output() {
         .build()
         .unwrap()
         .post(format!("{}/responses", gateway.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .body(r#"{"model":"gpt-test","input":[]}"#)
         .send()
         .await
@@ -306,7 +306,7 @@ async fn sse_comment_and_cr_only_event_are_dispatched_without_waiting_for_lf_or_
             .build()
             .unwrap()
             .post(format!("{}/responses", gateway.url))
-            .header("x-router-client", "codex")
+            .header("originator", "codex_cli_rs")
             .body(r#"{"model":"gpt-test","input":[]}"#)
             .send()
             .await
@@ -357,7 +357,7 @@ async fn marked_sse_multiline_json_is_compacted_without_changing_opaque_values()
         .build()
         .unwrap()
         .post(format!("{}/responses", gateway.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .body(r#"{"model":"gpt-test","input":[]}"#)
         .send()
         .await
@@ -409,7 +409,7 @@ async fn marked_sse_normalizes_mixed_line_endings_and_dispatches_without_eof() {
         .build()
         .unwrap()
         .post(format!("{}/responses", gateway.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .body(r#"{"model":"gpt-test","input":[]}"#)
         .send()
         .await

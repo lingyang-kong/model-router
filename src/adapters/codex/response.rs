@@ -5,9 +5,11 @@ use axum::{
     http::{HeaderMap, header},
     response::Response,
 };
-use futures_util::{Stream, StreamExt};
+use futures_util::{Stream, StreamExt, stream::BoxStream};
 use http_body_util::BodyExt;
+use serde_json::{Value, value::RawValue};
 use tokio::io::AsyncRead;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_util::io::{ReaderStream, StreamReader};
 
 use crate::{
@@ -16,12 +18,7 @@ use crate::{
 };
 
 pub(crate) async fn restore(response: reqwest::Response) -> Result<Response> {
-    let content_type = response
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
+    let content_type = content_type(response.headers());
     if !response.status().is_success() {
         return Ok(crate::router::stream_response(response));
     }
@@ -37,6 +34,15 @@ pub(crate) async fn restore(response: reqwest::Response) -> Result<Response> {
     let trailers = collected.trailers().cloned();
     let original = collected.to_bytes();
     restore_json(parts.status, parts.headers, original, trailers).await
+}
+
+/// HTTP content types are case-insensitive; compare the decoded value in lowercase.
+fn content_type(headers: &HeaderMap) -> String {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase()
 }
 
 async fn restore_json(
@@ -129,6 +135,13 @@ fn transform_sse<S>(input: S) -> impl Stream<Item = std::result::Result<Bytes, i
 where
     S: Stream<Item = std::result::Result<Bytes, io::Error>> + Send + 'static,
 {
+    frame_sse(input).map(|result| result.map(|event| Bytes::from(transform_event(&event))))
+}
+
+fn frame_sse<S>(input: S) -> impl Stream<Item = std::result::Result<Bytes, io::Error>> + Send
+where
+    S: Stream<Item = std::result::Result<Bytes, io::Error>> + Send + 'static,
+{
     futures_util::stream::unfold(
         (
             Box::pin(input)
@@ -156,6 +169,198 @@ where
             }
         },
     )
+}
+
+/// Convert the existing HTTP adapter's output to WebSocket events without retaining a stream.
+pub(super) fn websocket_response(
+    response: Response,
+    stream_id: Option<Value>,
+) -> BoxStream<'static, Message> {
+    futures_util::stream::once(async move {
+        if !response.status().is_success() {
+            return futures_util::stream::once(async move {
+                Message::Text(
+                    super::compaction_transport::failure_event(response, stream_id.as_ref())
+                        .await
+                        .to_string()
+                        .into(),
+                )
+            })
+            .boxed();
+        }
+        let sse = content_type(response.headers()).starts_with("text/event-stream");
+        let (parts, body) = response.into_parts();
+        let reader = StreamReader::new(
+            body.into_data_stream()
+                .map(|result| result.map_err(io::Error::other)),
+        );
+        let reader = match decode_reader(reader, &parts.headers) {
+            Ok(reader) => reader,
+            Err(error) => {
+                return futures_util::stream::iter([super::websocket::error_message(
+                    error,
+                    stream_id.as_ref(),
+                )])
+                .boxed();
+            }
+        };
+        if sse {
+            let end_stream_id = stream_id.clone();
+            let events = frame_sse(ReaderStream::new(reader))
+                .filter_map(move |event| {
+                    let message = match event {
+                        Err(error) => {
+                            Some(super::websocket::error_message(error, stream_id.as_ref()))
+                        }
+                        Ok(event) => {
+                            let text = std::str::from_utf8(&event).unwrap_or("");
+                            let data: Vec<_> = text
+                                .lines()
+                                .filter_map(|line| {
+                                    line.strip_prefix("data:")
+                                        .map(|line| line.strip_prefix(' ').unwrap_or(line))
+                                })
+                                .collect();
+                            if data.is_empty() || data == ["[DONE]"] {
+                                None
+                            } else {
+                                Some(with_stream_id(data.join("\n"), stream_id.as_ref()))
+                            }
+                        }
+                    };
+                    futures_util::future::ready(message)
+                })
+                .boxed();
+            return completed_stream(events, end_stream_id);
+        }
+        let mut reader = reader;
+        let mut bytes = Vec::new();
+        if let Err(error) = tokio::io::AsyncReadExt::read_to_end(&mut reader, &mut bytes).await {
+            return futures_util::stream::iter([super::websocket::error_message(
+                error,
+                stream_id.as_ref(),
+            )])
+            .boxed();
+        }
+        let events = json_websocket_events(&bytes, stream_id.as_ref()).unwrap_or_else(|error| {
+            vec![super::websocket::error_message(error, stream_id.as_ref())]
+        });
+        futures_util::stream::iter(events).boxed()
+    })
+    .flatten()
+    .boxed()
+}
+
+fn completed_stream(
+    events: BoxStream<'static, Message>,
+    stream_id: Option<Value>,
+) -> BoxStream<'static, Message> {
+    futures_util::stream::unfold(
+        (events, false, stream_id),
+        |(mut events, done, stream_id)| async move {
+            if done {
+                return None;
+            }
+            let message = match events.next().await {
+                Some(message) => message,
+                None => super::websocket::error_message(
+                    "Upstream response ended before completion",
+                    stream_id.as_ref(),
+                ),
+            };
+            let done = super::websocket::terminal(&message);
+            Some((message, (events, done, stream_id)))
+        },
+    )
+    .boxed()
+}
+
+fn with_stream_id(text: String, stream_id: Option<&Value>) -> Message {
+    if let Some(stream_id) = stream_id
+        && let Ok(mut event) =
+            serde_json::from_str::<std::collections::BTreeMap<String, Box<RawValue>>>(&text)
+    {
+        event.insert(
+            "stream_id".into(),
+            serde_json::value::to_raw_value(stream_id).unwrap(),
+        );
+        return Message::Text(serde_json::to_string(&event).unwrap().into());
+    }
+    Message::Text(text.into())
+}
+
+fn json_websocket_events(
+    bytes: &[u8],
+    stream_id: Option<&Value>,
+) -> serde_json::Result<Vec<Message>> {
+    type Fields = std::collections::BTreeMap<String, Box<RawValue>>;
+    let response: &RawValue = serde_json::from_slice(bytes)?;
+    let mut created: Fields = serde_json::from_slice(bytes)?;
+    let terminal = match created
+        .get("status")
+        .and_then(|status| serde_json::from_str::<String>(status.get()).ok())
+        .as_deref()
+    {
+        Some("failed") => "response.failed",
+        Some("incomplete") => "response.incomplete",
+        _ => "response.completed",
+    };
+    let output: Vec<&RawValue> = match created.get("output") {
+        Some(output) => serde_json::from_str(output.get())?,
+        None => Vec::new(),
+    };
+    #[derive(serde::Serialize)]
+    struct Item<'a> {
+        #[serde(rename = "type")]
+        kind: &'static str,
+        output_index: usize,
+        item: &'a RawValue,
+    }
+    let mut events = Vec::new();
+    for (output_index, item) in output.into_iter().enumerate() {
+        for kind in ["response.output_item.added", "response.output_item.done"] {
+            events.push(with_stream_id(
+                serde_json::to_string(&Item {
+                    kind,
+                    output_index,
+                    item,
+                })?,
+                stream_id,
+            ));
+        }
+    }
+    created.insert(
+        "status".into(),
+        serde_json::value::to_raw_value("in_progress")?,
+    );
+    created.insert(
+        "output".into(),
+        serde_json::value::to_raw_value(&Vec::<Value>::new())?,
+    );
+    #[derive(serde::Serialize)]
+    struct Envelope<'a, T> {
+        #[serde(rename = "type")]
+        kind: &'a str,
+        response: T,
+    }
+    events.insert(
+        0,
+        with_stream_id(
+            serde_json::to_string(&Envelope {
+                kind: "response.created",
+                response: created,
+            })?,
+            stream_id,
+        ),
+    );
+    events.push(with_stream_id(
+        serde_json::to_string(&Envelope {
+            kind: terminal,
+            response,
+        })?,
+        stream_id,
+    ));
+    Ok(events)
 }
 
 #[derive(Default)]
@@ -207,8 +412,7 @@ impl SseParser {
         }
         self.event.append(&mut self.line);
         if blank {
-            ready.push_back(transform_event(&self.event));
-            self.event.clear();
+            ready.push_back(std::mem::take(&mut self.event));
         }
     }
 
@@ -221,8 +425,7 @@ impl SseParser {
             }
         }
         if !self.event.is_empty() {
-            ready.push_back(transform_event(&self.event));
-            self.event.clear();
+            ready.push_back(std::mem::take(&mut self.event));
         }
     }
 }
@@ -275,6 +478,37 @@ fn transform_event(event: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn bridge_errors_preserve_stream_id() {
+        use axum::body::Body;
+        use futures_util::StreamExt;
+        use serde_json::{Value, json};
+
+        for (content_type, encoding, body) in [
+            ("application/json", "identity", "invalid json"),
+            ("text/event-stream", "unsupported", ""),
+            ("text/event-stream", "gzip", "invalid gzip"),
+            (
+                "text/event-stream",
+                "identity",
+                "data: {\"type\":\"response.created\"}\n\n",
+            ),
+        ] {
+            let response = axum::response::Response::builder()
+                .header("content-type", content_type)
+                .header("content-encoding", encoding)
+                .body(Body::from(body))
+                .unwrap();
+            let events: Vec<_> = super::websocket_response(response, Some(json!("lane")))
+                .collect()
+                .await;
+            let error: Value =
+                serde_json::from_slice(&events.last().unwrap().clone().into_data()).unwrap();
+            assert_eq!(error["type"], "error", "{content_type}, {encoding}");
+            assert_eq!(error["stream_id"], "lane");
+        }
+    }
+
     use super::*;
     use async_compression::tokio::bufread::GzipEncoder;
     use serde_json::Value;
@@ -548,7 +782,10 @@ mod tests {
         let mut parser = SseParser::default();
         let mut ready = VecDeque::new();
         parser.push(event, &mut ready);
-        let output: Vec<_> = ready.into_iter().flatten().collect();
+        let output: Vec<_> = ready
+            .into_iter()
+            .flat_map(|event| transform_event(&event))
+            .collect();
         assert!(
             output
                 .windows(b"\"namespace\":\"collaboration\"".len())

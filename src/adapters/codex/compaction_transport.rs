@@ -139,10 +139,14 @@ pub(super) async fn failure_event(response: Response, stream_id: Option<&Value>)
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .unwrap_or_default();
-    let error = serde_json::from_slice::<Value>(&body)
+    let mut error = serde_json::from_slice::<Value>(&body)
         .ok()
         .and_then(|body| body.get("error").cloned())
         .unwrap_or_else(|| serde_json::json!({"message":String::from_utf8_lossy(&body)}));
+    // Codex expects string codes; a numeric code makes it ignore the error event.
+    if let Some(code @ Value::Number(_)) = error.get_mut("code") {
+        *code = Value::String(code.to_string());
+    }
     let mut event = serde_json::json!({"type":"error", "status":status, "error":error});
     if let Some(stream_id) = stream_id {
         event["stream_id"] = stream_id.clone();
@@ -152,4 +156,43 @@ pub(super) async fn failure_event(response: Response, stream_id: Option<&Value>)
 
 pub(super) fn json(response: Value) -> Response {
     Json(response).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn bridged_errors_normalize_numeric_codes_and_preserve_other_fields() {
+        for (code, expected) in [
+            (json!(400), json!("400")),
+            (
+                json!("previous_response_not_found"),
+                json!("previous_response_not_found"),
+            ),
+            (Value::Null, Value::Null),
+        ] {
+            let response = (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":{"code":code,"message":"upstream rejected request","type":"invalid_request_error"}})),
+            )
+                .into_response();
+            let mut events =
+                super::super::response::websocket_response(response, Some(json!("lane")));
+            let event = tokio::time::timeout(Duration::from_secs(1), events.next())
+                .await
+                .expect("upstream errors must be emitted promptly")
+                .unwrap();
+            let event: Value = serde_json::from_slice(&event.into_data()).unwrap();
+            assert_eq!(
+                event,
+                json!({
+                    "type":"error", "status":400, "stream_id":"lane",
+                    "error":{"code":expected,"message":"upstream rejected request","type":"invalid_request_error"}
+                })
+            );
+        }
+    }
 }

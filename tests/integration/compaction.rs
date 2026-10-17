@@ -239,7 +239,7 @@ async fn text_trigger_summarizes_on_same_provider_and_streams_one_checkpoint_eve
     let response = f
         .client
         .post(format!("{}/responses", f.server.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .header("idempotency-key", "logical-compaction")
         .json(&body)
         .send()
@@ -323,7 +323,7 @@ async fn provider_configured_idempotency_key_is_removed_from_internal_requests()
     let response = f
         .client
         .post(format!("{}/responses", f.server.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .header("idempotency-key", "caller-key")
         .json(&request(json!([trigger()]), false))
         .send()
@@ -353,7 +353,7 @@ async fn omitted_http_model_probes_and_summarizes_using_provider_default() {
     let response = f
         .client
         .post(format!("{}/responses", f.server.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .header("idempotency-key", "default-model-compaction")
         .json(&body)
         .send()
@@ -382,7 +382,7 @@ async fn omitted_http_model_native_or_unknown_probe_preserves_bytes_and_caller_k
         let response = f
             .client
             .post(format!("{}/responses", f.server.url))
-            .header("x-router-client", "codex")
+            .header("originator", "codex_cli_rs")
             .header("idempotency-key", "original-operation")
             .body(raw.to_vec())
             .send()
@@ -415,7 +415,7 @@ async fn native_trigger_and_ordinary_native_request_are_forwarded_unchanged() {
     let response = f
         .client
         .post(format!("{}/responses", f.server.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .body(raw.to_vec())
         .send()
         .await
@@ -435,7 +435,7 @@ async fn checkpoints_rehydrate_for_repeat_text_compaction_and_native_mode_switch
     let first = f
         .client
         .post(format!("{}/responses", f.server.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .json(&request(
             json!([{"type":"message","role":"user","content":"first"},trigger()]),
             false,
@@ -453,7 +453,7 @@ async fn checkpoints_rehydrate_for_repeat_text_compaction_and_native_mode_switch
     );
     f.client
         .post(format!("{}/responses", f.server.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .json(&repeated)
         .send()
         .await
@@ -469,7 +469,7 @@ async fn checkpoints_rehydrate_for_repeat_text_compaction_and_native_mode_switch
             .contains("remembered state")
     );
     let native = fixture("ok", "native").await;
-    let response = native.client.post(format!("{}/responses", native.server.url)).header("x-router-client", "codex").json(&json!({"model":"gpt-test","input":[saved,{"type":"message","role":"user","content":"continue"}]})).send().await.unwrap();
+    let response = native.client.post(format!("{}/responses", native.server.url)).header("originator", "codex_cli_rs").json(&json!({"model":"gpt-test","input":[saved,{"type":"message","role":"user","content":"continue"}]})).send().await.unwrap();
     let native_input: Value = summary_requests(&native.upstream.seen.lock().unwrap())[0].clone();
     assert_eq!(native_input["input"][0]["type"], "message");
     assert!(
@@ -488,7 +488,7 @@ async fn failures_never_emit_a_checkpoint_and_only_context_overflow_retries_afte
         let response = f
             .client
             .post(format!("{}/responses", f.server.url))
-            .header("x-router-client", "codex")
+            .header("originator", "codex_cli_rs")
             .json(&request(
                 json!([{"type":"message","role":"user","content":"latest"},trigger()]),
                 false,
@@ -515,7 +515,7 @@ async fn failures_never_emit_a_checkpoint_and_only_context_overflow_retries_afte
     let response = f
         .client
         .post(format!("{}/responses", f.server.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .header("idempotency-key", "overflow-compaction")
         .json(&request(input, false))
         .send()
@@ -546,7 +546,7 @@ async fn unknown_checkpoint_without_trigger_is_passed_to_provider() {
     let response = custom
         .client
         .post(format!("{}/responses", custom.server.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .body(raw.clone())
         .send()
         .await
@@ -557,7 +557,7 @@ async fn unknown_checkpoint_without_trigger_is_passed_to_provider() {
     native
         .client
         .post(format!("{}/responses", native.server.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .body(raw.clone())
         .send()
         .await
@@ -572,7 +572,7 @@ async fn only_exact_compaction_item_error_enables_fallback_and_probe_is_fresh_pe
     let response = f
         .client
         .post(format!("{}/responses", f.server.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .body(raw.clone())
         .send()
         .await
@@ -589,7 +589,7 @@ async fn only_exact_compaction_item_error_enables_fallback_and_probe_is_fresh_pe
     let first = f
         .client
         .post(format!("{}/responses", f.server.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .json(&request(json!([trigger()]), false))
         .send()
         .await
@@ -600,7 +600,7 @@ async fn only_exact_compaction_item_error_enables_fallback_and_probe_is_fresh_pe
     let second = f
         .client
         .post(format!("{}/responses", f.server.url))
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .body(raw.clone())
         .send()
         .await
@@ -626,7 +626,7 @@ async fn dropping_sse_cancels_pending_summary_request() {
     let task = tokio::spawn(async move {
         client
             .post(url)
-            .header("x-router-client", "codex")
+            .header("originator", "codex_cli_rs")
             .json(&request(
                 json!([{"type":"message","role":"user","content":"x"},trigger()]),
                 true,
@@ -662,7 +662,7 @@ async fn websocket_summary_uses_handshake_model_unless_body_overrides_it() {
             .unwrap();
         handshake
             .headers_mut()
-            .insert("x-router-client", "codex".parse().unwrap());
+            .insert("originator", "codex_cli_rs".parse().unwrap());
         handshake
             .headers_mut()
             .insert("x-model", "handshake-model".parse().unwrap());
@@ -721,7 +721,7 @@ async fn websocket_trigger_uses_http_summary_and_native_messages_still_forward()
         .insert("authorization", "Bearer client".parse().unwrap());
     request
         .headers_mut()
-        .insert("x-router-client", "codex".parse().unwrap());
+        .insert("originator", "codex_cli_rs".parse().unwrap());
     request
         .headers_mut()
         .insert("x-model", "gpt-test".parse().unwrap());
@@ -783,7 +783,7 @@ async fn closing_websocket_cancels_pending_http_summary() {
     let mut request = url.into_client_request().unwrap();
     request
         .headers_mut()
-        .insert("x-router-client", "codex".parse().unwrap());
+        .insert("originator", "codex_cli_rs".parse().unwrap());
     request
         .headers_mut()
         .insert("x-model", "gpt-test".parse().unwrap());

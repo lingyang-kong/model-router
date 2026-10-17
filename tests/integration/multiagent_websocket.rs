@@ -97,7 +97,7 @@ async fn adapted_websocket_close_cancels_an_upstream_write_blocked_by_client_bac
         .unwrap();
     request
         .headers_mut()
-        .insert("x-router-client", "codex".parse().unwrap());
+        .insert("originator", "codex_cli_rs".parse().unwrap());
     request.headers_mut().insert(
         "x-codex-routing-hint",
         "model=publisher/model".parse().unwrap(),
@@ -234,7 +234,7 @@ async fn codex_multiagent_websocket_transforms_requests_and_restores_events() {
         .unwrap();
     request
         .headers_mut()
-        .insert("x-router-client", "codex".parse().unwrap());
+        .insert("originator", "codex_cli_rs".parse().unwrap());
     request.headers_mut().insert(
         "x-codex-routing-hint",
         "model=alternate/model".parse().unwrap(),

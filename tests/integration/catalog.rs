@@ -946,7 +946,7 @@ async fn client_adapters_and_catalog_formats_are_isolated_on_the_same_endpoint()
             .get(gateway.url.clone() + "/models")
             .header("x-catalog-format", format);
         if client == "codex" {
-            request = request.header("x-router-client", "codex");
+            request = request.header("originator", "codex_cli_rs");
         }
         if key == "data" {
             request = request.header("x-catalog-data", "1");
@@ -1010,7 +1010,7 @@ async fn client_adapters_and_catalog_formats_are_isolated_on_the_same_endpoint()
     let response = fixture
         .client
         .get(gateway.url.clone() + "/models")
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .header("x-catalog-data", "1")
         .send()
         .await
@@ -1021,7 +1021,7 @@ async fn client_adapters_and_catalog_formats_are_isolated_on_the_same_endpoint()
     let response = fixture
         .client
         .get(gateway.url.clone() + "/models")
-        .header("x-router-client", "codex")
+        .header("originator", "codex_cli_rs")
         .header("x-catalog-format", "openai")
         .send()
         .await

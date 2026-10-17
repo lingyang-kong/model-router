@@ -39,7 +39,7 @@ Replace the inference URL and `vendor/model` with your server's URL and exact mo
 ## Client setup
 
 ```sh
-export ANTHROPIC_BASE_URL="http://localhost:8080"
+export ANTHROPIC_BASE_URL="http://localhost:4134"
 export ANTHROPIC_CUSTOM_MODEL_OPTION="vendor/model"
 export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="Custom model"
 claude

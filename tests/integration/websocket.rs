@@ -94,7 +94,7 @@ async fn model_websockets_select_a_provider_from_handshake_hints() {
         let mut request = url.clone().into_client_request().unwrap();
         request
             .headers_mut()
-            .insert("x-router-client", "codex".parse().unwrap());
+            .insert("originator", "codex_cli_rs".parse().unwrap());
         if let Some(hint) = hint {
             request
                 .headers_mut()
@@ -105,7 +105,7 @@ async fn model_websockets_select_a_provider_from_handshake_hints() {
         };
         assert_eq!(response.status().as_u16(), expected_status);
     }
-    // The Codex routing hint is ignored without its client marker.
+    // Originator identifies Codex; a routing hint alone does not identify another client.
     let mut request = url.clone().into_client_request().unwrap();
     request
         .headers_mut()
@@ -121,7 +121,7 @@ async fn model_websockets_select_a_provider_from_handshake_hints() {
         let mut request = url.clone().into_client_request().unwrap();
         request
             .headers_mut()
-            .insert("x-router-client", "codex".parse().unwrap());
+            .insert("originator", "codex_cli_rs".parse().unwrap());
         request.headers_mut().append(
             "x-codex-routing-hint",
             "model=publisher/model".parse().unwrap(),
@@ -135,7 +135,7 @@ async fn model_websockets_select_a_provider_from_handshake_hints() {
     let mut codex_request = url.clone().into_client_request().unwrap();
     codex_request
         .headers_mut()
-        .insert("x-router-client", "codex".parse().unwrap());
+        .insert("originator", "codex_cli_rs".parse().unwrap());
     codex_request.headers_mut().insert(
         "x-codex-routing-hint",
         "model=publisher/model;tier=priority".parse().unwrap(),
@@ -200,20 +200,18 @@ async fn model_websockets_select_a_provider_from_handshake_hints() {
     let mut request = url.into_client_request().unwrap();
     request
         .headers_mut()
+        .insert("originator", "codex_cli_rs".parse().unwrap());
+    request
+        .headers_mut()
         .insert("x-model", "gpt-test".parse().unwrap());
     request.headers_mut().insert(
         "x-codex-routing-hint",
         "model=publisher/model".parse().unwrap(),
     );
-    let (mut socket, _) = connect_async(request).await.unwrap();
-    socket
-        .send(tungstenite::Message::Text(r#"{"model":7}"#.into()))
-        .await
-        .unwrap();
-    let reply = socket.next().await.unwrap().unwrap().into_data();
-    let reply: Value = serde_json::from_slice(&reply).unwrap();
-    assert_eq!(reply["provider"], "service-a");
-    assert_eq!(reply["model"], 7);
+    let tungstenite::Error::Http(response) = connect_async(request).await.unwrap_err() else {
+        panic!("Expected conflicting native and generic model hints");
+    };
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
