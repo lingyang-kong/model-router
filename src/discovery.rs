@@ -14,13 +14,15 @@ use crate::{
 };
 
 impl RouterState {
-    /// Only an explicit rejection establishes lack of support; other outcomes are unknown.
-    pub(crate) async fn probe_responses_lite(
+    /// Only rejection of the tested item establishes missing support. The invalid
+    /// trailing item prevents normal generation; other outcomes remain unknown.
+    pub(crate) async fn probe_catalog_item(
         &self,
         provider: &Arc<Provider>,
         origin: &Arc<Provider>,
         incoming: &HeaderMap,
         model: &str,
+        item: serde_json::Value,
     ) -> Option<bool> {
         let (mut parts, _) = axum::http::Request::builder()
             .uri("/responses")
@@ -28,14 +30,8 @@ impl RouterState {
             .ok()?
             .into_parts();
         parts.headers = incoming.clone();
-        self.probe_response_item(
-            provider,
-            Some(origin),
-            &parts,
-            Some(model),
-            serde_json::json!({"type":"additional_tools","role":"developer","tools":[]}),
-        )
-        .await
+        self.probe_response_item(provider, Some(origin), &parts, Some(model), item)
+            .await
     }
 
     /// Only rejection of the tested item establishes missing support. The invalid
@@ -136,13 +132,18 @@ impl RouterState {
             add_tool_paths(url, &document.tools_paths, &mut tools, &mut seen);
             found.merge(document);
         }
-        let unsupported = found.capabilities.tool_inventory == Some(false)
-            || (!models.is_empty()
-                && models.iter().all(|model| {
-                    format
-                        .model_id(model)
-                        .is_ok_and(|id| found.for_model(id).tool_inventory == Some(false))
-                }));
+        let unsupported = match provider.capabilities.tool_inventory {
+            Some(supported) => !supported,
+            None => {
+                found.capabilities.tool_inventory == Some(false)
+                    || (!models.is_empty()
+                        && models.iter().all(|model| {
+                            format
+                                .model_id(model)
+                                .is_ok_and(|id| found.for_model(id).tool_inventory == Some(false))
+                        }))
+            }
+        };
         if !unsupported {
             for document in join_all(
                 tools
