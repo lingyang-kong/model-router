@@ -112,10 +112,45 @@ pub(super) fn apply_capabilities(model: &mut Value, capabilities: &Capabilities)
             capabilities.image_detail_original,
             "supports_image_detail_original",
         ),
+        (capabilities.history_notes, "supports_experimental_context"),
+        (
+            capabilities.reasoning_summary,
+            "supports_reasoning_summary_parameter",
+        ),
     ] {
         if let Some(value) = fact {
             model[field] = Value::Bool(value);
         }
+    }
+    apply_response_metadata(model, capabilities);
+
+    if capabilities.service_tiers == Some(false) || capabilities.service_tier_ids.is_some() {
+        for field in [
+            "additional_speed_tiers",
+            "service_tiers",
+            "default_service_tier",
+        ] {
+            model.as_object_mut().unwrap().remove(field);
+        }
+    }
+    if capabilities.service_tiers != Some(false)
+        && let Some(ids) = &capabilities.service_tier_ids
+    {
+        model["service_tiers"] = Value::Array(
+            ids.iter()
+                .filter(|id| !matches!(id.as_str(), "auto" | "default"))
+                .map(|id| serde_json::json!({"id": id, "name": id, "description": ""}))
+                .collect(),
+        );
+    }
+    if capabilities.web_search == Some(false) {
+        model
+            .as_object_mut()
+            .unwrap()
+            .remove("web_search_tool_type");
+    }
+    if capabilities.access_programs == Some(false) {
+        model["available_access_programs"] = serde_json::json!({"cyber": []});
     }
 
     if let Some(images) = capabilities.images {
@@ -134,6 +169,117 @@ pub(super) fn apply_capabilities(model: &mut Value, capabilities: &Capabilities)
             (true, None) => {}
             (_, Some(_)) => {}
         }
+    }
+
+    prune_defaults(model);
+}
+
+fn apply_response_metadata(model: &mut Value, capabilities: &Capabilities) {
+    if let Some(default) = &capabilities.reasoning_summary_default {
+        if matches!(default.as_str(), "auto" | "concise" | "detailed" | "none") {
+            model["default_reasoning_summary"] = Value::String(default.clone());
+        } else {
+            model
+                .as_object_mut()
+                .unwrap()
+                .remove("default_reasoning_summary");
+        }
+    }
+    if let Some(levels) = &capabilities.reasoning_summary_levels {
+        let current = model
+            .get("default_reasoning_summary")
+            .and_then(Value::as_str)
+            .unwrap_or("auto");
+        if !levels.iter().any(|level| level == current) {
+            if let Some(default) = levels
+                .iter()
+                .find(|level| matches!(level.as_str(), "auto" | "concise" | "detailed" | "none"))
+            {
+                model["default_reasoning_summary"] = Value::String(default.clone());
+            } else {
+                model["supports_reasoning_summary_parameter"] = Value::Bool(false);
+                model
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("default_reasoning_summary");
+            }
+        }
+    }
+    if let Some(levels) = &capabilities.verbosity_levels {
+        model["support_verbosity"] = Value::Bool(
+            levels
+                .iter()
+                .any(|level| matches!(level.as_str(), "low" | "medium" | "high")),
+        );
+        remove_excluded_default(model, "default_verbosity", levels);
+    }
+    if let Some(default) = &capabilities.verbosity_default {
+        if matches!(default.as_str(), "low" | "medium" | "high") {
+            model["default_verbosity"] = Value::String(default.clone());
+        } else {
+            model.as_object_mut().unwrap().remove("default_verbosity");
+        }
+    }
+}
+
+fn remove_excluded_default(model: &mut Value, field: &str, values: &[String]) {
+    if model
+        .get(field)
+        .and_then(Value::as_str)
+        .is_some_and(|value| !values.iter().any(|allowed| allowed == value))
+    {
+        model.as_object_mut().unwrap().remove(field);
+    }
+}
+
+/// Keep projected catalogs compact where Codex itself treats omission as the default.
+fn prune_defaults(model: &mut Value) {
+    let Some(fields) = model.as_object_mut() else {
+        return;
+    };
+    if fields.get("supports_reasoning_summary_parameter") == Some(&Value::Bool(true)) {
+        fields.remove("supports_reasoning_summary_parameter");
+    }
+    if fields
+        .get("default_reasoning_summary")
+        .and_then(Value::as_str)
+        == Some("auto")
+    {
+        fields.remove("default_reasoning_summary");
+    }
+    for field in [
+        "use_responses_lite",
+        "supports_search_tool",
+        "supports_image_detail_original",
+        "supports_experimental_context",
+    ] {
+        if fields.get(field) == Some(&Value::Bool(false)) {
+            fields.remove(field);
+        }
+    }
+    for field in ["additional_speed_tiers", "service_tiers"] {
+        if fields
+            .get(field)
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+        {
+            fields.remove(field);
+        }
+    }
+    if fields
+        .get("default_service_tier")
+        .is_some_and(Value::is_null)
+    {
+        fields.remove("default_service_tier");
+    }
+    if fields
+        .get("available_access_programs")
+        .is_some_and(Value::is_null)
+    {
+        fields.remove("available_access_programs");
+    }
+    if fields.get("web_search_tool_type").and_then(Value::as_str) == Some("text") {
+        fields.remove("web_search_tool_type");
     }
 }
 
@@ -290,5 +436,135 @@ mod tests {
             row["base_instructions"],
             "Custom identity: local, not GPT. Later GPT-6 stays literal."
         );
+    }
+
+    #[test]
+    fn codex_projection_prunes_omission_defaults_and_keeps_nondefault_values() {
+        let mut row = json!({
+            "slug":"m", "additional_speed_tiers":[], "service_tiers":[],
+            "default_service_tier":null, "available_access_programs":null,
+            "web_search_tool_type":"text", "supports_search_tool":false,
+            "supports_image_detail_original":false, "supports_experimental_context":false
+        });
+        apply_capabilities(&mut row, &Capabilities::default());
+        for key in [
+            "additional_speed_tiers",
+            "service_tiers",
+            "default_service_tier",
+            "available_access_programs",
+            "web_search_tool_type",
+            "supports_search_tool",
+            "supports_image_detail_original",
+            "supports_experimental_context",
+        ] {
+            assert!(row.get(key).is_none(), "{key} should be omitted");
+        }
+
+        let mut row = json!({"slug":"m"});
+        apply_capabilities(
+            &mut row,
+            &Capabilities {
+                tool_search: Some(true),
+                image_detail_original: Some(true),
+                history_notes: Some(true),
+                web_search: Some(true),
+                service_tiers: Some(true),
+                access_programs: Some(true),
+                ..Default::default()
+            },
+        );
+        assert_eq!(row["supports_search_tool"], true);
+        assert_eq!(row["supports_image_detail_original"], true);
+        assert_eq!(row["supports_experimental_context"], true);
+    }
+
+    #[test]
+    fn codex_capability_false_values_and_unknowns_preserve_intended_distinctions() {
+        let mut row = json!({
+            "slug":"m", "additional_speed_tiers":["fast"],
+            "service_tiers":[{"id":"fast"}], "default_service_tier":"fast",
+            "web_search_tool_type":"text_and_image", "available_access_programs":{"cyber":["standard"]}
+        });
+        apply_capabilities(
+            &mut row,
+            &Capabilities {
+                service_tiers: Some(false),
+                web_search: Some(false),
+                access_programs: Some(false),
+                history_notes: Some(false),
+                ..Default::default()
+            },
+        );
+        assert!(row.get("additional_speed_tiers").is_none());
+        assert!(row.get("service_tiers").is_none());
+        assert!(row.get("default_service_tier").is_none());
+        assert!(row.get("web_search_tool_type").is_none());
+        assert_eq!(row["available_access_programs"], json!({"cyber":[]}));
+        assert!(row.get("supports_experimental_context").is_none());
+
+        let mut unknown = json!({"slug":"m","web_search_tool_type":"text_and_image"});
+        apply_capabilities(&mut unknown, &Capabilities::default());
+        assert_eq!(unknown["web_search_tool_type"], "text_and_image");
+    }
+
+    #[test]
+    fn schema_tiers_replace_template_choices_and_default() {
+        let template = json!({
+            "slug":"m", "additional_speed_tiers":["fast"],
+            "service_tiers":[{"id":"old","name":"Old","description":"Old pricing"}],
+            "default_service_tier":"old"
+        });
+        let mut row = template.clone();
+        let mut facts = Capabilities {
+            service_tiers: Some(true),
+            service_tier_ids: Some(vec![
+                "auto".into(),
+                "default".into(),
+                "flex".into(),
+                "priority".into(),
+            ]),
+            ..Default::default()
+        };
+        apply_capabilities(&mut row, &facts);
+        assert_eq!(
+            row["service_tiers"],
+            json!([
+                {"id":"flex","name":"flex","description":""},
+                {"id":"priority","name":"priority","description":""}
+            ])
+        );
+        assert!(row.get("additional_speed_tiers").is_none());
+        assert!(row.get("default_service_tier").is_none());
+
+        facts.service_tiers = Some(false);
+        let mut row = template;
+        apply_capabilities(&mut row, &facts);
+        assert!(row.get("service_tiers").is_none());
+    }
+
+    #[test]
+    fn excluded_summary_default_uses_an_allowed_mode_not_implicit_auto() {
+        let mut row = json!({"default_reasoning_summary":"auto"});
+        apply_capabilities(
+            &mut row,
+            &Capabilities {
+                reasoning_summary: Some(true),
+                reasoning_summary_levels: Some(vec!["concise".into(), "detailed".into()]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(row["default_reasoning_summary"], "concise");
+        assert!(row.get("supports_reasoning_summary_parameter").is_none());
+
+        apply_capabilities(
+            &mut row,
+            &Capabilities {
+                reasoning_summary: Some(true),
+                reasoning_summary_levels: Some(vec!["unrepresentable".into()]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(row["supports_reasoning_summary_parameter"], false);
+        assert!(row.get("default_reasoning_summary").is_none());
     }
 }

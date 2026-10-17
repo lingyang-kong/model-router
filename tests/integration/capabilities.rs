@@ -88,6 +88,16 @@ async fn gateway_with(
     discovery: Value,
     discovery_urls: Vec<String>,
 ) -> (Server, Server, DiscoveryFixture) {
+    gateway_with_provider_options(fixture, discovery, discovery_urls, json!({}), vec![]).await
+}
+
+async fn gateway_with_provider_options(
+    fixture: &Fixture,
+    discovery: Value,
+    discovery_urls: Vec<String>,
+    capabilities: Value,
+    hidden_models: Vec<&str>,
+) -> (Server, Server, DiscoveryFixture) {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let source = DiscoveryFixture {
         requests: requests.clone(),
@@ -114,6 +124,8 @@ async fn gateway_with(
                     "catalog":{"path":"/catalog","format":"openai"},
                     "http_headers":{"x-provider-secret":"provider-secret"},
                     "discovery_urls":urls,
+                    "capabilities":capabilities,
+                    "hidden_models":hidden_models,
                     "defaults":{"extends":{"provider":"donor","model":"donor-model"}},
                 }
             },
@@ -154,6 +166,63 @@ async fn fetch_catalog(fixture: &Fixture, gateway: &Server) -> Value {
 }
 
 #[tokio::test]
+async fn summary_and_verbosity_refresh_but_effort_schema_does_not_override_template() {
+    let fixture = Fixture::new().await;
+    std::fs::write(fixture.root.path().join("donor.json"), json!({"models":[{
+        "slug":"donor-model", "supported_reasoning_levels":[{"effort":"old","description":"old"}],
+        "default_reasoning_level":"old", "supports_reasoning_summary_parameter":false,
+        "default_reasoning_summary":"detailed", "support_verbosity":false,
+        "default_verbosity":"high"
+    }]}).to_string()).unwrap();
+    let schema = json!({"paths":{"/responses":{"post":{"requestBody":{"content":{
+        "application/json":{"schema":{"properties":{
+            "reasoning":{"anyOf":[{"properties":{
+                "effort":{"anyOf":[{"enum":["low","medium","high"]},{"type":"null"}],"default":"medium"},
+                "summary":{"enum":["auto","concise"],"default":"auto"}
+            }},{"type":"null"}]},
+            "text":{"properties":{"verbosity":{"enum":["low","medium"],"default":"low"}}}
+        }}}
+    }}}}}});
+    let (gateway, _upstream, source) = gateway_with(
+        &fixture,
+        json!({"/openapi.json":schema}),
+        vec!["/openapi.json".into()],
+    )
+    .await;
+    let catalog = fetch_catalog(&fixture, &gateway).await;
+    let row = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["slug"] == "worker")
+        .unwrap();
+    assert_eq!(
+        row["supported_reasoning_levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|level| level["effort"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec!["old"]
+    );
+    assert_eq!(row["default_reasoning_level"], "old");
+    assert!(row.get("supports_reasoning_summary_parameter").is_none());
+    assert!(row.get("default_reasoning_summary").is_none());
+    assert_eq!(row["support_verbosity"], true);
+    assert_eq!(row["default_verbosity"], "low");
+    source.documents.lock().unwrap()["/openapi.json"] = Value::Null;
+    let catalog = fetch_catalog(&fixture, &gateway).await;
+    let row = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["slug"] == "worker")
+        .unwrap();
+    assert_eq!(row["default_reasoning_level"], "old");
+    assert_eq!(row["support_verbosity"], false);
+}
+
+#[tokio::test]
 async fn refresh_queries_explicit_and_advertised_sources_once_then_projects_facts() {
     let fixture = Fixture::new().await;
     write_donor(&fixture);
@@ -184,7 +253,7 @@ async fn refresh_queries_explicit_and_advertised_sources_once_then_projects_fact
     assert_eq!(worker["use_responses_lite"], true);
     assert_eq!(worker["supports_search_tool"], true);
     assert_eq!(worker["input_modalities"], json!(["text", "image"]));
-    assert_eq!(worker["supports_image_detail_original"], false);
+    assert!(worker.get("supports_image_detail_original").is_none());
 
     let second = fetch_catalog(&fixture, &gateway).await;
     assert_eq!(second["models"], response["models"]);
@@ -197,7 +266,7 @@ async fn refresh_queries_explicit_and_advertised_sources_once_then_projects_fact
             "{path}"
         );
     }
-    assert!(!requests.iter().any(|(path, _)| path == "/v1/responses"));
+    assert!(!requests.iter().any(|(path, _)| path == "/responses"));
     assert!(
         requests
             .iter()
@@ -208,7 +277,8 @@ async fn refresh_queries_explicit_and_advertised_sources_once_then_projects_fact
             .iter()
             .all(|(_, headers)| !headers.contains_key("authorization"))
     );
-    assert!(source.probes.lock().unwrap().is_empty());
+    let probes = source.probes.lock().unwrap();
+    assert!(probes.is_empty());
 }
 
 #[tokio::test]
@@ -326,7 +396,7 @@ async fn responses_lite_probe_learns_only_a_specific_rejection_and_runs_each_ref
         .iter()
         .find(|model| model["slug"] == "worker")
         .unwrap();
-    assert_eq!(rejected_worker["use_responses_lite"], false);
+    assert!(rejected_worker.get("use_responses_lite").is_none());
     let first_probe = source.probes.lock().unwrap()[0].clone();
     assert_eq!(first_probe["input"][0]["type"], "additional_tools");
     assert_eq!(first_probe["input"][0]["role"], "developer");
@@ -350,7 +420,160 @@ async fn responses_lite_probe_learns_only_a_specific_rejection_and_runs_each_ref
         .find(|model| model["slug"] == "worker")
         .unwrap();
     assert_eq!(unknown_worker["use_responses_lite"], true);
+    assert_eq!(source.probes.lock().unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn disabled_template_features_do_not_trigger_compatibility_probes() {
+    let fixture = Fixture::new().await;
+    std::fs::write(
+        fixture.root.path().join("donor.json"),
+        json!({"models":[{
+            "slug":"donor-model", "use_responses_lite":false, "supports_search_tool":false
+        }]})
+        .to_string(),
+    )
+    .unwrap();
+    let (gateway, _upstream, source) = gateway_with(&fixture, json!({}), vec![]).await;
+    let catalog = fetch_catalog(&fixture, &gateway).await;
+    let row = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["slug"] == "worker")
+        .unwrap();
+    assert!(row.get("use_responses_lite").is_none());
+    assert!(row.get("supports_search_tool").is_none());
+    assert!(source.probes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn tool_search_probe_learns_a_specific_negative_and_does_not_reuse_it() {
+    let fixture = Fixture::new().await;
+    write_donor(&fixture);
+    let (gateway, _source_server, source) = gateway_with(
+        &fixture,
+        json!({"/server_info":{"capabilities":{"responses_lite":true}}}),
+        vec!["/server_info".into()],
+    )
+    .await;
+    *source.probe_reply.lock().unwrap() = (
+        StatusCode::BAD_REQUEST,
+        json!({"error":{"message":"Unsupported Responses API input item type: 'tool_search_output' None"}}),
+    );
+
+    let rejected = fetch_catalog(&fixture, &gateway).await;
+    let rejected_worker = rejected["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["slug"] == "worker")
+        .unwrap();
+    assert!(rejected_worker.get("supports_search_tool").is_none());
+    let first_probe = source.probes.lock().unwrap()[0].clone();
+    assert_eq!(first_probe["input"][0]["type"], "tool_search_output");
+    assert_eq!(first_probe["input"][0]["call_id"], "model_router_probe");
+    assert_eq!(first_probe["input"][0]["status"], "completed");
+    assert_eq!(first_probe["input"][0]["execution"], "client");
+    assert_eq!(first_probe["input"][0]["tools"], json!([]));
+    assert_eq!(
+        first_probe["input"][1]["type"],
+        "__model_router_capability_check__"
+    );
+    assert_eq!(first_probe["max_output_tokens"], 1);
+    assert_eq!(first_probe["store"], false);
+
+    *source.probe_reply.lock().unwrap() = (
+        StatusCode::UNAUTHORIZED,
+        json!({"error":{"message":"Invalid API key"}}),
+    );
+    let unknown = fetch_catalog(&fixture, &gateway).await;
+    let unknown_worker = unknown["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["slug"] == "worker")
+        .unwrap();
+    assert_eq!(unknown_worker["supports_search_tool"], true);
     assert_eq!(source.probes.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn provider_capability_overrides_discovered_and_inherited_search_support() {
+    let fixture = Fixture::new().await;
+    write_donor(&fixture);
+    let (gateway, _source_server, source) = gateway_with_provider_options(
+        &fixture,
+        json!({
+            "/model_info":{"served_model_name":"worker","capabilities":{"tool_search":true,"responses_lite":true}}
+        }),
+        vec!["/model_info".into()],
+        json!({"tool_search":false}),
+        vec![],
+    )
+    .await;
+
+    let response = fetch_catalog(&fixture, &gateway).await;
+    let worker = response["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["slug"] == "worker")
+        .unwrap();
+    assert!(worker.get("supports_search_tool").is_none());
+    assert!(source.probes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn hidden_models_skip_search_capability_probes() {
+    let fixture = Fixture::new().await;
+    write_donor(&fixture);
+    let (gateway, _source_server, source) = gateway_with_provider_options(
+        &fixture,
+        json!({"/server_info":{"capabilities":{"responses_lite":true}}}),
+        vec!["/server_info".into()],
+        json!({}),
+        vec!["worker"],
+    )
+    .await;
+
+    let response = fetch_catalog(&fixture, &gateway).await;
+    assert!(
+        !response["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|model| model["slug"] == "worker")
+    );
+    assert!(source.probes.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn provider_tool_inventory_false_overrides_discovery_and_skips_tool_fetch() {
+    let fixture = Fixture::new().await;
+    write_donor(&fixture);
+    let (gateway, _source_server, source) = gateway_with_provider_options(
+        &fixture,
+        json!({
+            "/server_info":{"capabilities":{"tool_inventory":true}},
+            "/openapi.json":openapi_without_original(),
+            "/v1/tools":{"tools":[{"type":"tool_search"}]}
+        }),
+        vec!["/server_info".into(), "/openapi.json".into()],
+        json!({"tool_inventory":false}),
+        vec![],
+    )
+    .await;
+
+    fetch_catalog(&fixture, &gateway).await;
+    assert!(
+        !source
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(path, _)| path == "/v1/tools")
+    );
 }
 
 #[tokio::test]
@@ -459,7 +682,7 @@ async fn missing_or_wrong_model_facts_preserve_inherited_values() {
     assert_eq!(worker["input_modalities"], json!(["text", "image"]));
     assert_eq!(worker["supports_search_tool"], true);
     assert_eq!(worker["use_responses_lite"], true);
-    assert_eq!(source.probes.lock().unwrap().len(), 1);
+    assert_eq!(source.probes.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
