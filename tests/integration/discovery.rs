@@ -450,7 +450,12 @@ async fn explicitly_qualified_inheritance_rejects_a_donor_owned_by_another_provi
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::NOT_FOUND
+            // Explicit provider ownership is usable even before catalog metadata validates.
+            if model == "alias/model" {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            }
         );
     }
 }
@@ -548,7 +553,7 @@ async fn explicit_inheritance_tracks_remote_donor_updates_and_missing_donor_roll
     );
     assert_eq!(
         route("broken/model").send().await.unwrap().status(),
-        StatusCode::NOT_FOUND
+        StatusCode::OK
     );
     assert_eq!(
         route("vendor/model").send().await.unwrap().status(),

@@ -51,6 +51,22 @@ impl RouterState {
         {
             return Ok(Arc::clone(&entry.provider));
         }
+        // Explicit native IDs already identify their provider before remote discovery.
+        if let Some(model) = model {
+            let mut configured = self
+                .config
+                .providers
+                .values()
+                .filter(|provider| provider.models.contains_key(model));
+            if let Some(provider) = configured.next() {
+                if configured.next().is_some() {
+                    return Err(Error::bad_gateway(format!(
+                        "Conflicting providers for model: {model}"
+                    )));
+                }
+                return Ok(Arc::clone(provider));
+            }
+        }
         if let Some(fallback) = fallback {
             return Ok(Arc::clone(fallback));
         }
@@ -139,7 +155,7 @@ async fn handle_request(
     State(state): State<Arc<RouterState>>,
     request: Request,
 ) -> Result<Response> {
-    let adapter = Client::from_headers(request.headers())?;
+    let adapter = Client::from_headers(request.headers());
     let action = &state
         .config
         .route(request.method(), request.uri(), request.headers())?

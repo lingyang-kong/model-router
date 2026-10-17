@@ -6,28 +6,19 @@ Use GPT through your ChatGPT subscription and custom models through Responses-co
 
 1. Adapt [router-config.toml](../examples/router-config.toml) to your upstream and model. The supplied example discovers Qwen models from SGLang's OpenAI-compatible `http://localhost:30000/v1/models` endpoint and inherits a full model entry from the official ChatGPT catalog.
 2. [Start the router](../README.md#run).
-3. Merge the following into `~/.codex/config.toml`. Put `model_provider` before any tables and merge existing tables rather than duplicating them.
+3. Set this top-level option in `~/.codex/config.toml`:
 
 ```toml
-model_provider = "router"
-
-[agents]
-default_subagent_model = "vendor/model"
-
-[model_providers.router]
-name = "OpenAI"
-base_url = "http://localhost:8080"
-model_catalog_url = "http://localhost:8080/models"
-requires_openai_auth = true
-supports_websockets = true
-http_headers = { "x-router-client" = "codex" }
+openai_base_url = "http://localhost:4134"
 ```
 
-Replace `vendor/model` with the exact model ID in your catalog. Keep your ChatGPT login, or run `codex login`; no OpenAI API key is needed. Start `codex` and use `/model` to select the main model. Workers default to the configured model unless an explicit model or agent-role setting overrides it.
+Keep your ChatGPT login, or run `codex login`; no OpenAI API key is needed. When migrating, remove `model_provider = "router"` and its old custom provider table so Codex uses the built-in OpenAI provider. Select models with `/model`; worker defaults remain optional agent settings. This one-line setup uses ChatGPT authentication. API-key catalog discovery still needs an explicit catalog URL in Codex.
 
 ## Multi-agent v2 compatibility
 
-For HTTP and WebSocket Model routes carrying `x-router-client: codex`, the router adapts Codex multi-agent v2 JSON messages for compatible Responses upstreams. It renames the `collaboration` tool namespace to `collaboration_compat` upstream, removes `message.encrypted` from `spawn_agent`, `send_message`, and `followup_task` schemas, then restores the original tool identities in returned calls. It maps collaboration tool identities in replayed input as well. Plaintext `agent_message` content is relabeled as `input_text`, including on marked requests whose upstream preserves native `agent_message` items. This does not decrypt `encrypted_content` or rewrite nested code-mode calls. Payloads that need no JSON edit retain their bytes. The WebSocket adaptation handles JSON messages only.
+Client detection checks whether the `originator` value contains `codex`, ignoring ASCII case. Other values remain unadapted.
+
+For HTTP and WebSocket Model routes identified by recognized Codex `originator` values, the router adapts Codex multi-agent v2 JSON messages for compatible Responses upstreams. It renames the `collaboration` tool namespace to `collaboration_compat` upstream, removes `message.encrypted` from `spawn_agent`, `send_message`, and `followup_task` schemas, then restores the original tool identities in returned calls. It maps collaboration tool identities in replayed input as well. Plaintext `agent_message` content is relabeled as `input_text`, including on marked requests whose upstream preserves native `agent_message` items. This does not decrypt `encrypted_content` or rewrite nested code-mode calls. Payloads that need no JSON edit retain their bytes. The WebSocket adaptation handles JSON messages only.
 
 Codex SSE streams use LF framing and forward comments promptly. Rewritten JSON data removes literal CR/LF whitespace while preserving strings and escaped newlines.
 
@@ -35,7 +26,7 @@ When an actual input contains `agent_message`, the router validates support with
 
 Subagent model listings use non-hidden entries from the latest successful catalog snapshots. Retired IDs remain routable but are not advertised. Before remote discovery succeeds, the client's cached model list is preserved; file-only catalogs are available at startup. A successful empty catalog clears the old choices, while a failed refresh preserves the previous listing.
 
-For WebSocket Model routes, the router reads `x-codex-routing-hint` during the handshake, selects the corresponding upstream provider, and keeps it fixed for that connection. The adapted handshake does not negotiate `permessage-deflate`, which the WebSocket library does not support; generic raw tunnels preserve negotiated extensions. Compression may remain enabled for HTTP requests; the adapter decodes and rewrites JSON when needed. Start a fresh Codex session after enabling this compatibility.
+For Codex WebSocket requests, the handshake routing hint selects the initial provider. Every subsequent model request is resolved again, so a socket prewarmed for GPT can safely serve a custom model. Supported upstreams use WebSocket; an explicit upgrade refusal selects HTTP for that request while the client remains connected by WebSocket. The adapted handshake does not negotiate `permessage-deflate`; generic raw tunnels retain their negotiated extensions.
 
 The catalog retains the inherited `multi_agent_version`. Remove earlier v1 pins or configuration that disables Codex's multi-agent v2 feature.
 
@@ -69,6 +60,6 @@ The prompt and summary-prefix templates plus their license are fetched at build 
 
 With WebSockets, Codex uses `name = "OpenAI"` and ChatGPT sign-in to supply the model routing hint.
 
-Keep `name = "OpenAI"` and ChatGPT sign-in so Codex supplies its routing hint. If the selected upstream rejects WebSockets, Codex may retry and fall back to HTTP; the previously tested SGLang endpoint rejected seven handshakes before that fallback. This is an endpoint limitation, and the router leaves the upstream handshake result intact. A provider is selected once per WebSocket connection, so reconnect after changing providers.
+No provider WebSocket flag is required. The router attempts the real upstream handshake and falls back on a successful non-upgrade response or HTTP 404, 405, 426, or 501. Authentication, rate-limit, and server errors remain errors. The original working upstream socket remains open; requests routed elsewhere use a separate upstream WebSocket when available, or streamed HTTP otherwise. Connection-local `previous_response_id` values require a full-history replay when changing upstream connections. Codex handles that retry automatically.
 
 [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)

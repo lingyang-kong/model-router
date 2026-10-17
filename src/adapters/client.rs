@@ -9,18 +9,9 @@ pub(crate) enum Client {
 }
 
 impl Client {
-    pub fn from_headers(headers: &HeaderMap) -> Result<Option<Self>> {
-        let mut values = headers.get_all("x-router-client").iter();
-        let Some(value) = values.next() else {
-            return Ok(None);
-        };
-        if values.any(|other| other != value) {
-            return Err(Error::bad_request("Conflicting x-router-client headers"));
-        }
-        match value.as_bytes() {
-            b"codex" => Ok(Some(Self::Codex)),
-            _ => Err(Error::bad_request("Unknown x-router-client")),
-        }
+    pub fn from_headers(headers: &HeaderMap) -> Option<Self> {
+        let originator = headers.get("originator")?.to_str().ok()?;
+        codex::matches_originator(originator).then_some(Self::Codex)
     }
 
     pub fn catalog_format(self) -> CatalogFormat {
@@ -81,8 +72,40 @@ impl<'a> ModelHint<'a> {
         Ok(())
     }
 
-    pub fn require(self) -> Result<&'a str> {
+    pub fn optional(self) -> Option<&'a str> {
         self.0
-            .ok_or_else(|| Error::bad_request("WebSocket model routes require a model hint"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn originator_value_identifies_codex_not_header_presence() {
+        for value in [
+            "codex_cli_rs",
+            "codex-tui",
+            "codex_vscode",
+            "codex_atlas",
+            "codex_chatgpt_desktop",
+            "codex_work_desktop",
+            "Codex Desktop",
+            "my-CODEX-host",
+            "codex_unrelated",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert("originator", value.parse().unwrap());
+            assert!(
+                matches!(Client::from_headers(&headers), Some(Client::Codex)),
+                "{value}"
+            );
+        }
+        for value in ["", "opencode", "claude-code", "router_test_host"] {
+            let mut headers = HeaderMap::new();
+            headers.insert("originator", value.parse().unwrap());
+            assert!(Client::from_headers(&headers).is_none(), "{value}");
+        }
+        assert!(Client::from_headers(&HeaderMap::new()).is_none());
     }
 }
