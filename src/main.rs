@@ -12,7 +12,7 @@ async fn main() -> anyhow::Result<()> {
                  Environment:\n\t\
                  MODEL_ROUTER_CONFIG\t\tPath to the router TOML configuration\n\t\
                  MODEL_ROUTER_CONFIG_TOML\tInline TOML when no configuration path is set\n\t\
-                 MODEL_ROUTER_PORT\t\tLocalhost port (default: 8080)"
+                 MODEL_ROUTER_PORT\t\tLocalhost port (default: 4134)"
             );
             return Ok(());
         }
@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
     }
     let config = Config::from_env()?;
     let port = std::env::var("MODEL_ROUTER_PORT")
-        .unwrap_or_else(|_| "8080".into())
+        .unwrap_or_else(|_| "4134".into())
         .parse::<u16>()?;
     let app = router(config)?;
     #[cfg(unix)]

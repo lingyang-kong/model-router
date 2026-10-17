@@ -127,15 +127,15 @@ async fn empty_model_requests_use_only_the_configured_fallback() {
 }
 
 #[tokio::test]
-async fn client_markers_are_validated_before_forwarding() {
+async fn obsolete_client_markers_do_not_control_forwarding() {
     let fixture = Fixture::new().await;
     for (markers, status) in [
         (vec![], StatusCode::OK),
         (vec!["codex"], StatusCode::OK),
         (vec!["codex", "codex"], StatusCode::OK),
-        (vec![""], StatusCode::BAD_REQUEST),
-        (vec!["unknown"], StatusCode::BAD_REQUEST),
-        (vec!["codex", "unknown"], StatusCode::BAD_REQUEST),
+        (vec![""], StatusCode::OK),
+        (vec!["unknown"], StatusCode::OK),
+        (vec!["codex", "unknown"], StatusCode::OK),
     ] {
         let seen = fixture.live.seen.lock().unwrap().len();
         let mut request = fixture
@@ -151,6 +151,27 @@ async fn client_markers_are_validated_before_forwarding() {
             fixture.live.seen.lock().unwrap().len(),
             seen + usize::from(status.is_success())
         );
+    }
+}
+
+#[tokio::test]
+async fn other_originators_preserve_payloads_that_resemble_codex_requests() {
+    let fixture = Fixture::new().await;
+    let original = r#"{ "model": "gpt-test", "tools": [{"type":"namespace","name":"collaboration","tools":[]}], "input": [{"type":"agent_message","content":[{"type":"encrypted_content","encrypted_content":"plain text"}]}] }"#;
+    for originator in ["opencode", "claude-code", "router_test_host"] {
+        let response: Value = fixture
+            .client
+            .post(fixture.routed.url.clone() + "/responses")
+            .header("x-route-provider", "service-a")
+            .header("originator", originator)
+            .body(original)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(response["body"], original);
     }
 }
 

@@ -9,7 +9,7 @@ For OpenCode v2 WebSockets, merge this into an existing Responses provider:
   "providers": {
     "openai": {
       "settings": {
-        "baseURL": "http://localhost:8080",
+        "baseURL": "http://localhost:4134",
         "transport": "websocket"
       },
       "models": {

@@ -11,8 +11,14 @@ mod compaction_transport;
 mod multiagent;
 mod response;
 mod transport;
+mod websocket;
 
-pub(super) use transport::{adapt_websocket_response, forward, websocket_request};
+pub(super) use transport::{adapt_websocket_response, forward};
+pub(super) use websocket::route as websocket_request;
+
+pub(super) fn matches_originator(originator: &str) -> bool {
+    originator.to_ascii_lowercase().contains("codex")
+}
 
 fn rename_field(fields: &mut Map<String, Value>, from: &str, to: &str) {
     if from != to
