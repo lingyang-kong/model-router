@@ -362,6 +362,7 @@ async fn codex_multiagent_requests_are_rewritten_and_responses_restored() {
     let restored: Value = response.json().await.unwrap();
     assert_eq!(restored["output"][0]["namespace"], "collaboration");
     assert_eq!(restored["output"][0]["name"], "spawn_agent");
+    assert_eq!(restored["output"][0]["encrypted_function_args"], json!([]));
 
     let worker_message = json!({"model":"worker-model","input":[{"type":"agent_message","author":"worker-1","recipient":"parent","internal_chat_message_metadata_passthrough":{"opaque":true},"content":[{"type":"input_text","text":"finished"}]}]});
     let response = client

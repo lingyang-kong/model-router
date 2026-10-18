@@ -314,7 +314,12 @@ async fn codex_multiagent_websocket_transforms_requests_and_restores_events() {
     );
     for event in &received[..2] {
         assert_eq!(event["item"]["namespace"], "collaboration");
+        assert_eq!(event["item"]["encrypted_function_args"], json!([]));
     }
+    assert_eq!(
+        received[2]["response"]["output"][0]["encrypted_function_args"],
+        json!([])
+    );
     assert_eq!(
         received[2]["response"]["output"][0]["namespace"],
         "collaboration"
