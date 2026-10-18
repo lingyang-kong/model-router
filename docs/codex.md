@@ -16,9 +16,13 @@ Keep your ChatGPT login, or run `codex login`; no OpenAI API key is needed. When
 
 ## Multi-agent v2 compatibility
 
-Client detection checks whether the `originator` value contains `codex`, ignoring ASCII case. Other values remain unadapted.
+The adapter renames the `collaboration` namespace to `collaboration_compat` upstream, removes `message.encrypted` from the `spawn_agent`, `send_message`, and `followup_task` schemas, maps replayed tool identities, and restores identities in returned calls. Encrypted agent messages pass through unchanged, including their envelopes. Only plaintext agent-message envelopes are converted after the rejection described above.
 
-For HTTP and WebSocket Model routes identified by recognized Codex `originator` values, the router adapts Codex multi-agent v2 JSON messages for compatible Responses upstreams. It renames the `collaboration` tool namespace to `collaboration_compat` upstream, removes `message.encrypted` from `spawn_agent`, `send_message`, and `followup_task` schemas, then restores the original tool identities in returned calls. It maps collaboration tool identities in replayed input as well. Plaintext `agent_message` content is relabeled as `input_text`, including on marked requests whose upstream preserves native `agent_message` items. This does not decrypt `encrypted_content` or rewrite nested code-mode calls. Payloads that need no JSON edit retain their bytes. The WebSocket adaptation handles JSON messages only.
+Restored collaboration message calls receive `encrypted_function_args: []` if that metadata is absent. Codex uses an explicit empty list for plaintext delivery and persistence; absence means encrypted handling. Preserve this distinction and any existing encryption metadata.
+
+Restored collaboration message calls include `encrypted_function_args: []` when the upstream omitted it. Codex uses this explicit empty list to deliver and save the message as plaintext; an absent marker instead makes it treat the message as encrypted. Existing encryption metadata is preserved. This prevents new messages from being mislabeled, but does not repair earlier saved history or make router-generated compaction checkpoints portable to direct OpenAI connections.
+
+A Codex 0.163.0 comparison used a controlled plaintext parent tool response and live GPT children. With the marker, Codex saved the child's task as `input_text`; removing the marker made it save literal plaintext as `encrypted_content`. After stopping the router and restarting Codex against OpenAI directly, both parents resumed, but continuing the existing child through `followup_task` succeeded only in the marked run. That child recalled its original answer. The control child failed with a stream-closed error, which did not explicitly identify a decryption failure. This isolates the marker; it does not establish general Qwen-history portability. A separate Qwen run encountered OpenAI rejecting a nonempty `reasoning.content` array.
 
 Codex SSE streams use LF framing and forward comments promptly. Rewritten JSON data removes literal CR/LF whitespace while preserving strings and escaped newlines.
 

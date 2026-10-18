@@ -10,7 +10,6 @@ const COLLABORATION: NamespacePair = NamespacePair {
 };
 const AGENT_MESSAGE: &str = "agent_message";
 const ENCRYPTED_CONTENT: &str = "encrypted_content";
-const INPUT_TEXT: &str = "input_text";
 const SPAWN_AGENT: &str = "spawn_agent";
 
 pub(crate) fn request_may_need_adaptation(bytes: &[u8]) -> bool {
@@ -250,29 +249,18 @@ fn rewrite_agent(
     object: &mut BTreeMap<String, Box<RawValue>>,
     text_messages: bool,
 ) -> serde_json::Result<bool> {
-    let mut changed = false;
     if let Some(content) = object.get("content")
-        && let Some(mut parts) = parse_array(content)?
+        && let Some(parts) = parse_array(content)?
     {
-        let mut content_changed = false;
-        for part in &mut parts {
-            let Some(mut part_object) = parse_object(part)? else {
-                continue;
-            };
-            if string(part_object.get("type")).as_deref() == Some(ENCRYPTED_CONTENT)
-                && let Some(encrypted_text) = part_object.remove(ENCRYPTED_CONTENT)
+        for part in parts {
+            if let Some(part) = parse_object(&part)?
+                && string(part.get("type")).as_deref() == Some(ENCRYPTED_CONTENT)
             {
-                set_str(&mut part_object, "type", INPUT_TEXT);
-                part_object.insert("text".into(), encrypted_text);
-                *part = encode_json(&part_object)?;
-                content_changed = true;
+                return Ok(false);
             }
         }
-        if content_changed {
-            object.insert("content".into(), encode_json(&parts)?);
-            changed = true;
-        }
     }
+    let mut changed = false;
     if text_messages {
         if string(object.get("type")).as_deref() != Some("message") {
             set_str(object, "type", "message");
@@ -342,11 +330,7 @@ pub(super) fn restore_bytes(bytes: &[u8]) -> serde_json::Result<Option<Vec<u8>>>
         Some("response.output_item.done" | "response.output_item.added") => {
             if let Some(item_raw) = object.get("item")
                 && let Some(mut item) = parse_object(item_raw)?
-                && matches!(
-                    string(item.get("type")).as_deref(),
-                    Some("function_call" | "custom_tool_call")
-                )
-                && rewrite_identity(&mut item, COLLABORATION.upstream, COLLABORATION.client)
+                && restore_call(&mut item)?
             {
                 object.insert("item".into(), encode_json(&item)?);
                 changed = true;
@@ -359,6 +343,29 @@ pub(super) fn restore_bytes(bytes: &[u8]) -> serde_json::Result<Option<Vec<u8>>>
     } else {
         Ok(None)
     }
+}
+fn restore_call(item: &mut BTreeMap<String, Box<RawValue>>) -> serde_json::Result<bool> {
+    let kind = string(item.get("type"));
+    if !matches!(kind.as_deref(), Some("function_call" | "custom_tool_call"))
+        || !rewrite_identity(item, COLLABORATION.upstream, COLLABORATION.client)
+    {
+        return Ok(false);
+    }
+    let name = string(item.get("name"));
+    let name = name
+        .as_deref()
+        .map(|name| name.strip_prefix("collaboration__").unwrap_or(name));
+    if kind.as_deref() == Some("function_call")
+        && matches!(name, Some("spawn_agent" | "send_message" | "followup_task"))
+        && !item.contains_key("encrypted_function_args")
+    {
+        // Codex treats an absent marker as encrypted, even for plaintext arguments.
+        item.insert(
+            "encrypted_function_args".into(),
+            encode_json(&[] as &[String])?,
+        );
+    }
+    Ok(true)
 }
 fn restore_output(
     object: &mut BTreeMap<String, Box<RawValue>>,
@@ -375,11 +382,7 @@ fn restore_output(
         let Some(mut item) = parse_object(item_raw)? else {
             continue;
         };
-        if matches!(
-            string(item.get("type")).as_deref(),
-            Some("function_call" | "custom_tool_call")
-        ) && rewrite_identity(&mut item, COLLABORATION.upstream, COLLABORATION.client)
-        {
+        if restore_call(&mut item)? {
             *item_raw = encode_json(&item)?;
             changed = true;
         }
@@ -394,8 +397,56 @@ fn restore_output(
 mod tests {
     use super::*;
     #[test]
+    fn encrypted_agent_messages_remain_unchanged_even_when_native_items_are_rejected() {
+        let input = br#"{"input":[{"type":"agent_message","author":"worker","recipient":"parent","content":[{"type":"input_text","text":"context"},{"type":"encrypted_content","encrypted_content":"opaque-ciphertext"}]}]}"#;
+        for convert in [false, true] {
+            assert!(prepare_bytes(input, convert, "").unwrap().is_none());
+        }
+    }
+    #[test]
+    fn plaintext_marker_is_selective_and_preserves_explicit_encryption() {
+        use serde_json::json;
+        for name in ["spawn_agent", "send_message", "followup_task"] {
+            for call in [
+                json!({"type":"function_call", "namespace":"collaboration_compat", "name":name}),
+                json!({"type":"function_call", "name":format!("collaboration_compat.{name}")}),
+                json!({"type":"function_call", "name":format!("collaboration_compat__{name}")}),
+            ] {
+                for event in ["response.output_item.added", "response.output_item.done"] {
+                    let input = json!({"type":event,"item":call});
+                    let restored = restore_bytes(input.to_string().as_bytes())
+                        .unwrap()
+                        .unwrap();
+                    let restored: serde_json::Value = serde_json::from_slice(&restored).unwrap();
+                    assert_eq!(restored["item"]["encrypted_function_args"], json!([]));
+                    assert!(
+                        restore_bytes(&serde_json::to_vec(&restored).unwrap())
+                            .unwrap()
+                            .is_none()
+                    );
+                }
+            }
+        }
+        for call in [
+            json!({"type":"function_call","namespace":"collaboration_compat","name":"wait_agent"}),
+            json!({"type":"custom_tool_call","namespace":"collaboration_compat","name":"spawn_agent"}),
+            json!({"type":"function_call","namespace":"collaboration","name":"spawn_agent"}),
+            json!({"type":"function_call","namespace":"other","name":"spawn_agent"}),
+            json!({"type":"function_call","namespace":"collaboration_compat","name":"spawn_agent","encrypted_function_args":["message"]}),
+        ] {
+            let input = json!({"object":"response","output":[call]});
+            let bytes = serde_json::to_vec(&input).unwrap();
+            let restored = restore_bytes(&bytes).unwrap().unwrap_or(bytes);
+            let restored: serde_json::Value = serde_json::from_slice(&restored).unwrap();
+            assert_eq!(
+                restored["output"][0].get("encrypted_function_args"),
+                call.get("encrypted_function_args")
+            );
+        }
+    }
+    #[test]
     fn targeted_adaptation_and_restore() {
-        let input=br#"{"tools":[{"type":"namespace","name":"collaboration","tools":[{"name":"spawn_agent","description":"d","parameters":{"properties":{"message":{"encrypted":true,"deep":{"x":1}}}}}]}],"input":[{"type":"agent_message","author":"a","content":[{"type":"encrypted_content","encrypted_content":"literal"}]},{"type":"function_call","name":"collaboration__send_message","arguments":"collaboration"}]}"#;
+        let input=br#"{"tools":[{"type":"namespace","name":"collaboration","tools":[{"name":"spawn_agent","description":"d","parameters":{"properties":{"message":{"encrypted":true,"deep":{"x":1}}}}}]}],"input":[{"type":"agent_message","author":"a","content":[{"type":"input_text","text":"literal"}]},{"type":"function_call","name":"collaboration__send_message","arguments":"collaboration"}]}"#;
         let out = prepare_bytes(input, true, "listing\n").unwrap().unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["tools"][0]["name"], COLLABORATION.upstream);

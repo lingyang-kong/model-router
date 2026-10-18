@@ -254,7 +254,7 @@ async fn codex_multiagent_websocket_transforms_requests_and_restores_events() {
         ]}]},
         {"type":"function_call","namespace":"collaboration","name":"spawn_agent","call_id":"c1","arguments":"{}"},
         {"type":"function_call_output","call_id":"c1","output":"done"},
-        {"type":"agent_message","author":"worker","recipient":"parent","internal_chat_message_metadata_passthrough":{"opaque":true},"content":[{"type":"encrypted_content","encrypted_content":"secret text"}]}
+        {"type":"agent_message","author":"worker","recipient":"parent","internal_chat_message_metadata_passthrough":{"opaque":true},"content":[{"type":"input_text","text":"secret text"}]}
     ]});
     let encoded = original
         .to_string()
@@ -314,7 +314,12 @@ async fn codex_multiagent_websocket_transforms_requests_and_restores_events() {
     );
     for event in &received[..2] {
         assert_eq!(event["item"]["namespace"], "collaboration");
+        assert_eq!(event["item"]["encrypted_function_args"], json!([]));
     }
+    assert_eq!(
+        received[2]["response"]["output"][0]["encrypted_function_args"],
+        json!([])
+    );
     assert_eq!(
         received[2]["response"]["output"][0]["namespace"],
         "collaboration"
