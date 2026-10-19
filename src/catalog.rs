@@ -1,11 +1,10 @@
 use std::{io, sync::Arc};
 
 use axum::{
-    Json,
     body::Body,
     extract::Request,
     http::{HeaderMap, Method, StatusCode, request::Parts},
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use futures_util::{StreamExt, TryStreamExt, future::try_join_all, stream::FuturesOrdered};
 use indexmap::IndexMap;
@@ -17,8 +16,8 @@ use crate::{
     adapters::CatalogFormat,
     body::stream_body,
     capabilities::{self, Discovery},
-    compression::decode_body,
-    config::Provider,
+    compression::{accepts_gzip, decode_body, encode_body},
+    config::{Provider, header_has_token},
     error::{Error, Result},
     router::{RouterState, stream_response},
 };
@@ -239,6 +238,7 @@ impl RouterState {
         origin: &Arc<Provider>,
         output: CatalogFormat,
     ) -> Result<Response> {
+        let gzip = accepts_gzip(&parts.headers)?;
         let incoming_headers = parts.headers.clone();
         let mut auxiliary = Vec::new();
         for provider in self.config.providers.values() {
@@ -426,7 +426,6 @@ impl RouterState {
         let mut headers = anchor.headers;
         for name in [
             "content-encoding",
-            "content-type",
             "etag",
             "last-modified",
             "content-md5",
@@ -437,8 +436,18 @@ impl RouterState {
         ] {
             headers.remove(name);
         }
-        let mut response = Json(document).into_response();
-        response.headers_mut().extend(headers);
+        headers.insert("content-type", "application/json".parse().unwrap());
+        if gzip {
+            headers.insert("content-encoding", "gzip".parse().unwrap());
+        }
+        if !header_has_token(&headers, "vary", "accept-encoding")
+            && !header_has_token(&headers, "vary", "*")
+        {
+            headers.append("vary", "Accept-Encoding".parse().unwrap());
+        }
+        let bytes = serde_json::to_vec(&document).map_err(Error::bad_gateway)?;
+        let mut response = Response::new(encode_body(bytes, gzip));
+        *response.headers_mut() = headers;
         Ok(response)
     }
 }
