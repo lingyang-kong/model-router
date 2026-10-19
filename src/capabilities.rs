@@ -65,7 +65,8 @@ pub(crate) struct Discovery {
 }
 
 impl Discovery {
-    /// Combine independently fetched discovery documents. Explicit newer facts win.
+    /// Later documents overwrite known fields, regardless of evidence source.
+    /// Missing fields preserve earlier observations.
     pub(crate) fn merge(&mut self, newer: Self) {
         self.capabilities.merge(newer.capabilities);
         for (id, capabilities) in newer.models {
@@ -88,7 +89,7 @@ impl Discovery {
     }
 }
 
-/// Extract only explicit provider facts; absence is represented as `None`.
+/// Read declared capabilities and supported schema constraints; unknowns remain `None`.
 pub(crate) fn parse(document: &Value) -> Discovery {
     let mut found = Discovery::default();
     parse_tool_inventory(document, &mut found.capabilities);
@@ -127,8 +128,7 @@ pub(crate) fn parse(document: &Value) -> Discovery {
         found.capabilities.image_detail_original = Some(supported);
     }
 
-    // Closed enums describe accepted capability values. Every relevant
-    // Responses request schema must provide the same closed fact.
+    // Only use a deduction when all relevant Responses request schemas agree.
     let mut tier_constraints = Vec::new();
     let mut tier_id_constraints = Vec::new();
     let mut search_constraints = Vec::new();
@@ -731,23 +731,6 @@ mod tests {
     }
 
     #[test]
-    fn inventories_require_native_tool_type_and_absence_is_unknown() {
-        assert_eq!(parse(&json!({"tools":[]})).capabilities.tool_search, None);
-        assert_eq!(
-            parse(&json!({"tools":[{"type":"function","name":"tool_search"}]}))
-                .capabilities
-                .tool_search,
-            None
-        );
-        assert_eq!(
-            parse(&json!({"tools":[{"type":"tool_search"}]}))
-                .capabilities
-                .tool_search,
-            Some(true)
-        );
-    }
-
-    #[test]
     fn explicit_flags_and_model_scope_are_preserved() {
         let d = parse(
             &json!({"capabilities":{"responses_lite":false,"images":true},"model_info":{"served_model_name":"m","has_image_understanding":false}}),
@@ -926,17 +909,18 @@ mod tests {
     }
 
     #[test]
-    fn inventory_response_array_is_reachable_and_empty_inventory_is_known() {
+    fn inventories_distinguish_native_tool_types_empty_lists_and_missing_facts() {
         assert_eq!(
             parse(&json!([{"type":"tool_search"}]))
                 .capabilities
                 .tool_search,
             Some(true)
         );
-        assert_eq!(
-            parse(&json!({"tools":[]})).capabilities.tool_inventory,
-            Some(true)
-        );
+        for tools in [json!([]), json!([{"type":"function","name":"tool_search"}])] {
+            let inventory = parse(&json!({"tools":tools}));
+            assert_eq!(inventory.capabilities.tool_inventory, Some(true));
+            assert_eq!(inventory.capabilities.tool_search, None);
+        }
         assert_eq!(
             parse(&json!({"tool_server":null}))
                 .capabilities

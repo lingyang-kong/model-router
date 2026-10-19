@@ -40,8 +40,8 @@ async fn configured_discovery_refreshes_native_metadata_and_isolates_source_head
     let seen = Arc::new(Mutex::new(Vec::new()));
     let remote = serve(Router::new().fallback(source).with_state(seen.clone())).await;
     let config = parse_config(
-        &json!({"providers": {
-            "anchor": {"base_url":remote.url,"auth":"none"},
+        &json!({"clients":{"openai":{"provider":"anchor","format":"openai"}},"providers": {
+            "anchor": {"base_url":remote.url,"auth":"none","catalog":{"path":"/models","format":"openai"}},
             "custom": {
                 "base_url":remote.url,"auth":"none",
                 "catalog":{"path":"/custom/models","format":"openai"},
@@ -52,7 +52,7 @@ async fn configured_discovery_refreshes_native_metadata_and_isolates_source_head
                 }
             }
         }, "routes":[
-            {"method":"GET","path":"/models","action":"catalog","provider":"anchor","format":"openai"},
+            {"method":"GET","path":"/models","action":"catalog"},
             {"action":"model"}
         ]})
         .to_string(),
@@ -72,8 +72,8 @@ async fn configured_discovery_refreshes_native_metadata_and_isolates_source_head
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let catalog: Value = response.json().await.unwrap();
-    // The route anchor owns the response envelope; metadata from extra sources is
-    // merged into its model array without replacing or extending that envelope.
+    // The client profile anchor owns the response envelope; extra source metadata
+    // merges into its model array without replacing or extending that envelope.
     assert!(catalog.get("description").is_none());
     assert!(catalog.get("extensions").is_none());
     let first = catalog["data"]
@@ -168,8 +168,8 @@ async fn openai_sources_project_to_codex_only_with_explicit_native_inheritance()
             .with_state(source.clone()),
     )
     .await;
-    let config = parse_config(&json!({"providers":{
-        "anchor":{"base_url":server.url,"auth":"none"},
+    let config = parse_config(&json!({"clients":{"openai":{"provider":"anchor","format":"codex"}},"providers":{
+        "anchor":{"base_url":server.url,"auth":"none","catalog":{"path":"/models","format":"codex"}},
         "custom":{
             "base_url":server.url,"auth":"none",
             "catalog":{"path":"/custom/models","format":"openai"},
@@ -184,7 +184,7 @@ async fn openai_sources_project_to_codex_only_with_explicit_native_inheritance()
             "unchecked-limit":{"extends":{"provider":"anchor","model":"gpt-6.1-sol"}}}
         }
     },"routes":[
-        {"method":"GET","path":"/models","action":"catalog","provider":"anchor","format":"codex"},
+        {"method":"GET","path":"/models","action":"catalog"},
         {"action":"model"}
     ]}).to_string(),fixture.root.path()).unwrap();
     let gateway = serve(router(config).unwrap()).await;
@@ -337,12 +337,14 @@ async fn ownership_source(State(models): State<OwnershipSource>, request: Reques
     if request.uri().path() == "/models" {
         Json(json!({"data":[{"id":"anchor-model"}]}))
     } else {
+        assert!(request.headers().get("authorization").is_none());
         Json(json!({"data":models.0.lock().unwrap().clone()}))
     }
 }
 
 #[tokio::test]
-async fn ownership_conflict_rolls_back_entire_refresh_and_cross_provider_passthrough_is_rejected() {
+async fn ownership_conflict_rolls_back_entire_refresh_and_cross_provider_passthrough_is_anonymous()
+{
     let fixture = Fixture::new().await;
     let models = Arc::new(Mutex::new(vec![json!({"id":"custom-model"})]));
     let server = serve(
@@ -351,11 +353,11 @@ async fn ownership_conflict_rolls_back_entire_refresh_and_cross_provider_passthr
             .with_state(OwnershipSource(models.clone())),
     )
     .await;
-    let config = parse_config(&json!({"providers":{
-        "anchor":{"base_url":server.url,"auth":"none"},
+    let config = parse_config(&json!({"clients":{"openai":{"format":"openai"}},"providers":{
+        "anchor":{"base_url":server.url,"auth":"none","catalog":{"path":"/models","format":"openai"}},
         "custom":{"base_url":server.url,"auth":"none","catalog":{"path":"/custom/models","format":"openai"}}
     },"routes":[
-        {"method":"GET","path":"/models","action":"catalog","provider":"anchor","format":"openai"},
+        {"method":"GET","path":"/models","action":"catalog"},
         {"action":"model"}
     ]}).to_string(),fixture.root.path()).unwrap();
     let gateway = serve(router(config).unwrap()).await;
@@ -387,11 +389,12 @@ async fn ownership_conflict_rolls_back_entire_refresh_and_cross_provider_passthr
         StatusCode::NOT_FOUND
     );
 
-    let passthrough = parse_config(&json!({"providers":{
-        "anchor":{"base_url":server.url,"auth":"none"},
+    *models.lock().unwrap() = vec![json!({"id":"custom-model"})];
+    let passthrough = parse_config(&json!({"clients":{"openai":{"format":"openai"}},"providers":{
+        "anchor":{"base_url":server.url,"auth":"none","catalog":{"path":"/models","format":"openai"}},
         "custom":{"base_url":server.url,"auth":"passthrough","catalog":{"path":"/custom/models","format":"openai"}}
     },"routes":[
-        {"method":"GET","path":"/models","action":"catalog","provider":"anchor","format":"openai"},
+        {"method":"GET","path":"/models","action":"catalog"},
         {"action":"model"}
     ]}).to_string(),fixture.root.path()).unwrap();
     let gateway = serve(router(passthrough).unwrap()).await;
@@ -399,11 +402,12 @@ async fn ownership_conflict_rolls_back_entire_refresh_and_cross_provider_passthr
         fixture
             .client
             .get(gateway.url.clone() + "/models")
+            .header("authorization", "Bearer client-secret")
             .send()
             .await
             .unwrap()
             .status(),
-        StatusCode::BAD_REQUEST
+        StatusCode::OK
     );
 }
 
@@ -420,13 +424,13 @@ async fn explicitly_qualified_inheritance_rejects_a_donor_owned_by_another_provi
             .with_state(OwnershipSource(models)),
     )
     .await;
-    let config = parse_config(&json!({"providers":{
-        "anchor":{"base_url":server.url,"auth":"none"},
+    let config = parse_config(&json!({"clients":{"openai":{"format":"openai"}},"providers":{
+        "anchor":{"base_url":server.url,"auth":"none","catalog":{"path":"/models","format":"openai"}},
         "custom":{"base_url":server.url,"auth":"none",
             "catalog":{"path":"/custom/models","format":"openai"},
             "models":{"alias/model":{"extends":{"provider":"anchor","model":"custom-model"}}}}
     },"routes":[
-        {"method":"GET","path":"/models","action":"catalog","provider":"anchor","format":"openai"},
+        {"method":"GET","path":"/models","action":"catalog"},
         {"action":"model"}
     ]}).to_string(),fixture.root.path()).unwrap();
     let gateway = serve(router(config).unwrap()).await;
@@ -498,13 +502,13 @@ async fn explicit_inheritance_tracks_remote_donor_updates_and_missing_donor_roll
             .with_state(source.clone()),
     )
     .await;
-    let config = parse_config(&json!({"providers":{
-        "anchor":{"base_url":server.url,"auth":"none"},
+    let config = parse_config(&json!({"clients":{"openai":{"provider":"anchor","format":"codex"}},"providers":{
+        "anchor":{"base_url":server.url,"auth":"none","catalog":{"path":"/models","format":"codex"}},
         "remote":{"base_url":server.url,"auth":"none","catalog":{"path":"/openai/models","format":"openai"},
             "models":{"vendor/model":{"extends":{"provider":"anchor","model":"gpt-6-luna"}},
                 "broken/model":{"extends":{"provider":"anchor","model":"missing-template"}}}}
     },"routes":[
-        {"method":"GET","path":"/models","action":"catalog","provider":"anchor","format":"codex"},
+        {"method":"GET","path":"/models","action":"catalog"},
         {"action":"model"}
     ]}).to_string(),fixture.root.path()).unwrap();
     let gateway = serve(router(config).unwrap()).await;
@@ -569,10 +573,10 @@ async fn file_backed_catalog_origin_uses_startup_metadata_without_reading_file_o
         &file,
         json!({"data":[{"id":"file-origin","name":"Cached model"}],"description":"discarded envelope"}).to_string(),
     ).unwrap();
-    let config = parse_config(&json!({"providers":{
+    let config = parse_config(&json!({"clients":{"openai":{"provider":"origin","format":"openai"}},"providers":{
         "origin":{"base_url":"http://127.0.0.1:1","auth":"none","catalog":{"file":"origin.json","format":"openai"}}
     },"routes":[
-        {"method":"GET","path":"/models","action":"catalog","provider":"origin","format":"openai"},
+        {"method":"GET","path":"/models","action":"catalog"},
         {"action":"model"}
     ]}).to_string(),fixture.root.path()).unwrap();
     let gateway = serve(router(config).unwrap()).await;
@@ -618,13 +622,13 @@ async fn file_donor_changes_are_visible_after_restart() {
         .unwrap();
     };
     write_donor(1);
-    let document = json!({"providers":{
+    let document = json!({"clients":{"openai":{"provider":"origin","format":"codex"}},"providers":{
         "origin":{"base_url":server.url,"auth":"none","catalog":{"path":"/codex/models","format":"codex"}},
         "remote":{"base_url":server.url,"auth":"none","catalog":{"path":"/openai/models","format":"openai"},
             "models":{"derived/model":{"extends":{"provider":"file","model":"file-donor"}}}},
         "file":{"base_url":"http://127.0.0.1:1","auth":"none","catalog":{"file":"donor.json","format":"codex"}}
     },"routes":[
-        {"method":"GET","path":"/models","action":"catalog","provider":"origin","format":"codex"},
+        {"method":"GET","path":"/models","action":"catalog"},
         {"action":"model"}
     ]});
     let config = || parse_config(&document.to_string(), fixture.root.path()).unwrap();
@@ -673,17 +677,22 @@ async fn file_donor_changes_are_visible_after_restart() {
 #[derive(Clone)]
 struct RejectedOriginState {
     auxiliary_started: Arc<tokio::sync::Notify>,
-    auxiliary_hangs: bool,
+    auxiliary_succeeds: bool,
 }
 
 async fn rejected_origin_source(
     State(state): State<RejectedOriginState>,
     request: Request,
 ) -> Response {
+    if request.uri().path() == "/responses" {
+        return StatusCode::OK.into_response();
+    }
     if request.uri().path() == "/custom/models" {
         state.auxiliary_started.notify_one();
-        if state.auxiliary_hangs {
-            std::future::pending::<()>().await;
+        if state.auxiliary_succeeds {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            return Json(json!({"data":[{"id":"auxiliary-model"}],"auxiliary_only":true}))
+                .into_response();
         }
         return (StatusCode::SERVICE_UNAVAILABLE, "auxiliary failed").into_response();
     }
@@ -697,22 +706,22 @@ async fn rejected_origin_source(
 }
 
 #[tokio::test]
-async fn rejected_catalog_origin_keeps_response_and_does_not_wait_for_auxiliary_sources() {
-    for auxiliary_hangs in [false, true] {
+async fn rejected_catalog_origin_uses_successful_auxiliary_or_preserves_its_error() {
+    for auxiliary_succeeds in [false, true] {
         let fixture = Fixture::new().await;
         let server = serve(Router::new().fallback(rejected_origin_source).with_state(
             RejectedOriginState {
                 auxiliary_started: Arc::new(tokio::sync::Notify::new()),
-                auxiliary_hangs,
+                auxiliary_succeeds,
             },
         ))
         .await;
         let config = parse_config(
-            &json!({"providers":{
-                "origin":{"base_url":server.url,"auth":"none"},
+            &json!({"clients":{"openai":{"provider":"origin","format":"openai"}},"providers":{
+                "origin":{"base_url":server.url,"auth":"none","catalog":{"path":"/models","format":"openai"}},
                 "auxiliary":{"base_url":server.url,"auth":"none","catalog":{"path":"/custom/models","format":"openai"}}
             },"routes":[
-                {"method":"GET","path":"/models","action":"catalog","provider":"origin","format":"openai"},
+                {"method":"GET","path":"/models","action":"catalog"},
                 {"action":"model"}
             ]}).to_string(),
             fixture.root.path(),
@@ -724,11 +733,30 @@ async fn rejected_catalog_origin_keeps_response_and_does_not_wait_for_auxiliary_
             fixture.client.get(gateway.url.clone() + "/models").send(),
         )
         .await
-        .expect("origin rejection waited for an auxiliary source")
+        .expect("catalog did not collect the finite auxiliary response")
         .unwrap();
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(response.headers()["retry-after"], "17");
-        assert_eq!(response.text().await.unwrap(), "origin rate limited");
+        if auxiliary_succeeds {
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.headers().get("retry-after").is_none());
+            let document: Value = response.json().await.unwrap();
+            assert_eq!(document["data"], json!([{"id":"auxiliary-model"}]));
+            assert_eq!(document["auxiliary_only"], true);
+            assert_eq!(
+                fixture
+                    .client
+                    .post(gateway.url.clone() + "/responses")
+                    .json(&json!({"model":"auxiliary-model"}))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::OK
+            );
+        } else {
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(response.headers()["retry-after"], "17");
+            assert_eq!(response.text().await.unwrap(), "origin rate limited");
+        }
     }
 }
 
@@ -745,19 +773,20 @@ async fn failed_auxiliary_group_source(
         "/models" => Json(json!({"data":[{"id":"origin-model"}]})).into_response(),
         "/first/models" => {
             state.first_started.notify_one();
-            std::future::pending::<()>().await;
-            unreachable!()
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Json(json!({"data":[{"id":"first-model"}]})).into_response()
         }
         "/second/models" => {
             state.first_started.notified().await;
             (StatusCode::SERVICE_UNAVAILABLE, "second auxiliary failed").into_response()
         }
+        "/responses" => StatusCode::OK.into_response(),
         _ => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
 #[tokio::test]
-async fn failed_auxiliary_group_returns_promptly_and_commits_no_catalog_models() {
+async fn failed_auxiliary_does_not_cancel_delayed_successful_sources() {
     let fixture = Fixture::new().await;
     let server = serve(
         Router::new()
@@ -768,12 +797,12 @@ async fn failed_auxiliary_group_returns_promptly_and_commits_no_catalog_models()
     )
     .await;
     let config = parse_config(
-        &json!({"providers":{
-            "origin":{"base_url":server.url,"auth":"none"},
+        &json!({"clients":{"openai":{"provider":"origin","format":"openai"}},"providers":{
+            "origin":{"base_url":server.url,"auth":"none","catalog":{"path":"/models","format":"openai"}},
             "first":{"base_url":server.url,"auth":"none","catalog":{"path":"/first/models","format":"openai"}},
             "second":{"base_url":server.url,"auth":"none","catalog":{"path":"/second/models","format":"openai"}}
         },"routes":[
-            {"method":"GET","path":"/models","action":"catalog","provider":"origin","format":"openai"},
+            {"method":"GET","path":"/models","action":"catalog"},
             {"action":"model"}
         ]}).to_string(),
         fixture.root.path(),
@@ -785,20 +814,27 @@ async fn failed_auxiliary_group_returns_promptly_and_commits_no_catalog_models()
         fixture.client.get(gateway.url.clone() + "/models").send(),
     )
     .await
-    .expect("a failing auxiliary source waited for the earlier hanging source")
+    .expect("catalog did not collect the finite successful sources")
     .unwrap();
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(response.status(), StatusCode::OK);
+    let document: Value = response.json().await.unwrap();
     assert_eq!(
-        fixture
-            .client
-            .post(gateway.url.clone() + "/responses")
-            .json(&json!({"model":"origin-model"}))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::NOT_FOUND
+        document["data"],
+        json!([{"id":"first-model"},{"id":"origin-model"}])
     );
+    for model in ["origin-model", "first-model"] {
+        assert_eq!(
+            fixture
+                .client
+                .post(gateway.url.clone() + "/responses")
+                .json(&json!({"model":model}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -837,8 +873,8 @@ async fn metadata_override_survives_invalid_source_values_and_cached_file_remova
     )
     .await;
     let config = parse_config(
-        &json!({"providers":{
-            "origin":{"base_url":server.url,"auth":"none"},
+        &json!({"clients":{"openai":{"provider":"origin","format":"openai"}},"providers":{
+            "origin":{"base_url":server.url,"auth":"none","catalog":{"path":"/models","format":"openai"}},
             "remote":{"base_url":server.url,"auth":"none","catalog":{"path":"/remote/models","format":"openai"},
                 "defaults":{"nested":{"a":1}},"models":{"remote-model":{"nested":{"b":2}}}},
             "cached":{"base_url":"http://127.0.0.1:1","auth":"none","catalog":{"file":"cached.json","format":"openai"},
@@ -846,7 +882,7 @@ async fn metadata_override_survives_invalid_source_values_and_cached_file_remova
                     "file-null":{"nested":{"b":2}},"file-scalar":{"nested":{"b":2}},"file-array":{"nested":{"b":2}}
                 }}
         },"routes":[
-            {"method":"GET","path":"/models","action":"catalog","provider":"origin","format":"openai"},
+            {"method":"GET","path":"/models","action":"catalog"},
             {"action":"model"}
         ]}).to_string(),
         fixture.root.path(),
@@ -907,10 +943,10 @@ async fn native_codex_metadata_values_pass_through_unchanged() {
     )
     .await;
     let config = parse_config(
-        &json!({"providers":{
+        &json!({"clients":{"openai":{"provider":"native","format":"codex"}},"providers":{
             "native":{"base_url":server.url,"auth":"none","catalog":{"path":"/models","format":"codex"}}
         },"routes":[
-            {"method":"GET","path":"/models","action":"catalog","provider":"native","format":"codex"},
+            {"method":"GET","path":"/models","action":"catalog"},
             {"action":"model"}
         ]}).to_string(),
         fixture.root.path(),
