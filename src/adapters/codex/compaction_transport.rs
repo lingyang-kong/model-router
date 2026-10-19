@@ -161,11 +161,10 @@ pub(super) fn json(response: Value) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_util::StreamExt;
     use serde_json::json;
 
     #[tokio::test]
-    async fn bridged_errors_normalize_numeric_codes_and_preserve_other_fields() {
+    async fn failure_events_normalize_numeric_codes_and_preserve_other_fields() {
         for (code, expected) in [
             (json!(400), json!("400")),
             (
@@ -179,13 +178,12 @@ mod tests {
                 Json(json!({"error":{"code":code,"message":"upstream rejected request","type":"invalid_request_error"}})),
             )
                 .into_response();
-            let mut events =
-                super::super::response::websocket_response(response, Some(json!("lane")));
-            let event = tokio::time::timeout(Duration::from_secs(1), events.next())
-                .await
-                .expect("upstream errors must be emitted promptly")
-                .unwrap();
-            let event: Value = serde_json::from_slice(&event.into_data()).unwrap();
+            let event = tokio::time::timeout(
+                Duration::from_secs(1),
+                failure_event(response, Some(&json!("lane"))),
+            )
+            .await
+            .expect("upstream errors must be emitted promptly");
             assert_eq!(
                 event,
                 json!({

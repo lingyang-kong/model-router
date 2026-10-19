@@ -30,7 +30,7 @@ When an actual input contains `agent_message`, the router validates support with
 
 Subagent model listings use non-hidden entries from the latest successful catalog snapshots. Retired IDs remain routable but are not advertised. Before remote discovery succeeds, the client's cached model list is preserved; file-only catalogs are available at startup. A successful empty catalog clears the old choices, while a failed refresh preserves the previous listing.
 
-For Codex WebSocket requests, the handshake routing hint selects the initial provider. Every subsequent model request is resolved again, so a socket prewarmed for GPT can safely serve a custom model. Supported upstreams use WebSocket; an explicit upgrade refusal selects HTTP for that request while the client remains connected by WebSocket. The adapted handshake does not negotiate `permessage-deflate`; generic raw tunnels retain their negotiated extensions.
+For Codex WebSocket requests, the handshake routing hint selects the initial provider; without a hint, the model route's fallback provider handles the real upstream handshake. Every subsequent model request is resolved again, allowing switches between providers with WebSocket support. An upstream that rejects WebSocket requires client-owned HTTP fallback. The adapted handshake does not negotiate `permessage-deflate`; generic raw tunnels retain their negotiated extensions.
 
 The catalog retains the inherited `multi_agent_version`. Remove earlier v1 pins or configuration that disables Codex's multi-agent v2 feature.
 
@@ -72,6 +72,10 @@ The prompt and summary-prefix templates plus their license are fetched at build 
 
 With WebSockets, Codex uses `name = "OpenAI"` and ChatGPT sign-in to supply the model routing hint.
 
-No provider WebSocket flag is required. The router attempts the real upstream handshake and falls back on a successful non-upgrade response or HTTP 404, 405, 426, or 501. Authentication, rate-limit, and server errors remain errors. The original working upstream socket remains open; requests routed elsewhere use a separate upstream WebSocket when available, or streamed HTTP otherwise. Connection-local `previous_response_id` values require a full-history replay when changing upstream connections. Codex handles that retry automatically.
+No provider WebSocket flag is required. The router performs a real upstream handshake before accepting the client socket, including model-less and prewarm handshakes. Without a routing hint, it uses the model route's fallback provider; it does not synthesize a successful local handshake. A successful non-upgrade response or HTTP 404, 405, 426, or 501 from that initial handshake becomes HTTP 426 for the client to handle with its own HTTP fallback. Authentication, rate-limit, and server errors remain errors.
+
+After the client socket is established, every model request is routed again. Switching to another provider attempts a real WebSocket handshake; an unsupported upgrade sends a WebSocket error and closes the client socket. The router does not bridge ordinary inference requests from WebSocket to HTTP. Switching between providers with WebSocket support is supported, but seamless fallback between WebSocket and HTTP-only providers is not guaranteed. Synthetic compaction still generates its summary over HTTP and returns compaction events on the established client socket.
+
+Connection-local `previous_response_id` values require a full-history replay when changing upstream connections. Codex handles that retry automatically.
 
 [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference)

@@ -43,30 +43,21 @@ pub(crate) async fn forward(
     let mut downstream = hyper::upgrade::on(&mut request);
     let (parts, body) = request.into_parts();
     let adapted = matches!(action, RouteAction::Model { .. }) && adapter.is_some();
-    let (upstream, headers, http_only) = if adapted && model.is_none() {
-        (None, local_handshake(&parts)?, false)
-    } else {
-        let opening = connect(state, &provider, origin, &parts, stream_body(body), adapted);
-        let response = tokio::select! {
-            response = opening => response?,
-            _ = &mut downstream => return Err(Error::bad_request("Client disconnected during WebSocket handshake")),
-        };
-        if adapted && unsupported(response.status()) {
-            (None, local_handshake(&parts)?, true)
-        } else {
-            if response.status() != StatusCode::SWITCHING_PROTOCOLS {
-                return Ok(stream_response(response));
-            }
-            let mut headers = response.headers().clone();
-            sanitize_headers(&mut headers);
-            restore_upgrade_headers(response.headers(), &mut headers);
-            (
-                Some(response.upgrade().await.map_err(Error::bad_gateway)?),
-                headers,
-                false,
-            )
-        }
+    let opening = connect(state, &provider, origin, &parts, stream_body(body), adapted);
+    let response = tokio::select! {
+        response = opening => response?,
+        _ = &mut downstream => return Err(Error::bad_request("Client disconnected during WebSocket handshake")),
     };
+    if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        let status = rejection_status(response.status());
+        let mut response = stream_response(response);
+        *response.status_mut() = status;
+        return Ok(response);
+    }
+    let mut headers = response.headers().clone();
+    sanitize_headers(&mut headers);
+    restore_upgrade_headers(response.headers(), &mut headers);
+    let upstream = response.upgrade().await.map_err(Error::bad_gateway)?;
     let context = WebSocketContext {
         state: Arc::clone(state),
         provider: Arc::clone(&provider),
@@ -74,8 +65,7 @@ pub(crate) async fn forward(
         uri: parts.uri,
         model,
         origin: origin.cloned(),
-        connected: upstream.is_some(),
-        http_only,
+        connected: true,
     };
     tokio::spawn(async move {
         if let Ok(downstream) = downstream.await {
@@ -84,9 +74,8 @@ pub(crate) async fn forward(
                 crate::adapters::websocket::relay(downstream, upstream, adapter, context).await;
             } else {
                 let mut downstream = downstream;
-                if let Some(mut upstream) = upstream {
-                    let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
-                }
+                let mut upstream = upstream;
+                let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
             }
         }
     });
@@ -122,8 +111,8 @@ pub(crate) async fn connect(
     Ok(response)
 }
 
-pub(crate) fn unsupported(status: StatusCode) -> bool {
-    status.is_success()
+pub(crate) fn rejection_status(status: StatusCode) -> StatusCode {
+    if status.is_success()
         || matches!(
             status,
             StatusCode::NOT_FOUND
@@ -131,19 +120,11 @@ pub(crate) fn unsupported(status: StatusCode) -> bool {
                 | StatusCode::UPGRADE_REQUIRED
                 | StatusCode::NOT_IMPLEMENTED
         )
-}
-
-fn local_handshake(parts: &Parts) -> Result<HeaderMap> {
-    let mut request = axum::http::Request::builder()
-        .method(parts.method.clone())
-        .uri(parts.uri.clone())
-        .version(parts.version)
-        .body(())
-        .map_err(Error::bad_request)?;
-    *request.headers_mut() = parts.headers.clone();
-    let response = tokio_tungstenite::tungstenite::handshake::server::create_response(&request)
-        .map_err(Error::bad_request)?;
-    Ok(response.into_parts().0.headers)
+    {
+        StatusCode::UPGRADE_REQUIRED
+    } else {
+        status
+    }
 }
 
 /// Re-establish the upgrade on each HTTP hop; negotiation headers pass through.
