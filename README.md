@@ -114,7 +114,7 @@ The Codex adapter shares a conservative byte scan across WebSocket, HTTP JSON, a
 
 Codex SSE framing is normalized to LF, with comments forwarded promptly. Rewritten JSON data loses literal CR/LF whitespace so it fits on one `data:` line; string contents and escaped newlines are preserved. Unmarked SSE streams pass through unchanged.
 
-HTTP model routing buffers the request to read `model`; responses stream. Unchanged traffic preserves bytes and trailers. Rewritten catalogs discard stale encoding, integrity, and cache validators. The router adds no payload or concurrency cap.
+HTTP model routing buffers the request to read `model`; responses stream. Unchanged traffic preserves bytes and trailers. Merged catalogs use streamed gzip when accepted by the client, otherwise uncompressed JSON, independently of upstream encoding. Explicit encoding exclusions and an explicit preference for identity are respected; rejecting both supported choices returns HTTP 406. Valid provider headers remain, and `Vary: Accept-Encoding` is added when needed. Stale lengths, integrity fields, and cache validators are discarded because the merged body differs. The router adds no payload or concurrency cap.
 
 Generic WebSocket model routes need `x-model: <native ID>` and tunnel bytes after the handshake. Codex uses its native routing hint, or the model route's fallback provider when no hint is available, for a real upstream handshake. Later model requests are routed independently; switching between providers with WebSocket support is supported. Clients own HTTP fallback when an upstream rejects WebSocket. See [Codex routing and fallback](docs/codex.md#websocket-routing).
 
