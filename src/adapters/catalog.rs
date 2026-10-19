@@ -300,9 +300,11 @@ mod tests {
     }
 
     #[test]
-    fn same_format_link_retains_donor_fields_and_overlays_local_native_row() {
-        let donor =
-            json!({"slug":"donor","display_name":"Donor","opaque":{"donor":true},"priority":1});
+    fn same_format_link_overlays_local_metadata_and_rewrites_inherited_identity() {
+        let donor = json!({
+            "slug":"donor", "display_name":"Donor", "opaque":{"donor":true}, "priority":1,
+            "model_messages":{"instructions_template":"You are Codex, an agent based on GPT-6. Continue."}
+        });
         let local = json!({"slug":"local","opaque":{"local":true}});
         let got = CatalogFormat::Codex
             .project(
@@ -317,25 +319,6 @@ mod tests {
         assert_eq!(got["display_name"], "local");
         assert_eq!(got["opaque"]["local"], true);
         assert_eq!(got["priority"], 1);
-    }
-
-    #[test]
-    fn same_format_codex_link_uses_local_name_and_rewrites_inherited_gpt_opening() {
-        let donor = json!({
-            "slug":"donor", "display_name":"donor name",
-            "model_messages":{"instructions_template":"You are Codex, an agent based on GPT-6. Continue."}
-        });
-        let local = json!({"slug":"local"});
-        let got = CatalogFormat::Codex
-            .project(
-                &local,
-                CatalogFormat::Codex,
-                Some((&donor, CatalogFormat::Codex)),
-                &Capabilities::default(),
-            )
-            .unwrap()
-            .unwrap();
-        assert_eq!(got["display_name"], "local");
         assert_eq!(
             got["model_messages"]["instructions_template"],
             "You are Codex, an agent based on local, not GPT. Continue."
