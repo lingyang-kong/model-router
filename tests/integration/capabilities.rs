@@ -116,7 +116,7 @@ async fn gateway_with_provider_options(
         .map(|path| format!("{}{}", source_server.url, path))
         .collect::<Vec<_>>();
     let config = parse_config(
-        &json!({
+        &json!({"clients":{"openai":{"provider":"custom","format":"codex"}},
             "providers": {
                 "donor": {"base_url":fixture._manual_server.url,"auth":"none","catalog":{"file":"donor.json","format":"codex"}},
                 "custom": {
@@ -130,8 +130,8 @@ async fn gateway_with_provider_options(
                 }
             },
             "routes":[
-                {"method":"GET","path":"/models","action":"catalog","provider":"custom","format":"codex"},
-                {"action":"model","provider":"custom"}
+                {"method":"GET","path":"/models","action":"catalog"},
+                {"action":"model"}
             ]
         })
         .to_string(),
@@ -706,7 +706,7 @@ async fn explicit_external_discovery_url_is_fetched_without_provider_credentials
     )
     .await;
     let config = parse_config(
-        &json!({
+        &json!({"clients":{"openai":{"provider":"custom","format":"codex"}},
             "providers": {
                 "donor":{"base_url":fixture._manual_server.url,"auth":"none","catalog":{"file":"donor.json","format":"codex"}},
                 "custom":{
@@ -718,8 +718,8 @@ async fn explicit_external_discovery_url_is_fetched_without_provider_credentials
                 }
             },
             "routes":[
-                {"method":"GET","path":"/models","action":"catalog","provider":"custom","format":"codex"},
-                {"action":"model","provider":"custom"}
+                {"method":"GET","path":"/models","action":"catalog"},
+                {"action":"model"}
             ]
         })
         .to_string(),

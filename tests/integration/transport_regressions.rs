@@ -18,11 +18,11 @@ async fn explicit_ownership_survives_discovery() {
     .await;
     let root = tempfile::tempdir().unwrap();
     let config = parse_config(
-        &json!({"providers":{
+        &json!({"clients":{"codex":{"provider":"b","format":"openai"},"openai":{"provider":"b","format":"openai"},"anthropic":{"provider":"b","format":"openai"}},"providers":{
             "a":{"base_url":a.url,"auth":"none","models":{"worker":{}}},
             "b":{"base_url":b.url,"auth":"none","catalog":{"path":"/models","format":"openai"}}
         },"routes":[
-            {"path":"/models","action":"catalog","format":"openai","provider":"b"},
+            {"path":"/models","action":"catalog"},
             {"action":"model"}
         ]})
         .to_string(),
@@ -89,14 +89,14 @@ async fn sse_content_type_is_case_insensitive() {
     let root = tempfile::tempdir().unwrap();
     let config = parse_config(
         &json!({
-            "providers": {
+            "clients":{"codex":{"provider":"a"},"openai":{"provider":"a"},"anthropic":{"provider":"a"}},"providers": {
                 "a": {
                     "base_url": backend.url,
                     "auth": "none",
                     "models": {"worker": {}}
                 }
             },
-            "routes": [{"action": "model", "provider": "a"}]
+            "routes": [{"action": "model"}]
         })
         .to_string(),
         root.path(),

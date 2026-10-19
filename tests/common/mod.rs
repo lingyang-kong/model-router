@@ -205,16 +205,27 @@ pub(crate) struct Fixture {
 }
 
 pub(crate) fn test_config(
-    providers: Value,
+    mut providers: Value,
     default_provider: Option<&str>,
     catalog_provider: Option<&str>,
     root: &std::path::Path,
 ) -> Config {
     let mut routes = Vec::new();
-    if let Some(provider) = catalog_provider {
-        routes
-            .push(json!({"method":"GET","path":"/models","action":"catalog","format":"codex","provider":provider}));
-    }
+    let clients = if let Some(provider) = catalog_provider {
+        providers[provider]
+            .as_object_mut()
+            .unwrap()
+            .entry("catalog")
+            .or_insert_with(|| json!({"path":"/models","format":"codex"}));
+        routes.push(json!({"method":"GET","path":"/models","action":"catalog"}));
+        json!({
+            "codex":{"provider":provider,"format":"codex"},
+            "openai":{"provider":provider,"format":"codex"},
+            "anthropic":{"provider":provider,"format":"codex"}
+        })
+    } else {
+        json!({})
+    };
     if providers.get("service-b").is_some() {
         routes.push(
             json!({"method":"GET","path":"/v1/models","action":"forward","provider":"service-b"}),
@@ -229,7 +240,7 @@ pub(crate) fn test_config(
         routes.push(json!({"action":"forward","provider":provider}));
     }
     parse_config(
-        &json!({"providers":providers,"routes":routes}).to_string(),
+        &json!({"providers":providers,"clients":clients,"routes":routes}).to_string(),
         root,
     )
     .unwrap()
@@ -256,7 +267,6 @@ impl Fixture {
         let manual = Mock::new("service-b", "publisher/model");
         let live_server = serve(Router::new().fallback(mock).with_state(live.clone())).await;
         let manual_server = serve(Router::new().fallback(mock).with_state(manual)).await;
-        std::fs::write(root.path().join("models_cache.json"), json!({"identity":"cache-identity","fetched_at":"2000-01-01T00:00:00Z","models":live.models.lock().unwrap().clone()}).to_string()).unwrap();
         std::fs::write(root.path().join("models.json"), json!({"models":[{"slug":"publisher/model","display_name":"Manually managed","context_window":262144}]}).to_string()).unwrap();
         let config = test_config(
             json!({
