@@ -80,8 +80,7 @@ async fn native_spawn_agent_listing_tracks_successful_remote_snapshots() {
             .status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
-    // A file-backed model remains routable, while the supplied client prefix is untouched
-    // until every remote source has a successful listing snapshot.
+    // File-backed routing works before discovery; keep the client's listing until refresh succeeds.
     assert_eq!(
         forwarded_description(&fixture, &gateway, "manually-known").await,
         CLIENT_DESCRIPTION

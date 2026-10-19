@@ -196,7 +196,8 @@ fn terminal(message: &Message) -> bool {
     matches!(message, Message::Text(text) if serde_json::from_str::<Kind>(text).is_ok_and(|event| matches!(event.kind.as_str(), "response.completed" | "response.failed" | "response.incomplete" | "error")))
 }
 
-/// Forward one side WebSocket session, correlating premature-close errors with its request.
+/// Temporary provider connections serve one response, ending at its terminal event.
+/// Correlate premature-close errors with the request.
 fn socket_events<S>(
     socket: WebSocketStream<S>,
     stream_id: Option<Value>,

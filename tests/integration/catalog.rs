@@ -326,7 +326,6 @@ async fn conflicting_catalogs_are_rejected_without_changing_header_routes() {
             .unwrap()["provider"],
         "service-b"
     );
-    // Once the conflicting entry is gone, the entire refresh is accepted.
     *fixture.live.models.lock().unwrap() = vec![json!({"slug":"new-live-model"})];
     assert_eq!(
         fixture

@@ -341,8 +341,7 @@ async fn codex_multiagent_websocket_transforms_requests_and_restores_events() {
             .unwrap(),
         tungstenite::Message::Pong(vec![7, 8].into())
     );
-    // A frame model takes precedence over the handshake hint; the earlier probe
-    // used publisher/model while the hint named alternate/model.
+    // The frame's model overrides the handshake hint for probing as well as routing.
     assert_eq!(
         capture.probes.lock().unwrap()[0]["model"],
         "publisher/model"

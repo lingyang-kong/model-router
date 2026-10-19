@@ -65,7 +65,8 @@ pub(crate) struct Discovery {
 }
 
 impl Discovery {
-    /// Combine independently fetched discovery documents. Explicit newer facts win.
+    /// Later documents overwrite known fields, regardless of evidence source.
+    /// Missing fields preserve earlier observations.
     pub(crate) fn merge(&mut self, newer: Self) {
         self.capabilities.merge(newer.capabilities);
         for (id, capabilities) in newer.models {
@@ -88,7 +89,7 @@ impl Discovery {
     }
 }
 
-/// Extract only explicit provider facts; absence is represented as `None`.
+/// Read declared capabilities and supported schema constraints; unknowns remain `None`.
 pub(crate) fn parse(document: &Value) -> Discovery {
     let mut found = Discovery::default();
     parse_tool_inventory(document, &mut found.capabilities);
@@ -103,7 +104,7 @@ pub(crate) fn parse(document: &Value) -> Discovery {
     parse_models(document, &mut found);
     found.tools_paths = declared_tool_paths(document);
 
-    // The schema's closed detail enum is direct evidence that `original` is unsupported.
+    // Agreeing detail enums establish whether `original` is accepted.
     let mut visited = BTreeSet::new();
     let mut image_constraints = Vec::new();
     if let Some(paths) = root.get("paths").and_then(Value::as_object) {
@@ -127,8 +128,7 @@ pub(crate) fn parse(document: &Value) -> Discovery {
         found.capabilities.image_detail_original = Some(supported);
     }
 
-    // Closed enums describe accepted capability values. Every relevant
-    // Responses request schema must provide the same closed fact.
+    // Only use a deduction when all relevant Responses request schemas agree.
     let mut tier_constraints = Vec::new();
     let mut tier_id_constraints = Vec::new();
     let mut search_constraints = Vec::new();

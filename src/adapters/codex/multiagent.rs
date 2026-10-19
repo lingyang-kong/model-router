@@ -192,7 +192,7 @@ fn prepare_collaboration_tools(
             && !listing.is_empty()
             && let Some(description) = string(tool.get("description"))
         {
-            // Codex puts its model list before this stable tool-description marker.
+            // Replace Codex's model-list prefix when the expected description marker is present.
             let description = description
                 .find("Spawns an agent")
                 .map_or(description.as_str(), |start| &description[start..]);
