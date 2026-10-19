@@ -29,8 +29,6 @@ pub(crate) struct WebSocketContext {
     pub origin: Option<Arc<Provider>>,
     /// True only while the original upstream WebSocket is available for forwarding.
     pub connected: bool,
-    /// The initial provider explicitly refused WebSocket negotiation.
-    pub http_only: bool,
 }
 
 pub(crate) enum WebSocketAction {
@@ -41,7 +39,7 @@ pub(crate) enum WebSocketAction {
 
 pub(crate) async fn relay(
     downstream: TokioIo<DownstreamUpgraded>,
-    upstream: Option<reqwest::Upgraded>,
+    upstream: reqwest::Upgraded,
     client: Client,
     context: WebSocketContext,
 ) {
@@ -49,18 +47,13 @@ pub(crate) async fn relay(
         .max_message_size(None)
         .max_frame_size(None);
     let downstream = WebSocketStream::from_raw_socket(downstream, Role::Server, Some(config)).await;
-    let upstream = match upstream {
-        Some(upstream) => {
-            Some(WebSocketStream::from_raw_socket(upstream, Role::Client, Some(config)).await)
-        }
-        None => None,
-    };
+    let upstream = WebSocketStream::from_raw_socket(upstream, Role::Client, Some(config)).await;
     relay_sockets(downstream, upstream, client, context).await;
 }
 
 async fn relay_sockets<D, U>(
     downstream: WebSocketStream<D>,
-    upstream: Option<WebSocketStream<U>>,
+    upstream: WebSocketStream<U>,
     client: Client,
     context: WebSocketContext,
 ) where
@@ -68,19 +61,14 @@ async fn relay_sockets<D, U>(
     U: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut downstream_sink, mut downstream_stream) = downstream.split();
-    let (mut upstream_sink, mut upstream_stream) = match upstream {
-        Some(upstream) => {
-            let (sink, stream) = upstream.split();
-            (Some(sink), Some(stream))
-        }
-        None => (None, None),
-    };
+    let (sink, stream) = upstream.split();
+    let (mut upstream_sink, mut upstream_stream) = (Some(sink), Some(stream));
     let (local_tx, local_rx) = tokio::sync::mpsc::channel(1);
     let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
     let (from_downstream, close) = tokio::select! {
         result = forward_requests(
             &mut downstream_stream, &mut upstream_sink, client,
-            context.clone(),
+            context,
             local_tx,
             closed_rx,
         ) => (true, result),
@@ -200,7 +188,9 @@ where
             }
             messages = local_rx.recv() => match messages {
                 Some(messages) => for message in messages {
+                    let closing = message.is_close();
                     destination.send(message).await.ok()?;
+                    if closing { return None; }
                 },
                 None => return None,
             }

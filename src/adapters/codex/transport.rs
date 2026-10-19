@@ -29,19 +29,9 @@ enum RequestPlan {
 
 pub(crate) async fn forward(
     state: &Arc<RouterState>,
-    parts: Parts,
-    body: Body,
-    origin: Option<&Arc<Provider>>,
-) -> Result<Response> {
-    forward_to(state, parts, body, origin, None).await
-}
-
-pub(super) async fn forward_to(
-    state: &Arc<RouterState>,
     mut parts: Parts,
     body: Body,
     origin: Option<&Arc<Provider>>,
-    destination: Option<Arc<Provider>>,
 ) -> Result<Response> {
     let collected = body.collect().await.map_err(Error::bad_request)?;
     let trailers = collected.trailers().cloned();
@@ -56,10 +46,7 @@ pub(super) async fn forward_to(
         Cow::Borrowed(original.as_ref())
     };
     let model = request_model(&decoded)?;
-    let provider = match destination {
-        Some(provider) => provider,
-        None => state.resolve_provider(model.as_deref(), origin).await?,
-    };
+    let provider = state.resolve_provider(model.as_deref(), origin).await?;
     provider.validate_credential_scope(origin)?;
     let plan =
         prepare_request(state, &provider, origin, &parts, &decoded, model.as_deref()).await?;
