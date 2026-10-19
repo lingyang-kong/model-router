@@ -19,6 +19,10 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Error {
+    pub fn not_acceptable(message: impl Into<String>) -> Self {
+        Self(StatusCode::NOT_ACCEPTABLE, message.into())
+    }
+
     pub fn unknown_model(model: &str) -> Self {
         Self(
             StatusCode::NOT_FOUND,
