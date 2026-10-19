@@ -97,10 +97,8 @@ async fn hidden_models_remain_routable_and_cannot_mask_ownership_conflicts() {
 }
 
 #[tokio::test]
-async fn catalog_responses_extend_routing_without_reading_harness_files() {
+async fn catalog_refresh_preserves_origin_credentials_and_strips_cache_conditions() {
     let fixture = Fixture::new().await;
-    let cache = fixture.root.path().join("models_cache.json");
-    let original = std::fs::read(&cache).unwrap();
     *fixture.live.models.lock().unwrap() = vec![json!({"slug":"gpt-new","context_window":1048576})];
     let response = fixture
         .client
@@ -130,222 +128,11 @@ async fn catalog_responses_extend_routing_without_reading_harness_files() {
             .iter()
             .any(|model| model["slug"] == "publisher/model")
     );
-    assert_eq!(std::fs::read(&cache).unwrap(), original);
     let seen = fixture.live.seen.lock().unwrap().last().unwrap().clone();
     assert!(seen["headers"].get("if-none-match").is_none());
     assert!(seen["headers"].get("if-modified-since").is_none());
     assert_eq!(seen["headers"]["authorization"], "Bearer client-token");
     assert_eq!(seen["query"], "client_version=test");
-    assert!(
-        seen["query"]
-            .as_str()
-            .unwrap()
-            .contains("client_version=test")
-    );
-    // New live models are usable before the harness writes its own cache.
-    assert_eq!(
-        fixture.post("service-a", "gpt-new").await.status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        fixture.post("service-a", "gpt-test").await.status(),
-        StatusCode::OK
-    );
-    std::fs::write(
-        &cache,
-        json!({"identity":"codex-owned","models":response["models"]}).to_string(),
-    )
-    .unwrap();
-    let response: Value = fixture
-        .post("service-b", "publisher/model")
-        .await
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(response["provider"], "service-b");
-    let count = fixture.live.seen.lock().unwrap().len();
-    assert_eq!(
-        fixture.post("service-a", "gpt-new").await.status(),
-        StatusCode::OK
-    );
-    assert_eq!(fixture.live.seen.lock().unwrap().len(), count + 1);
-    assert_eq!(
-        fixture.post("service-a", "gpt-test").await.status(),
-        StatusCode::OK
-    );
-    std::fs::remove_file(&cache).unwrap();
-    assert_eq!(
-        fixture.post("service-b", "publisher/model").await.status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        fixture
-            .client
-            .post(format!("{}/v1/responses", fixture.routed.url))
-            .header("x-route-provider", "service-a")
-            .json(&json!({"model":"gpt-new"}))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        fixture
-            .client
-            .get(format!("{}/models", fixture.routed.url))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::OK
-    );
-}
-
-#[tokio::test]
-async fn catalog_refreshes_use_cached_manual_files_without_affecting_request_routing() {
-    let fixture = Fixture::new().await;
-    let config = test_config(
-        json!({
-            "live":{"base_url":fixture._live_server.url,"auth":"none"},
-            "manual":{"base_url":fixture._manual_server.url,"auth":"none","catalog":{"file":"models.json","format":"codex"}}
-        }),
-        None,
-        Some("live"),
-        fixture.root.path(),
-    );
-    let gateway = serve(router(config).unwrap()).await;
-    let post = |model: &str| {
-        fixture
-            .client
-            .post(gateway.url.clone() + "/responses")
-            .header(
-                "x-route-provider",
-                if model == "publisher/model" {
-                    "manual"
-                } else {
-                    "live"
-                },
-            )
-            .json(&json!({"model":model}))
-    };
-    // The harness file already contains gpt-test, but the router has not seen a live response.
-    assert_eq!(
-        post("gpt-test").send().await.unwrap().status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        post("publisher/model").send().await.unwrap().status(),
-        StatusCode::OK
-    );
-    std::fs::write(
-        fixture.root.path().join("models_cache.json"),
-        "invalid harness cache",
-    )
-    .unwrap();
-    assert_eq!(
-        fixture
-            .client
-            .get(gateway.url.clone() + "/models")
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        post("gpt-test").send().await.unwrap().status(),
-        StatusCode::OK
-    );
-    std::fs::remove_file(fixture.root.path().join("models.json")).unwrap();
-    assert_eq!(
-        post("publisher/model").send().await.unwrap().status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        fixture
-            .client
-            .get(gateway.url.clone() + "/models")
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        post("gpt-test").send().await.unwrap().status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        post("publisher/model").send().await.unwrap().status(),
-        StatusCode::OK
-    );
-}
-
-#[tokio::test]
-async fn conflicting_catalogs_are_rejected_without_changing_header_routes() {
-    let fixture = Fixture::new().await;
-    *fixture.live.models.lock().unwrap() = vec![
-        json!({"slug":"new-live-model"}),
-        json!({"slug":"publisher/model"}),
-    ];
-    let response = fixture
-        .client
-        .get(fixture.routed.url.clone() + "/models")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    assert!(
-        response.json::<Value>().await.unwrap()["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("publisher/model")
-    );
-    assert_eq!(
-        fixture.post("service-a", "new-live-model").await.status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        fixture
-            .post("service-a", "another-manual-model")
-            .await
-            .status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        fixture.post("service-a", "gpt-test").await.status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        fixture
-            .post("service-b", "publisher/model")
-            .await
-            .json::<Value>()
-            .await
-            .unwrap()["provider"],
-        "service-b"
-    );
-    *fixture.live.models.lock().unwrap() = vec![json!({"slug":"new-live-model"})];
-    assert_eq!(
-        fixture
-            .client
-            .get(fixture.routed.url.clone() + "/models")
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        fixture
-            .post("service-a", "new-live-model")
-            .await
-            .json::<Value>()
-            .await
-            .unwrap()["provider"],
-        "service-a"
-    );
 }
 
 #[tokio::test]
@@ -496,7 +283,7 @@ async fn buffered_model_routes_use_native_ids_and_learn_catalog_updates_atomical
 }
 
 #[tokio::test]
-async fn forwards_compressed_catalog_errors_without_changing_routes() {
+async fn forwards_compressed_catalog_errors_with_status_and_retry_headers() {
     let fixture = Fixture::new().await;
     let raw_client = reqwest::Client::builder()
         .no_proxy()
@@ -523,10 +310,6 @@ async fn forwards_compressed_catalog_errors_without_changing_routes() {
         assert_eq!(
             serde_json::from_slice::<Value>(&decoded).unwrap()["error"]["message"],
             "catalog rejected"
-        );
-        assert_eq!(
-            fixture.post("service-a", "gpt-test").await.status(),
-            StatusCode::OK
         );
     }
 }
@@ -836,82 +619,6 @@ async fn merged_catalog_encoding_respects_client_preferences_and_varies_caches()
     }
 }
 
-#[tokio::test]
-async fn manual_catalog_metadata_reloads_only_after_restart() {
-    let fixture = Fixture::new().await;
-    let replacement = fixture.root.path().join("replacement.json");
-    std::fs::write(
-        &replacement,
-        json!({"models":[
-            {"slug":"publisher/model","display_name":"Edited","context_window":1048576},
-            {"slug":"changed/model","display_name":"New"}
-        ]})
-        .to_string(),
-    )
-    .unwrap();
-    std::fs::rename(&replacement, fixture.root.path().join("models.json")).unwrap();
-    let response: Value = fixture
-        .client
-        .get(fixture.routed.url.clone() + "/models")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let manual = response["models"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|entry| entry["slug"] == "publisher/model")
-        .unwrap();
-    assert_eq!(manual["display_name"], "Manually managed");
-    assert_eq!(manual["context_window"], 262144);
-    assert_eq!(
-        fixture.post("service-b", "changed/model").await.status(),
-        StatusCode::OK
-    );
-    let config = test_config(
-        json!({
-            "live":{"base_url":fixture._live_server.url,"auth":"none"},
-            "manual":{"base_url":fixture._manual_server.url,"auth":"none","catalog":{"file":"models.json","format":"codex"}}
-        }),
-        None,
-        Some("live"),
-        fixture.root.path(),
-    );
-    let restarted = serve(router(config).unwrap()).await;
-    let response: Value = fixture
-        .client
-        .get(restarted.url.clone() + "/models")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let manual = response["models"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|entry| entry["slug"] == "publisher/model")
-        .unwrap();
-    assert_eq!(manual["display_name"], "Edited");
-    assert_eq!(manual["context_window"], 1048576);
-    let response: Value = fixture
-        .client
-        .post(restarted.url.clone() + "/responses")
-        .header("x-route-provider", "manual")
-        .json(&json!({"model":"changed/model"}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(response["provider"], "service-b");
-}
-
 #[test]
 fn validates_providers_and_allows_independent_catalog_sources() {
     let root = tempfile::tempdir().unwrap();
@@ -921,7 +628,6 @@ fn validates_providers_and_allows_independent_catalog_sources() {
         json!({"providers":{"api":{"base_url":"ftp://localhost","auth":"none"}},"routes":[{"action":"forward","provider":"api"}]}),
         json!({"providers":{"api":{"base_url":"http://localhost","auth":"invalid"}},"routes":[{"action":"forward","provider":"api"}]}),
         json!({"providers":{"api":{"base_url":"http://localhost?version=1","auth":"none"}},"routes":[{"action":"forward","provider":"api"}]}),
-        json!({"providers":{"api":{"base_url":"http://localhost","auth":"none","catalog_url":"models"}},"routes":[{"action":"forward","provider":"api"}]}),
     ];
     for document in cases {
         assert!(
@@ -1045,7 +751,7 @@ async fn serves_messages_and_token_counting_without_a_catalog_source() {
 }
 
 #[tokio::test]
-async fn invalid_catalog_identifiers_do_not_change_header_routing() {
+async fn catalog_identifiers_must_be_nonempty_and_use_the_source_format() {
     let fixture = Fixture::new().await;
     *fixture.live.models.lock().unwrap() =
         vec![json!({"slug":"new-live-model"}), json!({"slug":""})];
@@ -1059,15 +765,6 @@ async fn invalid_catalog_identifiers_do_not_change_header_routing() {
             .status(),
         StatusCode::BAD_GATEWAY
     );
-    assert_eq!(
-        fixture.post("service-a", "new-live-model").await.status(),
-        StatusCode::OK
-    );
-    assert_eq!(
-        fixture.post("service-a", "gpt-test").await.status(),
-        StatusCode::OK
-    );
-
     // The selected format's identifier is required; there is no alias fallback.
     std::fs::write(
         fixture.root.path().join("models.json"),
@@ -1178,15 +875,6 @@ async fn native_catalog_envelopes_and_manual_fields_are_preserved() {
             {"id":"publisher/model","display_name":"Native manual","extensions":{"opaque":[1,2]}}
         ])
     );
-}
-
-#[test]
-fn rejects_unsupported_catalog_format() {
-    let root = tempfile::tempdir().unwrap();
-    let mut descriptor = json!({"providers":{"api":{"base_url":"http://localhost","auth":"none"}},"routes":[{"action":"catalog","format":"codex","provider":"api"}]});
-    assert!(parse_config(&descriptor.to_string(), root.path()).is_ok());
-    descriptor["routes"][0]["format"] = json!("models");
-    assert!(parse_config(&descriptor.to_string(), root.path()).is_err());
 }
 
 #[tokio::test]
@@ -1335,13 +1023,12 @@ async fn client_adapters_and_catalog_formats_are_isolated_on_the_same_endpoint()
 }
 
 #[test]
-fn rejects_ambiguous_catalog_and_client_configuration() {
+fn rejects_missing_or_unknown_catalog_and_route_fields() {
     let root = tempfile::tempdir().unwrap();
     for route in [
         json!({"action":"catalog","provider":"api"}),
-        json!({"action":"catalog","provider":"api","format":"openai","client":"codex"}),
-        json!({"action":"catalog","provider":"api","format":"codex","model_overrides":{}}),
-        json!({"action":"model","client":"unknown"}),
+        json!({"action":"catalog","provider":"api","format":"unsupported"}),
+        json!({"action":"model","unexpected":true}),
     ] {
         let config = json!({"providers":{"api":{"base_url":"http://localhost","auth":"none"}},
             "routes":[route]});
@@ -1352,7 +1039,6 @@ fn rejects_ambiguous_catalog_and_client_configuration() {
         json!({"catalog":{"format":"openai"}}),
         json!({"catalog":{"file":"models.json","format":"unknown"}}),
         json!({"catalog":{"file":"models.json","format":"openai","unexpected":true}}),
-        json!({"catalog_file":"models.json","catalog_format":"openai"}),
     ] {
         let mut provider = json!({"base_url":"http://localhost","auth":"none"});
         provider

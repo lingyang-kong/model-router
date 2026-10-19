@@ -731,23 +731,6 @@ mod tests {
     }
 
     #[test]
-    fn inventories_require_native_tool_type_and_absence_is_unknown() {
-        assert_eq!(parse(&json!({"tools":[]})).capabilities.tool_search, None);
-        assert_eq!(
-            parse(&json!({"tools":[{"type":"function","name":"tool_search"}]}))
-                .capabilities
-                .tool_search,
-            None
-        );
-        assert_eq!(
-            parse(&json!({"tools":[{"type":"tool_search"}]}))
-                .capabilities
-                .tool_search,
-            Some(true)
-        );
-    }
-
-    #[test]
     fn explicit_flags_and_model_scope_are_preserved() {
         let d = parse(
             &json!({"capabilities":{"responses_lite":false,"images":true},"model_info":{"served_model_name":"m","has_image_understanding":false}}),
@@ -873,17 +856,18 @@ mod tests {
     }
 
     #[test]
-    fn inventory_response_array_is_reachable_and_empty_inventory_is_known() {
+    fn inventories_distinguish_native_tool_types_empty_lists_and_missing_facts() {
         assert_eq!(
             parse(&json!([{"type":"tool_search"}]))
                 .capabilities
                 .tool_search,
             Some(true)
         );
-        assert_eq!(
-            parse(&json!({"tools":[]})).capabilities.tool_inventory,
-            Some(true)
-        );
+        for tools in [json!([]), json!([{"type":"function","name":"tool_search"}])] {
+            let inventory = parse(&json!({"tools":tools}));
+            assert_eq!(inventory.capabilities.tool_inventory, Some(true));
+            assert_eq!(inventory.capabilities.tool_search, None);
+        }
         assert_eq!(
             parse(&json!({"tool_server":null}))
                 .capabilities

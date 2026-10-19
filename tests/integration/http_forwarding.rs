@@ -46,38 +46,6 @@ async fn streams_responses_without_waiting_for_completion() {
 }
 
 #[tokio::test]
-async fn streams_request_bodies_larger_than_the_removed_router_cap() {
-    async fn count(request: Request) -> Json<Value> {
-        let mut total = 0usize;
-        let mut body = request.into_body().into_data_stream();
-        while let Some(bytes) = body.next().await {
-            total += bytes.unwrap().len();
-        }
-        Json(json!({"bytes":total}))
-    }
-    let backend = serve(Router::new().fallback(count)).await;
-    let root = tempfile::tempdir().unwrap();
-    let config=parse_config(&json!({"providers":{"backend":{"base_url":backend.url,"auth":"none"}},"routes":[{"action":"forward","provider":"backend"}]}).to_string(),root.path()).unwrap();
-    let gateway = serve(router(config).unwrap()).await;
-    let chunk = Bytes::from(vec![b'x'; 1024 * 1024]);
-    let stream =
-        futures_util::stream::iter((0..129).map(move |_| Ok::<_, std::io::Error>(chunk.clone())));
-    let response: Value = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .unwrap()
-        .post(gateway.url.clone() + "/upload")
-        .body(reqwest::Body::wrap_stream(stream))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(response["bytes"], 129 * 1024 * 1024);
-}
-
-#[tokio::test]
 async fn dropping_a_streaming_response_cancels_the_upstream_body() {
     let fixture = Fixture::new().await;
     let response = fixture

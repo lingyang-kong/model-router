@@ -256,7 +256,6 @@ impl Fixture {
         let manual = Mock::new("service-b", "publisher/model");
         let live_server = serve(Router::new().fallback(mock).with_state(live.clone())).await;
         let manual_server = serve(Router::new().fallback(mock).with_state(manual)).await;
-        std::fs::write(root.path().join("models_cache.json"), json!({"identity":"cache-identity","fetched_at":"2000-01-01T00:00:00Z","models":live.models.lock().unwrap().clone()}).to_string()).unwrap();
         std::fs::write(root.path().join("models.json"), json!({"models":[{"slug":"publisher/model","display_name":"Manually managed","context_window":262144}]}).to_string()).unwrap();
         let config = test_config(
             json!({
