@@ -1,8 +1,7 @@
 //! Codex Remote V2 compaction support.
 //!
-//! The prompt text below follows the Codex 0.162.1 templates at
-//! https://github.com/openai/codex/tree/rust-v0.162.1/codex-rs/prompts/templates/compact
-//! Those prompt files are Apache-2.0 licensed; see the fetched license in the build output.
+//! Prompt templates come from the Codex revision pinned in build.rs.
+//! Their Apache-2.0 license is fetched alongside them into Cargo's build output.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
@@ -110,8 +109,8 @@ impl SummaryRequest {
         serde_json::to_vec(&body).map_err(Error::bad_request)
     }
 
-    /// Remove the oldest complete call/result group while preserving instructions and the last
-    /// unfinished user segment. Returns false when no safe reduction remains.
+    /// Remove the oldest eligible item and its paired call/result items.
+    /// Preserve instructions and the latest user segment; return false if no removal is possible.
     pub(super) fn trim_oldest(&mut self) -> bool {
         if self.history.len() <= 1 {
             return false;
@@ -417,8 +416,8 @@ pub(super) fn prepare(bytes: &[u8], mode: Mode, effective_model: Option<&str>) -
     })
 }
 
-/// WebSocket callers use this to ask Codex for a full-history replay when their current request
-/// depends on router-created state that cannot be recovered from the upstream provider.
+/// Detect `previous_response_id` references that require full-history replay.
+/// Upstreams cannot resolve router IDs, and text compaction needs the input history.
 pub(super) fn needs_full_history(bytes: &[u8], mode: Mode) -> Result<bool> {
     if !may_contain(bytes, b"previous_response_id") {
         return Ok(false);

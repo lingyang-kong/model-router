@@ -14,8 +14,7 @@ use crate::{
 };
 
 impl RouterState {
-    /// Only rejection of the tested item establishes missing support. The invalid
-    /// trailing item prevents normal generation; other outcomes remain unknown.
+    /// Probe the provider's `/responses` endpoint during catalog projection.
     pub(crate) async fn probe_catalog_item(
         &self,
         provider: &Arc<Provider>,
@@ -34,8 +33,9 @@ impl RouterState {
             .await
     }
 
-    /// Only rejection of the tested item establishes missing support. The invalid
-    /// trailing item prevents normal generation; other outcomes remain unknown.
+    /// Return `Some(false)` only for an explicit rejection of the tested item;
+    /// all other outcomes remain unknown. The invalid sentinel requests validation
+    /// failure, but a permissive server may still generate up to one token.
     pub(crate) async fn probe_response_item(
         &self,
         provider: &Arc<Provider>,

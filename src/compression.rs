@@ -7,7 +7,7 @@ use axum::{body::Body, http::HeaderMap};
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
 use tokio_util::io::ReaderStream;
 
-/// Prefer gzip unless the client excludes it or explicitly prefers identity.
+/// Negotiate gzip or identity, honoring exclusions and explicit preferences.
 pub(crate) fn accepts_gzip(headers: &HeaderMap) -> crate::error::Result<bool> {
     let (mut gzip, mut identity, mut wildcard): (Option<f32>, Option<f32>, Option<f32>) =
         (None, None, None);

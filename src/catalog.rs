@@ -25,9 +25,9 @@ use crate::{
 pub(crate) struct ModelEntry {
     pub provider: Arc<Provider>,
     pub format: CatalogFormat,
-    /// Parsed source metadata, independent of the requesting client.
+    /// Source-format metadata after local settings, before output projection.
     pub metadata: Value,
-    /// False for retired IDs retained only for routing existing conversations.
+    /// False for retired IDs kept routable but excluded from current listings.
     pub listed: bool,
 }
 pub(crate) type ModelRegistry = IndexMap<String, ModelEntry>;
@@ -246,8 +246,8 @@ impl RouterState {
                 auxiliary.push(self.fetch_catalog(provider, origin, None, output));
             }
         }
-        // Poll both groups concurrently, but give the origin's response precedence.
-        // Auxiliary fetches still fail fast; returning drops outstanding fetches.
+        // Fetch both groups concurrently, but yield the origin first so its rejection
+        // takes precedence. Returning drops unfinished fetches.
         let mut requests = [
             vec![self.fetch_catalog(origin, origin, Some((parts, body)), output)],
             auxiliary,

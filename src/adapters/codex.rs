@@ -103,7 +103,7 @@ pub(super) const CATALOG: CatalogLayout = CatalogLayout {
     id: "slug",
 };
 
-/// Apply explicit provider capability facts to a projected Codex row.
+/// Apply resolved capability facts to a projected Codex row.
 pub(super) fn apply_capabilities(model: &mut Value, capabilities: &Capabilities) {
     for (fact, field) in [
         (capabilities.responses_lite, "use_responses_lite"),
