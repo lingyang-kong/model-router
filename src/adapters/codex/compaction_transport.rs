@@ -170,11 +170,10 @@ mod tests {
         let response = Response::builder()
             .status(StatusCode::BAD_GATEWAY)
             .header("content-encoding", "gzip")
-            .body(Body::from_stream(tokio_util::io::ReaderStream::new(
-                async_compression::tokio::bufread::GzipEncoder::new(tokio::io::BufReader::new(
-                    io::Cursor::new(b"upstream unavailable"),
-                )),
-            )))
+            .body(crate::compression::encode_body(
+                b"upstream unavailable".to_vec(),
+                true,
+            ))
             .unwrap();
         assert_eq!(
             failure_event(response, None).await,

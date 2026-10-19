@@ -533,6 +533,311 @@ async fn forwards_compressed_catalog_errors_without_changing_routes() {
 }
 
 #[tokio::test]
+async fn merged_catalogs_decode_upstream_codings_and_negotiate_gzip_with_valid_headers() {
+    use async_compression::tokio::bufread::{
+        BrotliDecoder, BrotliEncoder, GzipDecoder, GzipEncoder, ZlibDecoder, ZlibEncoder,
+        ZstdDecoder, ZstdEncoder,
+    };
+    use axum::{body::Body, response::Response};
+    use tokio::io::AsyncRead;
+
+    async fn transcode(bytes: Vec<u8>, coding: &str, encode: bool) -> Vec<u8> {
+        let reader = BufReader::new(Cursor::new(bytes));
+        let mut codec: Box<dyn AsyncRead + Unpin> = match (coding, encode) {
+            ("gzip" | "x-gzip", true) => Box::new(GzipEncoder::new(reader)),
+            ("gzip" | "x-gzip", false) => Box::new(GzipDecoder::new(reader)),
+            ("deflate", true) => Box::new(ZlibEncoder::new(reader)),
+            ("deflate", false) => Box::new(ZlibDecoder::new(reader)),
+            ("br", true) => Box::new(BrotliEncoder::new(reader)),
+            ("br", false) => Box::new(BrotliDecoder::new(reader)),
+            ("zstd", true) => Box::new(ZstdEncoder::new(reader)),
+            ("zstd", false) => Box::new(ZstdDecoder::new(reader)),
+            ("identity", _) => Box::new(reader),
+            _ => panic!("unexpected test coding {coding}"),
+        };
+        let mut output = Vec::new();
+        codec.read_to_end(&mut output).await.unwrap();
+        output
+    }
+
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .no_gzip()
+        .no_deflate()
+        .no_brotli()
+        .no_zstd()
+        .build()
+        .unwrap();
+    for encoding_headers in [
+        vec![],
+        vec!["identity"],
+        vec!["gzip"],
+        vec!["x-gzip"],
+        vec!["deflate"],
+        vec!["br"],
+        vec!["zstd"],
+        vec!["gzip, deflate"],
+        vec!["gzip", "deflate"],
+    ] {
+        let codings: Vec<_> = encoding_headers
+            .iter()
+            .flat_map(|value| value.split(',').map(str::trim))
+            .collect();
+        let mut encoded = json!({"models":[{"slug":"remote-model"}],"revision":"upstream"})
+            .to_string()
+            .into_bytes();
+        for coding in &codings {
+            encoded = transcode(encoded, coding, true).await;
+        }
+        let upstream_length = encoded.len();
+        let headers = encoding_headers.clone();
+        let upstream = serve(Router::new().fallback(move |request: Request| {
+            let encoded = encoded.clone();
+            let headers = headers.clone();
+            async move {
+                let mut response = Response::new(Body::from(encoded));
+                let response_headers = response.headers_mut();
+                for encoding in headers {
+                    response_headers.append("content-encoding", encoding.parse().unwrap());
+                }
+                for (name, value) in [
+                    ("content-type", "application/json"),
+                    ("vary", "X-Catalog-Variant"),
+                    ("x-catalog-feature", "tools"),
+                    ("x-catalog-feature", "vision"),
+                    ("etag", "\"original-catalog\""),
+                    ("content-md5", "upstream-md5"),
+                    ("digest", "sha-256=upstream-digest"),
+                    ("content-digest", "sha-256=:dXBzdHJlYW0=:"),
+                    ("repr-digest", "sha-256=:dXBzdHJlYW0=:"),
+                ] {
+                    response_headers.append(name, value.parse().unwrap());
+                }
+                response_headers.insert(
+                    "content-length",
+                    upstream_length.to_string().parse().unwrap(),
+                );
+                response_headers.insert(
+                    "x-seen-accept-encoding",
+                    request.headers()["accept-encoding"].clone(),
+                );
+                response
+            }
+        }))
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("models.json"),
+            json!({"models":[{"slug":"manual-model","description":"Manually managed catalog entry"}]}).to_string(),
+        )
+        .unwrap();
+        let config = parse_config(
+            &json!({"providers":{
+                "remote":{"base_url":upstream.url,"auth":"none"},
+                "manual":{"base_url":upstream.url,"auth":"none","catalog":{"file":"models.json","format":"codex"}}
+            },"routes":[{"path":"/models","action":"catalog","format":"codex","provider":"remote"}]})
+            .to_string(),
+            root.path(),
+        )
+        .unwrap();
+        let gateway = serve(router(config).unwrap()).await;
+        let response = client
+            .get(gateway.url.clone() + "/models")
+            .header("accept-encoding", "gzip,deflate")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{encoding_headers:?}");
+        let headers = response.headers().clone();
+        assert_eq!(
+            headers
+                .get_all("content-encoding")
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["gzip"]
+        );
+        assert_eq!(headers["x-seen-accept-encoding"], "gzip,deflate");
+        let vary: Vec<_> = headers
+            .get_all("vary")
+            .iter()
+            .flat_map(|value| value.to_str().unwrap().split(',').map(str::trim))
+            .collect();
+        assert!(vary.contains(&"X-Catalog-Variant"));
+        assert!(
+            vary.iter()
+                .any(|value| value.eq_ignore_ascii_case("accept-encoding"))
+        );
+        assert_eq!(
+            headers
+                .get_all("x-catalog-feature")
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["tools", "vision"]
+        );
+        for stale in [
+            "etag",
+            "content-md5",
+            "digest",
+            "content-digest",
+            "repr-digest",
+        ] {
+            assert!(
+                headers.get(stale).is_none(),
+                "stale {stale} in {encoding_headers:?}"
+            );
+        }
+        let mut bytes = response.bytes().await.unwrap().to_vec();
+        if let Some(length) = headers.get("content-length") {
+            assert_eq!(
+                length.to_str().unwrap().parse::<usize>().unwrap(),
+                bytes.len()
+            );
+        }
+        bytes = transcode(bytes, "gzip", false).await;
+        let document: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(document["revision"], "upstream");
+        assert_eq!(
+            document["models"],
+            json!([
+                {"slug":"remote-model"},
+                {"slug":"manual-model","description":"Manually managed catalog entry"}
+            ])
+        );
+    }
+}
+
+#[tokio::test]
+async fn merged_catalog_encoding_respects_client_preferences_and_varies_caches() {
+    use axum::response::Response;
+
+    async fn endpoint(request: Request) -> Response {
+        let mut response = json_response(
+            StatusCode::OK,
+            json!({"models":[{"slug":"remote-model"}]}),
+            true,
+        )
+        .await;
+        if let Some(vary) = request.headers().get("x-test-vary") {
+            response.headers_mut().insert("vary", vary.clone());
+        }
+        response
+    }
+    let upstream = serve(Router::new().fallback(endpoint)).await;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"models":[{"slug":"manual-model"}]}).to_string(),
+    )
+    .unwrap();
+    let config = parse_config(
+        &json!({"providers":{
+            "remote":{"base_url":upstream.url,"auth":"none"},
+            "manual":{"base_url":upstream.url,"auth":"none","catalog":{"file":"models.json","format":"codex"}}
+        },"routes":[{"path":"/models","action":"catalog","format":"codex","provider":"remote"}]})
+        .to_string(),
+        root.path(),
+    )
+    .unwrap();
+    let gateway = serve(router(config).unwrap()).await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .no_gzip()
+        .no_deflate()
+        .no_brotli()
+        .no_zstd()
+        .build()
+        .unwrap();
+    for (accept, expected_encoding) in [
+        (None, Some("identity")),
+        (Some(""), Some("identity")),
+        (Some("deflate"), Some("identity")),
+        (Some("gzip"), Some("gzip")),
+        (Some("gzip,deflate"), Some("gzip")),
+        (Some("gzip;q=0"), Some("identity")),
+        (Some("gzip;q=0, *;q=1"), Some("identity")),
+        (Some("*"), Some("gzip")),
+        (Some("gzip;q=0.5, identity;q=1"), Some("identity")),
+        (Some("gzip;q=1, identity;q=0.5"), Some("gzip")),
+        (Some("gzip;q=0.5"), Some("gzip")),
+        (Some("gzip;q=0, identity;q=0"), None),
+        (Some("*;q=0"), None),
+        (Some("deflate, identity;q=0"), None),
+    ] {
+        for upstream_vary in [
+            None,
+            Some("X-Catalog-Variant"),
+            Some("accept-encoding"),
+            Some("*"),
+        ] {
+            let mut request = client.get(gateway.url.clone() + "/models");
+            if let Some(accept) = accept {
+                request = request.header("accept-encoding", accept);
+            }
+            if let Some(vary) = upstream_vary {
+                request = request.header("x-test-vary", vary);
+            }
+            let response = request.send().await.unwrap();
+            let context = format!("Accept-Encoding {accept:?}, upstream Vary {upstream_vary:?}");
+            let Some(expected_encoding) = expected_encoding else {
+                assert_eq!(response.status(), StatusCode::NOT_ACCEPTABLE, "{context}");
+                continue;
+            };
+            assert_eq!(response.status(), StatusCode::OK, "{context}");
+            let vary: Vec<_> = response
+                .headers()
+                .get_all("vary")
+                .iter()
+                .flat_map(|value| value.to_str().unwrap().split(',').map(str::trim))
+                .collect();
+            if upstream_vary == Some("*") {
+                assert_eq!(vary, ["*"], "{context}");
+            } else {
+                assert_eq!(
+                    vary.iter()
+                        .filter(|value| value.eq_ignore_ascii_case("accept-encoding"))
+                        .count(),
+                    1,
+                    "{context}"
+                );
+                if upstream_vary == Some("X-Catalog-Variant") {
+                    assert!(vary.contains(&"X-Catalog-Variant"), "{context}");
+                }
+            }
+            let coding = response
+                .headers()
+                .get("content-encoding")
+                .map(|value| value.to_str().unwrap());
+            assert_eq!(
+                coding,
+                (expected_encoding == "gzip").then_some("gzip"),
+                "{context}"
+            );
+            let mut bytes = response.bytes().await.unwrap().to_vec();
+            if expected_encoding == "gzip" {
+                let mut decoded = Vec::new();
+                async_compression::tokio::bufread::GzipDecoder::new(BufReader::new(Cursor::new(
+                    bytes,
+                )))
+                .read_to_end(&mut decoded)
+                .await
+                .unwrap();
+                bytes = decoded;
+            }
+            let document: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                document["models"],
+                json!([
+                    {"slug":"remote-model"}, {"slug":"manual-model"}
+                ]),
+                "{context}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn manual_catalog_metadata_reloads_only_after_restart() {
     let fixture = Fixture::new().await;
     let replacement = fixture.root.path().join("replacement.json");

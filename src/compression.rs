@@ -1,8 +1,63 @@
 use std::io;
 
-use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder, ZstdDecoder};
-use axum::http::HeaderMap;
+use async_compression::tokio::bufread::{
+    BrotliDecoder, GzipDecoder, GzipEncoder, ZlibDecoder, ZstdDecoder,
+};
+use axum::{body::Body, http::HeaderMap};
 use tokio::io::{AsyncRead, AsyncReadExt, BufReader};
+use tokio_util::io::ReaderStream;
+
+/// Prefer gzip unless the client excludes it or explicitly prefers identity.
+pub(crate) fn accepts_gzip(headers: &HeaderMap) -> crate::error::Result<bool> {
+    let (mut gzip, mut identity, mut wildcard): (Option<f32>, Option<f32>, Option<f32>) =
+        (None, None, None);
+    for value in headers.get_all("accept-encoding") {
+        let Ok(value) = value.to_str() else { continue };
+        for item in value.split(',') {
+            let mut parts = item.split(';').map(str::trim);
+            let slot = match parts
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "gzip" | "x-gzip" => &mut gzip,
+                "identity" => &mut identity,
+                "*" => &mut wildcard,
+                _ => continue,
+            };
+            let quality = parts.next().map_or(1.0, |parameter| {
+                parameter
+                    .split_once('=')
+                    .filter(|(name, _)| name.trim().eq_ignore_ascii_case("q"))
+                    .and_then(|(_, value)| value.trim().parse::<f32>().ok())
+                    .filter(|value| (0.0..=1.0).contains(value))
+                    .unwrap_or(0.0)
+            });
+            // Conflicting duplicate declarations must not override an explicit exclusion.
+            *slot = Some(slot.map_or(quality, |old| old.min(quality)));
+        }
+    }
+    let gzip = gzip.or(wildcard).unwrap_or(0.0);
+    if gzip > 0.0 && gzip >= identity.unwrap_or(0.0) {
+        return Ok(true);
+    }
+    if identity.unwrap_or(if wildcard == Some(0.0) { 0.0 } else { 1.0 }) > 0.0 {
+        return Ok(false);
+    }
+    Err(crate::error::Error::not_acceptable(
+        "Catalog responses support gzip or identity encoding",
+    ))
+}
+
+pub(crate) fn encode_body(bytes: Vec<u8>, gzip: bool) -> Body {
+    if gzip {
+        let encoder = GzipEncoder::new(BufReader::new(std::io::Cursor::new(bytes)));
+        Body::from_stream(ReaderStream::new(encoder))
+    } else {
+        Body::from(bytes)
+    }
+}
 
 /// Decode only bodies the router inspects, without collecting compressed input.
 pub(crate) async fn decode_body<R: AsyncRead + Send + Unpin>(
