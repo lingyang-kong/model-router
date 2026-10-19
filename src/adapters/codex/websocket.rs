@@ -1,14 +1,13 @@
 //! Route model changes independently of the client connection's initial handshake.
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
-    body::Body,
     http::{Method, Request, StatusCode},
     response::IntoResponse,
 };
 use futures_util::{FutureExt, SinkExt, StreamExt, stream::BoxStream};
 use serde::Deserialize;
-use serde_json::{Value, value::RawValue};
+use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::{
     WebSocketStream,
@@ -18,7 +17,7 @@ use tokio_tungstenite::{
     },
 };
 
-use super::{compaction_transport, response, transport};
+use super::{compaction_transport, transport};
 use crate::{
     adapters::websocket::{WebSocketAction, WebSocketContext},
     error::Error,
@@ -28,7 +27,6 @@ use crate::{
 struct Selector {
     model: Option<String>,
     previous_response_id: Option<String>,
-    generate: Option<bool>,
     stream_id: Option<Value>,
 }
 
@@ -68,7 +66,6 @@ pub(in crate::adapters) async fn route(
             async move { vec![Message::Text(event.to_string().into())] }.boxed(),
         );
     }
-    let http_only = context.http_only && Arc::ptr_eq(&provider, &context.provider);
     let mut routed = context.clone();
     routed.provider = provider;
     routed.model = model.map(str::to_owned);
@@ -80,19 +77,23 @@ pub(in crate::adapters) async fn route(
     let stream_id = selector.stream_id.clone();
     WebSocketAction::Stream(
         futures_util::stream::once(async move {
-            match bridge(message, selector, routed, http_only).await {
+            match forward_socket(message, selector, routed).await {
                 Ok(stream) => stream,
                 Err(error) => futures_util::stream::once(async move {
-                    Message::Text(
-                        compaction_transport::failure_event(
-                            error.into_response(),
-                            stream_id.as_ref(),
-                        )
-                        .await
-                        .to_string()
-                        .into(),
-                    )
+                    vec![
+                        Message::Text(
+                            compaction_transport::failure_event(
+                                error.into_response(),
+                                stream_id.as_ref(),
+                            )
+                            .await
+                            .to_string()
+                            .into(),
+                        ),
+                        Message::Close(None),
+                    ]
                 })
+                .flat_map(futures_util::stream::iter)
                 .boxed(),
             }
         })
@@ -115,11 +116,10 @@ fn failure(error: Error, stream_id: Option<Value>) -> WebSocketAction {
     )
 }
 
-async fn bridge(
+async fn forward_socket(
     message: Message,
     selector: Selector,
     context: WebSocketContext,
-    http_only: bool,
 ) -> crate::error::Result<BoxStream<'static, Message>> {
     let mut request = Request::builder()
         .method(Method::GET)
@@ -128,96 +128,66 @@ async fn bridge(
         .map_err(Error::bad_request)?;
     *request.headers_mut() = context.headers.clone();
     let (mut parts, _) = request.into_parts();
-    if !http_only {
-        parts.headers.insert(
-            "sec-websocket-key",
-            tokio_tungstenite::tungstenite::handshake::client::generate_key()
-                .parse()
-                .unwrap(),
-        );
-        let reply = crate::websocket::connect(
-            &context.state,
-            &context.provider,
-            context.origin.as_ref(),
-            &parts,
-            reqwest::Body::from(Vec::new()),
-            true,
-        )
-        .await?;
-        if reply.status() == StatusCode::SWITCHING_PROTOCOLS {
-            let connection = reply.upgrade().await.map_err(Error::bad_gateway)?;
-            let config = WebSocketConfig::default()
-                .max_message_size(None)
-                .max_frame_size(None);
-            let mut socket =
-                WebSocketStream::from_raw_socket(connection, Role::Client, Some(config)).await;
-            match transport::websocket_request(message, &context).await {
-                WebSocketAction::Forward(message) => {
-                    socket.send(message).await.map_err(Error::bad_gateway)?
-                }
-                WebSocketAction::Respond(job) => {
-                    return Ok(futures_util::stream::once(job)
-                        .flat_map(futures_util::stream::iter)
-                        .boxed());
-                }
-                WebSocketAction::Stream(stream) => return Ok(stream),
-            }
-            return Ok(socket_events(socket, selector.stream_id));
-        }
-        if !crate::websocket::unsupported(reply.status()) {
-            return Ok(response::websocket_response(
-                crate::router::stream_response(reply),
-                selector.stream_id,
-            ));
-        }
-    }
-    if selector.generate == Some(false) {
-        let reply = serde_json::json!({"id":"resp_router_prewarm","object":"response","status":"completed","output":[]});
-        return Ok(futures_util::stream::iter(
-            super::compaction::events(&reply, selector.stream_id.as_ref())
-                .into_iter()
-                .map(|event| Message::Text(event.to_string().into())),
-        )
-        .boxed());
-    }
-    let Message::Text(text) = message else {
-        unreachable!()
-    };
-    let mut fields: BTreeMap<String, Box<RawValue>> =
-        serde_json::from_str(&text).map_err(Error::bad_request)?;
-    for name in ["type", "stream_id", "event_id", "generate"] {
-        fields.remove(name);
-    }
-    fields.insert(
-        "stream".into(),
-        serde_json::value::to_raw_value(&true).unwrap(),
-    );
-    parts.method = Method::POST;
-    response::clean_rewritten_headers(&mut parts.headers);
-    for name in [
+    parts.headers.insert(
         "sec-websocket-key",
-        "sec-websocket-version",
-        "sec-websocket-protocol",
-        "sec-websocket-extensions",
-    ] {
-        parts.headers.remove(name);
-    }
-    parts
-        .headers
-        .insert("content-type", "application/json".parse().unwrap());
-    let body = Body::from(serde_json::to_vec(&fields).map_err(Error::bad_request)?);
-    let response = transport::forward_to(
+        tokio_tungstenite::tungstenite::handshake::client::generate_key()
+            .parse()
+            .unwrap(),
+    );
+    let reply = crate::websocket::connect(
         &context.state,
-        parts,
-        body,
+        &context.provider,
         context.origin.as_ref(),
-        Some(Arc::clone(&context.provider)),
+        &parts,
+        reqwest::Body::from(Vec::new()),
+        true,
     )
     .await?;
-    Ok(response::websocket_response(response, selector.stream_id))
+    if reply.status() == StatusCode::SWITCHING_PROTOCOLS {
+        let connection = reply.upgrade().await.map_err(Error::bad_gateway)?;
+        let config = WebSocketConfig::default()
+            .max_message_size(None)
+            .max_frame_size(None);
+        let mut socket =
+            WebSocketStream::from_raw_socket(connection, Role::Client, Some(config)).await;
+        match transport::websocket_request(message, &context).await {
+            WebSocketAction::Forward(message) => {
+                socket.send(message).await.map_err(Error::bad_gateway)?
+            }
+            WebSocketAction::Respond(job) => {
+                return Ok(futures_util::stream::once(job)
+                    .flat_map(futures_util::stream::iter)
+                    .boxed());
+            }
+            WebSocketAction::Stream(stream) => return Ok(stream),
+        }
+        return Ok(socket_events(socket, selector.stream_id));
+    }
+    let status = crate::websocket::rejection_status(reply.status());
+    let event = if status == StatusCode::UPGRADE_REQUIRED {
+        let mut event = serde_json::json!({"type":"error","status":status.as_u16(),"error":{
+            "code":"websocket_upgrade_rejected",
+            "message":format!("Upstream rejected WebSocket upgrade (HTTP {}); reconnect using a supported transport", reply.status().as_u16())
+        }});
+        if let Some(stream_id) = selector.stream_id {
+            event["stream_id"] = stream_id;
+        }
+        event
+    } else {
+        compaction_transport::failure_event(
+            crate::router::stream_response(reply),
+            selector.stream_id.as_ref(),
+        )
+        .await
+    };
+    Ok(futures_util::stream::iter([
+        Message::Text(event.to_string().into()),
+        Message::Close(None),
+    ])
+    .boxed())
 }
 
-pub(super) fn terminal(message: &Message) -> bool {
+fn terminal(message: &Message) -> bool {
     #[derive(Deserialize)]
     struct Kind {
         #[serde(rename = "type")]
@@ -267,7 +237,7 @@ where
     .boxed()
 }
 
-pub(super) fn error_message(error: impl std::fmt::Display, stream_id: Option<&Value>) -> Message {
+fn error_message(error: impl std::fmt::Display, stream_id: Option<&Value>) -> Message {
     let mut event =
         serde_json::json!({"type":"error","status":502,"error":{"message":error.to_string()}});
     if let Some(stream_id) = stream_id {
