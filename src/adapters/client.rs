@@ -1,7 +1,37 @@
 use axum::http::HeaderMap;
+use serde::Deserialize;
 
 use super::{catalog::CatalogFormat, codex, websocket};
 use crate::error::{Error, Result};
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ClientKind {
+    Codex,
+    Openai,
+    Anthropic,
+}
+
+impl ClientKind {
+    pub fn from_headers(headers: &HeaderMap) -> Self {
+        match (
+            Client::from_headers(headers),
+            headers.contains_key("anthropic-version"),
+        ) {
+            (Some(Client::Codex), _) => Self::Codex,
+            (None, true) => Self::Anthropic,
+            (None, false) => Self::Openai,
+        }
+    }
+
+    pub fn catalog_format(self) -> CatalogFormat {
+        match self {
+            Self::Codex => CatalogFormat::Codex,
+            Self::Openai => CatalogFormat::Openai,
+            Self::Anthropic => CatalogFormat::Anthropic,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum Client {
@@ -12,12 +42,6 @@ impl Client {
     pub fn from_headers(headers: &HeaderMap) -> Option<Self> {
         let originator = headers.get("originator")?.to_str().ok()?;
         codex::matches_originator(originator).then_some(Self::Codex)
-    }
-
-    pub fn catalog_format(self) -> CatalogFormat {
-        match self {
-            Self::Codex => CatalogFormat::Codex,
-        }
     }
 
     pub async fn forward_model(
@@ -80,6 +104,25 @@ impl<'a> ModelHint<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_kind_uses_protocol_headers_with_openai_as_the_default() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(ClientKind::from_headers(&headers), ClientKind::Openai);
+        headers.insert("originator", "opencode".parse().unwrap());
+        assert_eq!(ClientKind::from_headers(&headers), ClientKind::Openai);
+        headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
+        assert_eq!(ClientKind::from_headers(&headers), ClientKind::Anthropic);
+        headers.insert("originator", "codex_cli_rs".parse().unwrap());
+        assert_eq!(ClientKind::from_headers(&headers), ClientKind::Codex);
+        for (kind, format) in [
+            (ClientKind::Openai, CatalogFormat::Openai),
+            (ClientKind::Anthropic, CatalogFormat::Anthropic),
+            (ClientKind::Codex, CatalogFormat::Codex),
+        ] {
+            assert_eq!(kind.catalog_format(), format);
+        }
+    }
 
     #[test]
     fn originator_value_identifies_codex_not_header_presence() {

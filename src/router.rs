@@ -11,7 +11,7 @@ use tokio::sync::RwLock;
 
 use crate::{
     Config,
-    adapters::Client,
+    adapters::{CatalogFormat, Client, ClientKind},
     body::{inspect_body, stream_body},
     catalog::{CatalogState, ModelRegistry, load_manual_models},
     config::{Provider, RouteAction, sanitize_headers},
@@ -122,11 +122,7 @@ pub fn router(config: Config) -> anyhow::Result<Router> {
         && config
             .providers
             .values()
-            .all(|provider| provider.catalog.is_none() || from_file(provider))
-        && config.routes.iter().all(|route| match &route.action {
-            RouteAction::Catalog { provider, .. } => from_file(&config.providers[provider]),
-            _ => true,
-        });
+            .all(|provider| provider.catalog.is_none() || from_file(provider));
     let state = RouterState {
         config,
         catalog: RwLock::new(CatalogState { models, ready }),
@@ -156,12 +152,18 @@ async fn handle_request(
     request: Request,
 ) -> Result<Response> {
     let adapter = Client::from_headers(request.headers());
+    let client = ClientKind::from_headers(request.headers());
+    let profile = state.config.clients.get(&client);
+    let format = profile
+        .and_then(|profile| profile.format)
+        .unwrap_or_else(|| client.catalog_format());
     let action = &state
         .config
         .route(request.method(), request.uri(), request.headers())?
         .action;
     let origin = action
         .provider()
+        .or_else(|| profile.and_then(|profile| profile.provider.as_deref()))
         .map(|name| state.config.provider(name))
         .transpose()?;
     if request
@@ -171,7 +173,7 @@ async fn handle_request(
     {
         return websocket::forward(&state, request, action, origin, adapter).await;
     }
-    forward_http(&state, request, action, origin, adapter).await
+    forward_http(&state, request, action, origin, adapter, format).await
 }
 
 async fn forward_http(
@@ -180,25 +182,12 @@ async fn forward_http(
     action: &RouteAction,
     origin: Option<&Arc<Provider>>,
     adapter: Option<Client>,
+    format: CatalogFormat,
 ) -> Result<Response> {
-    if let (Some(adapter), RouteAction::Catalog { format, .. }) = (adapter, action)
-        && adapter.catalog_format() != *format
-    {
-        return Err(Error::bad_request(
-            "Catalog format does not match the client adapter",
-        ));
-    }
     let (parts, body) = request.into_parts();
     let (model, body) = match action {
-        RouteAction::Catalog { format, .. } => {
-            return state
-                .catalog_response(
-                    parts,
-                    body,
-                    origin.expect("catalog requires a provider"),
-                    *format,
-                )
-                .await;
+        RouteAction::Catalog {} => {
+            return state.catalog_response(parts, origin, format).await;
         }
         RouteAction::Forward { .. } => (None, stream_body(body)),
         RouteAction::Model { .. } if adapter.is_some() => {

@@ -97,10 +97,10 @@ async fn original_socket_close(during_response: bool) {
     .await;
     let root = tempfile::tempdir().unwrap();
     let config = parse_config(
-        &json!({"providers":{
+        &json!({"clients":{"codex":{"provider":"primary"},"openai":{"provider":"primary"},"anthropic":{"provider":"primary"}},"providers":{
         "primary":{"base_url":primary.url,"auth":"none","models":{"primary":{}}},
         "worker":{"base_url":worker.url,"auth":"none","models":{"worker":{}}}
-    },"routes":[{"action":"model","provider":"primary"}]})
+    },"routes":[{"action":"model"}]})
         .to_string(),
         root.path(),
     )
@@ -260,10 +260,10 @@ async fn fixture_with_handshakes(first: StatusCode, second: StatusCode) -> Fixtu
     let second = serve(Router::new().fallback(endpoint).with_state(b.clone())).await;
     let root = tempfile::tempdir().unwrap();
     let config = parse_config(
-        &json!({"providers":{
+        &json!({"clients":{"codex":{"provider":"primary"},"openai":{"provider":"primary"},"anthropic":{"provider":"primary"}},"providers":{
         "primary":{"base_url":first.url,"auth":"passthrough","models":{"gpt-test":{}}},
         "custom":{"base_url":format!("{}/v1",second.url),"auth":"none","models":{"worker":{}}}
-    },"routes":[{"path":"/responses","action":"model","provider":"primary"}]})
+    },"routes":[{"path":"/responses","action":"model"}]})
         .to_string(),
         root.path(),
     )

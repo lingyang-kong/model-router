@@ -4,6 +4,8 @@ mod common;
 mod adapter_regressions;
 mod capabilities;
 mod catalog;
+mod catalog_availability;
+mod catalog_clients;
 mod cli;
 mod compaction;
 mod discovery;

@@ -1,10 +1,10 @@
-use std::{io, sync::Arc};
+use std::{io, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
     extract::Request,
     http::{HeaderMap, Method, StatusCode, request::Parts},
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use futures_util::{StreamExt, TryStreamExt, future::try_join_all, stream::FuturesOrdered};
 use indexmap::IndexMap;
@@ -14,7 +14,6 @@ use tokio_util::io::StreamReader;
 use crate::{
     Config,
     adapters::CatalogFormat,
-    body::stream_body,
     capabilities::{self, Discovery},
     compression::{accepts_gzip, decode_body, encode_body},
     config::{Provider, header_has_token},
@@ -22,12 +21,14 @@ use crate::{
     router::{RouterState, stream_response},
 };
 
+const CATALOG_TIMEOUT: Duration = Duration::from_secs(3);
+
 pub(crate) struct ModelEntry {
     pub provider: Arc<Provider>,
     pub format: CatalogFormat,
     /// Source-format metadata after local settings, before output projection.
     pub metadata: Value,
-    /// False for retired IDs kept routable but excluded from current listings.
+    /// Unlisted IDs remain routable, including retired or unavailable models.
     pub listed: bool,
 }
 pub(crate) type ModelRegistry = IndexMap<String, ModelEntry>;
@@ -115,17 +116,18 @@ impl RouterState {
     async fn fetch_catalog(
         &self,
         provider: &Arc<Provider>,
-        origin: &Arc<Provider>,
-        incoming: Option<(Parts, Body)>,
-        output: CatalogFormat,
+        origin: Option<&Arc<Provider>>,
+        incoming: Option<&Parts>,
     ) -> Result<CatalogReply> {
         let discovery_headers = incoming
-            .as_ref()
-            .map(|(parts, _)| parts.headers.clone())
+            .map(|parts| parts.headers.clone())
             .unwrap_or_default();
-        let source = provider.catalog.as_ref();
-        let format = source.map_or(output, |source| source.format);
-        if source.is_some_and(|source| source.file.is_some()) {
+        let source = provider
+            .catalog
+            .as_ref()
+            .expect("configured catalog source");
+        let format = source.format;
+        if source.file.is_some() {
             let mut document = format.empty_catalog();
             format.models(&mut document)?.extend(
                 self.catalog
@@ -155,58 +157,76 @@ impl RouterState {
             })));
         }
 
-        let (mut parts, body) = match source.and_then(|source| source.path.as_deref()) {
-            Some(path) => {
-                let uri = match incoming.as_ref().and_then(|(parts, _)| parts.uri.query()) {
-                    Some(query) => format!("{path}?{query}"),
-                    None => path.to_owned(),
-                };
-                let (mut parts, body) = Request::builder()
-                    .method(Method::GET)
-                    .uri(uri)
-                    .body(Body::empty())
-                    .map_err(Error::bad_request)?
-                    .into_parts();
-                // Only the selected catalog source owns the incoming credentials and headers.
-                if let Some((incoming, _)) = incoming {
-                    parts.headers = incoming.headers;
-                }
-                for name in [
-                    "content-encoding",
-                    "content-type",
-                    "content-md5",
-                    "digest",
-                    "content-digest",
-                    "repr-digest",
-                    "trailer",
-                ] {
-                    parts.headers.remove(name);
-                }
-                (parts, body)
-            }
-            None => {
-                incoming.ok_or_else(|| Error::bad_request("Provider needs a catalog source"))?
-            }
+        let path = source.path.as_deref().expect("remote catalog path");
+        let uri = match incoming.and_then(|parts| parts.uri.query()) {
+            Some(query) => format!("{path}?{query}"),
+            None => path.to_owned(),
         };
+        let (mut parts, ()) = Request::builder()
+            .method(Method::GET)
+            .uri(uri)
+            .body(())
+            .map_err(Error::bad_request)?
+            .into_parts();
+        if let Some(incoming) = incoming {
+            parts.headers = incoming.headers.clone();
+        }
+        for name in [
+            "content-encoding",
+            "content-type",
+            "content-md5",
+            "digest",
+            "content-digest",
+            "repr-digest",
+            "trailer",
+        ] {
+            parts.headers.remove(name);
+        }
         parts.headers.remove("if-none-match");
         parts.headers.remove("if-modified-since");
-        let (client, request) =
-            self.prepare_request(provider, Some(origin), &parts, stream_body(body))?;
-        let response = client.execute(request).await.map_err(Error::bad_gateway)?;
-        if response.status() != StatusCode::OK {
-            if Arc::ptr_eq(provider, origin) {
-                return Ok(CatalogReply::Rejected(stream_response(response)));
+        let (client, mut request) = self.prepare_request(
+            provider,
+            incoming.and(origin),
+            &parts,
+            reqwest::Body::default(),
+        )?;
+        // Bound catalog transport through the final body byte without limiting inference.
+        *request.timeout_mut() = Some(CATALOG_TIMEOUT);
+        let response = match client.execute(request).await {
+            Ok(response) => response,
+            Err(error) => {
+                return Ok(CatalogReply::Rejected(
+                    Error::bad_gateway(error).into_response(),
+                ));
             }
-            return Err(Error::bad_gateway(format!(
-                "Provider catalog returned {}",
-                response.status()
-            )));
+        };
+        if response.status() != StatusCode::OK {
+            // Preserve the rejection even if other sources outlast this request's deadline.
+            let (parts, body) = stream_response(response).into_parts();
+            let body = match http_body_util::BodyExt::collect(body).await {
+                Ok(body) => Body::new(body),
+                Err(error) => {
+                    return Ok(CatalogReply::Rejected(
+                        Error::bad_gateway(error).into_response(),
+                    ));
+                }
+            };
+            return Ok(CatalogReply::Rejected(Response::from_parts(parts, body)));
         }
         let (parts, body) = stream_response(response).into_parts();
-        let reader = StreamReader::new(body.into_data_stream().map_err(io::Error::other));
-        let bytes = decode_body(reader, &parts.headers)
-            .await
-            .map_err(Error::bad_gateway)?;
+        let reader = StreamReader::new(
+            body.into_data_stream()
+                .map_err(|error| io::Error::new(io::ErrorKind::ConnectionAborted, error)),
+        );
+        let bytes = match decode_body(reader, &parts.headers).await {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::ConnectionAborted => {
+                return Ok(CatalogReply::Rejected(
+                    Error::bad_gateway(error).into_response(),
+                ));
+            }
+            Err(error) => return Err(Error::bad_gateway(error)),
+        };
         let mut document = serde_json::from_slice(&bytes).map_err(Error::bad_gateway)?;
         validate_complete_catalog(&document)?;
         for model in format.models(&mut document)? {
@@ -234,37 +254,49 @@ impl RouterState {
     pub(crate) async fn catalog_response(
         &self,
         parts: Parts,
-        body: Body,
-        origin: &Arc<Provider>,
+        origin: Option<&Arc<Provider>>,
         output: CatalogFormat,
     ) -> Result<Response> {
         let gzip = accepts_gzip(&parts.headers)?;
         let incoming_headers = parts.headers.clone();
-        let mut auxiliary = Vec::new();
-        for provider in self.config.providers.values() {
-            if !Arc::ptr_eq(provider, origin) && provider.catalog.is_some() {
-                auxiliary.push(self.fetch_catalog(provider, origin, None, output));
-            }
-        }
-        // Fetch both groups concurrently, but yield the origin first so its rejection
-        // takes precedence. Returning drops unfinished fetches.
-        let mut requests = [
-            vec![self.fetch_catalog(origin, origin, Some((parts, body)), output)],
-            auxiliary,
-        ]
-        .into_iter()
-        .map(try_join_all)
-        .collect::<FuturesOrdered<_>>();
+        // Client identity owns credentials; every configured catalog is a peer.
+        let mut requests = self
+            .config
+            .providers
+            .values()
+            .filter(|provider| provider.catalog.is_some())
+            .map(|provider| {
+                let incoming = origin
+                    .is_some_and(|origin| Arc::ptr_eq(provider, origin))
+                    .then_some(&parts);
+                async move {
+                    (
+                        provider,
+                        self.fetch_catalog(provider, origin, incoming).await,
+                    )
+                }
+            })
+            .collect::<FuturesOrdered<_>>();
         let mut snapshots = Vec::new();
-        while let Some(replies) = requests.next().await {
-            for reply in replies? {
-                match reply {
-                    CatalogReply::Catalog(snapshot) => snapshots.push(*snapshot),
-                    CatalogReply::Rejected(response) => return Ok(response),
+        let mut unavailable = Vec::new();
+        let mut rejection = None;
+        while let Some((provider, reply)) = requests.next().await {
+            match reply? {
+                CatalogReply::Catalog(snapshot) => snapshots.push(*snapshot),
+                CatalogReply::Rejected(response) => {
+                    unavailable.push(provider);
+                    if rejection.is_none()
+                        || origin.is_some_and(|origin| Arc::ptr_eq(provider, origin))
+                    {
+                        rejection = Some(response);
+                    }
                 }
             }
         }
-        // References resolve against this complete refresh, never stale routing metadata.
+        if snapshots.is_empty() {
+            return Ok(rejection.expect("configured catalog sources failed"));
+        }
+        // References resolve against this refresh, never stale routing metadata.
         let mut staged = ModelRegistry::new();
         for snapshot in &mut snapshots {
             for metadata in std::mem::take(snapshot.format.models(&mut snapshot.document)?) {
@@ -281,11 +313,30 @@ impl RouterState {
                 );
             }
         }
+        for (id, entry) in &mut staged {
+            let reference = entry
+                .provider
+                .models
+                .get(id)
+                .and_then(|settings| settings.extends.as_ref())
+                .or(entry.provider.defaults.extends.as_ref());
+            if let Some(reference) = reference {
+                let provider = self.config.provider(&reference.provider)?;
+                // Keep dependent IDs routable, but do not advertise incomplete
+                // inherited metadata to Codex or its subagent listing.
+                entry.listed = !unavailable
+                    .iter()
+                    .any(|source| Arc::ptr_eq(source, provider));
+            }
+        }
         let projections = staged.iter().map(|(id, entry)| {
             let snapshots = &snapshots;
             let staged = &staged;
             let incoming_headers = &incoming_headers;
             async move {
+                if !entry.listed && output == CatalogFormat::Codex {
+                    return Ok(None);
+                }
                 // Discovery lives only in this refresh; previous observations are never reused.
                 let snapshot = snapshots
                     .iter()
@@ -298,7 +349,10 @@ impl RouterState {
                 let reference = settings
                     .and_then(|settings| settings.extends.as_ref())
                     .or(entry.provider.defaults.extends.as_ref());
+                // Generic catalogs can describe the available model directly,
+                // even when its optional inheritance source is unavailable.
                 let base = reference
+                    .filter(|_| entry.listed)
                     .map(|reference| {
                         let provider = self.config.provider(&reference.provider)?;
                         staged
@@ -313,8 +367,20 @@ impl RouterState {
                             })
                     })
                     .transpose()?;
-                let mut projected =
-                    output.project(&entry.metadata, entry.format, base, &capabilities)?;
+                let provider_name = self
+                    .config
+                    .providers
+                    .iter()
+                    .find(|(_, provider)| Arc::ptr_eq(provider, &entry.provider))
+                    .map(|(name, _)| name.as_str())
+                    .expect("configured model provider");
+                let mut projected = output.project(
+                    &entry.metadata,
+                    provider_name,
+                    entry.format,
+                    base,
+                    &capabilities,
+                )?;
                 if output == CatalogFormat::Codex && !entry.provider.hidden_models.is_match(id) {
                     let probe_responses_lite = capabilities.responses_lite.is_none()
                         && projected
@@ -326,11 +392,12 @@ impl RouterState {
                             .is_some_and(|model| model["supports_search_tool"] == true);
                     if probe_responses_lite || probe_tool_search {
                         let empty = HeaderMap::new();
-                        let headers = if Arc::ptr_eq(&entry.provider, origin) {
-                            incoming_headers
-                        } else {
-                            &empty
-                        };
+                        let headers =
+                            if origin.is_some_and(|origin| Arc::ptr_eq(&entry.provider, origin)) {
+                                incoming_headers
+                            } else {
+                                &empty
+                            };
                         let lite = async {
                             if probe_responses_lite {
                                 self.probe_catalog_item(
@@ -382,6 +449,7 @@ impl RouterState {
                         if changed {
                             projected = output.project(
                                 &entry.metadata,
+                                provider_name,
                                 entry.format,
                                 base,
                                 &capabilities,
@@ -400,15 +468,14 @@ impl RouterState {
             .into_iter()
             .flatten()
             .collect();
-        // Validation and projection must succeed for every source before a refresh is visible.
+        // Validate successful sources together before publishing the partial refresh.
         let mut catalog = self.catalog.write().await;
         for (id, entry) in &staged {
             validate_ownership(&self.config, &catalog.models, id, &entry.provider)?;
         }
         for entry in catalog.models.values_mut() {
-            if snapshots
-                .iter()
-                .any(|snapshot| Arc::ptr_eq(&snapshot.provider, &entry.provider))
+            if origin.is_some_and(|origin| Arc::ptr_eq(&entry.provider, origin))
+                || entry.provider.catalog.is_some()
             {
                 entry.listed = false;
             }
@@ -416,14 +483,35 @@ impl RouterState {
         catalog.models.extend(staged);
         catalog.ready = true;
         drop(catalog);
-        let anchor = snapshots.into_iter().next().expect("catalog has an origin");
-        let mut document = if anchor.format == output {
-            anchor.document
-        } else {
-            output.empty_catalog()
+        // Choose a matching remote source in provider-name order. File sources
+        // supply rows only; credentials never determine the response envelope.
+        let matching = self.config.providers.values().find_map(|provider| {
+            snapshots.iter().position(|snapshot| {
+                Arc::ptr_eq(&snapshot.provider, provider)
+                    && snapshot.format == output
+                    && !provider
+                        .catalog
+                        .as_ref()
+                        .is_some_and(|source| source.file.is_some())
+            })
+        });
+        let (mut document, mut headers) = match matching {
+            Some(index) => {
+                let snapshot = snapshots.swap_remove(index);
+                (snapshot.document, snapshot.headers)
+            }
+            None => (output.empty_catalog(), HeaderMap::new()),
         };
+        if output == CatalogFormat::Anthropic {
+            document["first_id"] = models
+                .first()
+                .map_or(Value::Null, |model| model["id"].clone());
+            document["last_id"] = models
+                .last()
+                .map_or(Value::Null, |model| model["id"].clone());
+            document["has_more"] = Value::Bool(false);
+        }
         *output.models(&mut document)? = models;
-        let mut headers = anchor.headers;
         for name in [
             "content-encoding",
             "etag",
@@ -440,10 +528,11 @@ impl RouterState {
         if gzip {
             headers.insert("content-encoding", "gzip".parse().unwrap());
         }
-        if !header_has_token(&headers, "vary", "accept-encoding")
-            && !header_has_token(&headers, "vary", "*")
-        {
-            headers.append("vary", "Accept-Encoding".parse().unwrap());
+        for name in ["Accept-Encoding", "Originator", "Anthropic-Version"] {
+            if !header_has_token(&headers, "vary", name) && !header_has_token(&headers, "vary", "*")
+            {
+                headers.append("vary", name.parse().unwrap());
+            }
         }
         let bytes = serde_json::to_vec(&document).map_err(Error::bad_gateway)?;
         let mut response = Response::new(encode_body(bytes, gzip));

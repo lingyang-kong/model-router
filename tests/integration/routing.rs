@@ -75,7 +75,7 @@ async fn path_normalization_cannot_escape_route_or_provider_prefix() {
 }
 
 #[tokio::test]
-async fn empty_model_requests_use_only_the_configured_fallback() {
+async fn empty_model_requests_use_only_the_client_profile_fallback() {
     async fn capture(request: Request) -> Json<Value> {
         let (parts, body) = request.into_parts();
         let bytes = to_bytes(body, usize::MAX).await.unwrap();
@@ -86,7 +86,7 @@ async fn empty_model_requests_use_only_the_configured_fallback() {
     let backend = serve(Router::new().fallback(capture)).await;
     let root = tempfile::tempdir().unwrap();
     let config = parse_config(
-        &json!({"providers":{"api":{"base_url":backend.url,"auth":"none"}},"routes":[{"path":"/no-fallback","action":"model"},{"action":"model","provider":"api"}]}).to_string(),
+        &json!({"clients":{"openai":{"provider":"api"}},"providers":{"api":{"base_url":backend.url,"auth":"none"}},"routes":[{"action":"model"}]}).to_string(),
         root.path(),
     ).unwrap();
     let gateway = serve(router(config).unwrap()).await;
@@ -108,14 +108,15 @@ async fn empty_model_requests_use_only_the_configured_fallback() {
             json!({"method":method.as_str(),"path":path,"body":""})
         );
     }
-    for (path, body) in [
-        ("/no-fallback", ""),
-        ("/responses", " "),
-        ("/responses", "{bad"),
+    for (originator, body) in [
+        ("codex_cli_rs", ""),
+        ("opencode", " "),
+        ("opencode", "{bad"),
     ] {
         assert_eq!(
             client
-                .post(gateway.url.clone() + path)
+                .post(gateway.url.clone() + "/responses")
+                .header("originator", originator)
                 .body(body)
                 .send()
                 .await
@@ -151,13 +152,13 @@ async fn other_originators_preserve_payloads_that_resemble_codex_requests() {
 async fn providers_sharing_an_endpoint_keep_distinct_credential_scopes() {
     let fixture = Fixture::new().await;
     let config = parse_config(
-        &json!({"providers":{
+        &json!({"clients":{"codex":{"provider":"first"},"openai":{"provider":"first"},"anthropic":{"provider":"first"}},"providers":{
             "first":{"base_url":fixture._live_server.url,"auth":"passthrough"},
             "second":{"base_url":fixture._live_server.url,"auth":"passthrough",
                 "catalog":{"file":"models.json","format":"codex"}}
         },"routes":[
             {"path":"/direct","action":"forward","provider":"second"},
-            {"action":"model","provider":"first"}
+            {"action":"model"}
         ]})
         .to_string(),
         fixture.root.path(),
@@ -258,10 +259,10 @@ async fn one_messages_client_can_route_main_and_workers_without_headers() {
     )
     .unwrap();
     let config = parse_config(
-        &json!({"providers":{
+        &json!({"clients":{"codex":{"provider":"messages"},"openai":{"provider":"messages"},"anthropic":{"provider":"messages"}},"providers":{
         "messages":{"base_url":messages.url,"auth":"passthrough"},
         "inference":{"base_url":inference.url,"auth":"none","catalog":{"file":"models.json","format":"anthropic"}}
-    },"routes":[{"path_prefix":"/v1/messages","action":"model","provider":"messages"}]})
+    },"routes":[{"path_prefix":"/v1/messages","action":"model"}]})
         .to_string(),
         root.path(),
     )
@@ -347,7 +348,7 @@ async fn model_routing_waits_for_the_complete_body_without_rewriting_it() {
     }
     let backend = serve(Router::new().fallback(receive).with_state(arrived.clone())).await;
     let root = tempfile::tempdir().unwrap();
-    let config=parse_config(&json!({"providers":{"api":{"base_url":backend.url,"auth":"none"}},"routes":[{"action":"model","provider":"api"}]}).to_string(),root.path()).unwrap();
+    let config=parse_config(&json!({"clients":{"codex":{"provider":"api"},"openai":{"provider":"api"},"anthropic":{"provider":"api"}},"providers":{"api":{"base_url":backend.url,"auth":"none"}},"routes":[{"action":"model"}]}).to_string(),root.path()).unwrap();
     let gateway = serve(router(config).unwrap()).await;
     let (release_tx, release_rx) = oneshot::channel();
     let (started_tx, started_rx) = oneshot::channel();

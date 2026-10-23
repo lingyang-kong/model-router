@@ -1,6 +1,7 @@
 [providers.chatgpt]
 base_url = "https://chatgpt.com/backend-api/codex"
 auth = "passthrough"
+catalog = { path = "/models", format = "codex" }
 hidden_models = ["gpt-{reserve,5.6-*,6-sol}"]
 
 [providers.sglang]
@@ -28,14 +29,15 @@ reasoning_levels = [
 	{ level = "xhigh", description = "Maximum reasoning depth for complex problems" },
 ]
 
-[[routes]]
-method = "GET"
-path = "/models"
-action = "catalog"
+[clients.codex]
 provider = "chatgpt"
 format = "codex"
 
 [[routes]]
+method = "GET"
+path = "/models"
+action = "catalog"
+
+[[routes]]
 path_prefix = "/responses"
 action = "model"
-provider = "chatgpt"

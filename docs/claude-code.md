@@ -17,6 +17,10 @@ auth = "none"
 
 [providers.inference.models."vendor/model"]
 
+[clients.anthropic]
+provider = "anthropic"
+format = "anthropic"
+
 [[routes]]
 method = "GET"
 path = "/v1/models"
@@ -26,7 +30,6 @@ provider = "anthropic"
 [[routes]]
 path_prefix = "/v1/messages"
 action = "model"
-provider = "anthropic"
 ```
 
 Replace the inference URL and `vendor/model` with your server's URL and exact model ID. The explicit model table registers its route at startup; other IDs use Anthropic. These base URLs omit `/v1` because Claude supplies `/v1/messages` and `/v1/messages/count_tokens`.

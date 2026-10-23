@@ -48,8 +48,8 @@ async fn omitted_model_uses_provider_default_for_probe_and_actual_request() {
     let root = tempfile::tempdir().unwrap();
     let config = parse_config(
         &json!({
-            "providers":{"api":{"base_url":upstream.url,"auth":"none"}},
-            "routes":[{"action":"model","provider":"api"}]
+            "clients":{"codex":{"provider":"api"},"openai":{"provider":"api"},"anthropic":{"provider":"api"}},"providers":{"api":{"base_url":upstream.url,"auth":"none"}},
+            "routes":[{"action":"model"}]
         })
         .to_string(),
         root.path(),
@@ -283,12 +283,12 @@ async fn codex_multiagent_requests_are_rewritten_and_responses_restored() {
     }))
     .await;
     let config = parse_config(&json!({
-        "providers": {
+        "clients":{"codex":{"provider":"parent","format":"codex"},"openai":{"provider":"parent","format":"codex"},"anthropic":{"provider":"parent","format":"codex"}},"providers": {
             "parent":{"base_url":parent_server.url,"auth":"none","http_headers":{"x-upstream-key":"parent-secret"},"catalog":{"file":"parent.json","format":"codex"}},
             "worker":{"base_url":worker_server.url,"auth":"none","http_headers":{"x-upstream-key":"worker-secret"},"catalog":{"file":"worker.json","format":"codex"},"hidden_models":["hidden-*"]},
             "unknown":{"base_url":unknown_server.url,"auth":"none","http_headers":{"x-upstream-key":"unknown-secret"},"catalog":{"file":"unknown.json","format":"codex"}}
         },
-        "routes":[{"path":"/models","action":"catalog","provider":"parent","format":"codex"},{"path_prefix":"/responses","action":"model","provider":"parent"}]
+        "routes":[{"path":"/models","action":"catalog"},{"path_prefix":"/responses","action":"model"}]
     }).to_string(), root.path()).unwrap();
     let gateway = serve(router(config).unwrap()).await;
     let client = reqwest::Client::builder()

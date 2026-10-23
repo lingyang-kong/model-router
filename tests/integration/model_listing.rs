@@ -54,8 +54,8 @@ fn remote_config(fixture: &Fixture) -> model_router::Config {
                 "catalog": {"file": "manual-models.json", "format": "codex"},
                 "hidden_models": ["manually-known"]
             }
-        }, "routes": [
-            {"method":"GET", "path":"/models", "action":"catalog", "provider":"remote", "format":"codex"},
+        }, "clients":{"openai":{"provider":"remote","format":"codex"}}, "routes": [
+            {"method":"GET", "path":"/models", "action":"catalog"},
             {"path_prefix":"/responses", "action":"model"}
         ]})
         .to_string(),
@@ -78,13 +78,13 @@ async fn native_spawn_agent_listing_tracks_successful_remote_snapshots() {
             .await
             .unwrap()
             .status(),
-        StatusCode::SERVICE_UNAVAILABLE
+        StatusCode::OK
     );
-    // File-backed routing works before discovery; keep the client's listing until refresh succeeds.
-    assert_eq!(
-        forwarded_description(&fixture, &gateway, "manually-known").await,
-        CLIENT_DESCRIPTION
-    );
+    // The hidden file catalog is a successful empty listing even if the remote fails.
+    let initial = forwarded_description(&fixture, &gateway, "manually-known").await;
+    assert!(initial.starts_with("Available model overrides"));
+    assert!(!initial.contains("cached-model"));
+    assert!(!initial.contains("manually-known"));
 
     *fixture.live.models.lock().unwrap() = vec![
         json!({"slug":"model-a", "use_responses_lite":false}),
@@ -133,10 +133,10 @@ async fn native_spawn_agent_listing_tracks_successful_remote_snapshots() {
             .await
             .unwrap()
             .status(),
-        StatusCode::SERVICE_UNAVAILABLE
+        StatusCode::OK
     );
     let after_failure = forwarded_description(&fixture, &gateway, "model-a").await;
-    assert!(after_failure.contains("model-b"));
+    assert!(!after_failure.contains("model-b"));
     assert!(!after_failure.contains("model-a"));
 
     fixture.live.status.store(200, Ordering::SeqCst);
@@ -151,6 +151,51 @@ async fn native_spawn_agent_listing_tracks_successful_remote_snapshots() {
     assert!(empty.starts_with("Available model overrides"));
     assert!(!empty.contains("model-a"));
     assert!(!empty.contains("model-b"));
+}
+
+#[tokio::test]
+async fn total_catalog_outage_preserves_native_listing_and_known_routes() {
+    let fixture = Fixture::new().await;
+    *fixture.live.models.lock().unwrap() = vec![json!({"slug":"known-model"})];
+    let config = parse_config(
+        &json!({"providers":{
+            "remote":{
+                "base_url":fixture._live_server.url,"auth":"none",
+                "catalog":{"path":"/models","format":"codex"},
+                "models":{"known-model":{"use_responses_lite":false}}
+            }
+        },"clients":{"openai":{"provider":"remote","format":"codex"}},"routes":[
+            {"path":"/models","action":"catalog"},
+            {"path_prefix":"/responses","action":"model"}
+        ]})
+        .to_string(),
+        fixture.root.path(),
+    )
+    .unwrap();
+    let gateway = serve(router(config).unwrap()).await;
+    let mut last_description = CLIENT_DESCRIPTION.to_owned();
+    for status in [503, 200, 503] {
+        fixture.live.status.store(status, Ordering::SeqCst);
+        assert_eq!(
+            fixture
+                .client
+                .get(gateway.url.clone() + "/models")
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16(),
+            status
+        );
+        let description = forwarded_description(&fixture, &gateway, "known-model").await;
+        if status == 200 {
+            assert!(description.contains("known-model"));
+            assert!(!description.contains("cached-model"));
+        } else {
+            assert_eq!(description, last_description);
+        }
+        last_description = description;
+    }
 }
 
 #[tokio::test]

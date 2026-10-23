@@ -88,8 +88,8 @@ async fn adapted_websocket_close_cancels_an_upstream_write_blocked_by_client_bac
     )
     .unwrap();
     let config = parse_config(&json!({
-        "providers":{"parent":{"base_url":upstream_server.url,"auth":"none","catalog":{"file":"models.json","format":"codex"}}},
-        "routes":[{"action":"model","provider":"parent"}]
+        "clients":{"codex":{"provider":"parent"},"openai":{"provider":"parent"},"anthropic":{"provider":"parent"}},"providers":{"parent":{"base_url":upstream_server.url,"auth":"none","catalog":{"file":"models.json","format":"codex"}}},
+        "routes":[{"action":"model"}]
     }).to_string(), root.path()).unwrap();
     let gateway = serve(router(config).unwrap()).await;
     let mut request = (gateway.url.replace("http:", "ws:") + "/responses")
@@ -225,8 +225,8 @@ async fn codex_multiagent_websocket_transforms_requests_and_restores_events() {
     )
     .unwrap();
     let config = parse_config(&json!({
-        "providers":{"parent":{"base_url":upstream_server.url,"auth":"none","catalog":{"file":"models.json","format":"codex"}}},
-        "routes":[{"action":"model","provider":"parent"}]
+        "clients":{"codex":{"provider":"parent"},"openai":{"provider":"parent"},"anthropic":{"provider":"parent"}},"providers":{"parent":{"base_url":upstream_server.url,"auth":"none","catalog":{"file":"models.json","format":"codex"}}},
+        "routes":[{"action":"model"}]
     }).to_string(), root.path()).unwrap();
     let gateway = serve(router(config).unwrap()).await;
     let mut request = (gateway.url.replace("http:", "ws:") + "/responses")

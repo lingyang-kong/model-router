@@ -18,7 +18,7 @@ impl RouterState {
     pub(crate) async fn probe_catalog_item(
         &self,
         provider: &Arc<Provider>,
-        origin: &Arc<Provider>,
+        origin: Option<&Arc<Provider>>,
         incoming: &HeaderMap,
         model: &str,
         item: serde_json::Value,
@@ -29,7 +29,7 @@ impl RouterState {
             .ok()?
             .into_parts();
         parts.headers = incoming.clone();
-        self.probe_response_item(provider, Some(origin), &parts, Some(model), item)
+        self.probe_response_item(provider, origin, &parts, Some(model), item)
             .await
     }
 

@@ -188,7 +188,7 @@ async fn fixture_with_headers(mode: &str, probe_mode: &str, headers: Value) -> F
     )
     .await;
     let root = tempfile::tempdir().unwrap();
-    let config = parse_config(&json!({"providers":{"api":{"base_url":backend.url,"auth":"none","http_headers":headers}},"routes":[{"action":"model","provider":"api"}]}).to_string(),root.path()).unwrap();
+    let config = parse_config(&json!({"clients":{"codex":{"provider":"api"},"openai":{"provider":"api"},"anthropic":{"provider":"api"}},"providers":{"api":{"base_url":backend.url,"auth":"none","http_headers":headers}},"routes":[{"action":"model"}]}).to_string(),root.path()).unwrap();
     let server = serve(router(config).unwrap()).await;
     Fixture {
         server,

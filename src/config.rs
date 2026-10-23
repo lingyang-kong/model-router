@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 use url::{Host, Url};
 
 use crate::{
-    adapters::CatalogFormat,
+    adapters::{CatalogFormat, ClientKind},
     capabilities::Capabilities,
     error::{Error, Result},
 };
@@ -74,7 +74,16 @@ pub(crate) struct Provider {
 #[derive(Deserialize)]
 struct ConfigDocument {
     providers: BTreeMap<String, Provider>,
+    #[serde(default)]
+    clients: BTreeMap<ClientKind, ClientProfile>,
     routes: Vec<Route>,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ClientProfile {
+    pub provider: Option<String>,
+    pub format: Option<CatalogFormat>,
 }
 
 #[derive(Deserialize)]
@@ -94,16 +103,9 @@ pub(crate) struct Route {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum RouteAction {
-    Forward {
-        provider: String,
-    },
-    Model {
-        provider: Option<String>,
-    },
-    Catalog {
-        provider: String,
-        format: CatalogFormat,
-    },
+    Forward { provider: String },
+    Model {},
+    Catalog {},
 }
 
 fn deserialize_hidden_models<'de, D: Deserializer<'de>>(
@@ -159,8 +161,8 @@ fn deserialize_static_headers<'de, D: Deserializer<'de>>(
 impl RouteAction {
     pub fn provider(&self) -> Option<&str> {
         match self {
-            Self::Forward { provider } | Self::Catalog { provider, .. } => Some(provider),
-            Self::Model { provider } => provider.as_deref(),
+            Self::Forward { provider } => Some(provider),
+            Self::Model {} | Self::Catalog {} => None,
         }
     }
 }
@@ -193,6 +195,7 @@ impl Route {
 
 pub struct Config {
     pub(crate) providers: BTreeMap<String, Arc<Provider>>,
+    pub(crate) clients: BTreeMap<ClientKind, ClientProfile>,
     pub(crate) routes: Vec<Route>,
 }
 
@@ -217,6 +220,7 @@ impl Config {
     pub fn from_toml(text: &str, root: &Path) -> anyhow::Result<Self> {
         let ConfigDocument {
             mut providers,
+            clients,
             routes,
         } = toml::from_str(text).context("Invalid router configuration")?;
         if providers.is_empty() {
@@ -272,11 +276,25 @@ impl Config {
         if routes.is_empty() {
             bail!("Configure at least one routing rule");
         }
+        for profile in clients.values() {
+            if let Some(name) = &profile.provider
+                && !providers.contains_key(name)
+            {
+                bail!("Unknown provider in client profile: {name}");
+            }
+        }
         for route in &routes {
             if let Some(name) = route.action.provider()
                 && !providers.contains_key(name)
             {
                 bail!("Unknown provider in routing rule: {name}");
+            }
+            if matches!(route.action, RouteAction::Catalog {})
+                && providers
+                    .values()
+                    .all(|provider| provider.catalog.is_none())
+            {
+                bail!("Catalog routes require at least one catalog source");
             }
             if route.path.is_some() && route.path_prefix.is_some() {
                 bail!("A route must use either path or path_prefix");
@@ -288,6 +306,7 @@ impl Config {
             }
         }
         Ok(Self {
+            clients,
             providers: providers
                 .into_iter()
                 .map(|(name, provider)| (name, Arc::new(provider)))
@@ -435,6 +454,63 @@ pub(crate) fn sanitize_headers(headers: &mut HeaderMap) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_profiles_select_provider_and_catalog_format_independently() {
+        let config = Config::from_toml(
+            r#"
+            [providers.api]
+            base_url = "http://localhost:30000"
+            auth = "passthrough"
+            catalog = { path = "/models", format = "codex" }
+            [clients.codex]
+            provider = "api"
+            [clients.openai]
+            format = "anthropic"
+            [[routes]]
+            path = "/models"
+            action = "catalog"
+            [[routes]]
+            action = "model"
+            "#,
+            Path::new("."),
+        )
+        .unwrap();
+        assert_eq!(
+            config.clients[&ClientKind::Codex].provider.as_deref(),
+            Some("api")
+        );
+        assert_eq!(config.clients[&ClientKind::Codex].format, None);
+        assert_eq!(config.clients[&ClientKind::Openai].provider, None);
+        assert_eq!(
+            config.clients[&ClientKind::Openai].format,
+            Some(CatalogFormat::Anthropic)
+        );
+    }
+
+    #[test]
+    fn invalid_client_profiles_and_provider_specific_model_routes_are_rejected() {
+        let base = r#"
+            [providers.api]
+            base_url = "http://localhost:30000"
+            auth = "none"
+            catalog = { path = "/models", format = "codex" }
+        "#;
+        for settings in [
+            "[[routes]]\naction='model'\nprovider='api'",
+            "[[routes]]\naction='catalog'\nprovider='api'",
+            "[[routes]]\naction='catalog'\nformat='codex'",
+            "[clients.codex]\nprovider='missing'\n[[routes]]\naction='model'",
+            "[clients.unknown]\nprovider='api'\n[[routes]]\naction='model'",
+            "[clients.codex]\nunknown=true\n[[routes]]\naction='model'",
+            "[clients.codex]\nformat='unknown'\n[[routes]]\naction='model'",
+        ] {
+            assert!(
+                Config::from_toml(&format!("{base}\n{settings}"), Path::new(".")).is_err(),
+                "{settings}"
+            );
+        }
+    }
 
     #[test]
     fn hidden_models_compile_globs_with_alternatives_and_escapes() {

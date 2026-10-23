@@ -17,7 +17,7 @@ This setup uses Codex's built-in OpenAI provider and ChatGPT authentication. Rem
 
 For other client options, see the [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
 
-The router selects Codex handling when the `originator` header contains `codex`, ignoring ASCII case. It adapts HTTP and WebSocket `model` routes; other clients and `forward` routes remain unadapted. No router-specific client header is needed. Catalog output must use the `codex` format for marked requests.
+The router selects Codex handling when the `originator` header contains `codex`, ignoring ASCII case. It adapts HTTP and WebSocket `model` routes; other clients and `forward` routes remain unadapted. No router-specific client header is needed. `[clients.codex]` associates Codex with its provider and catalog format; the example uses ChatGPT and `codex`. The same catalog route serves OpenAI and Anthropic clients through their own profiles. The ChatGPT catalog source declares its source format independently.
 
 ## Model metadata
 
@@ -81,7 +81,7 @@ HTTP JSON, SSE, and WebSocket replies are supported. Summary generation always u
 
 ## WebSocket routing
 
-Codex's native routing hint selects the initial provider; absent a hint, the route's fallback provider is used. The router requires a real upstream handshake before accepting the client socket, including prewarm connections. Successful non-upgrade responses and HTTP 404/405/426/501 become HTTP 426 so the client can fall back to HTTP. Authentication, rate-limit, and server errors remain errors.
+Codex's native routing hint selects the initial provider; absent a hint, `[clients.codex].provider` is used. The router requires a real upstream handshake before accepting the client socket, including prewarm connections. Successful non-upgrade responses and HTTP 404/405/426/501 become HTTP 426 so the client can fall back to HTTP. Authentication, rate-limit, and server errors remain errors.
 
 Every subsequent model request is routed again. The initial upstream connection is reused while available; requests to another provider open a separate connection for that response. Those requests may require full-history replay because connection-local `previous_response_id` state is unavailable. A rejected alternate-provider upgrade emits an error and closes the client socket.
 

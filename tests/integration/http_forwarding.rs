@@ -146,7 +146,12 @@ async fn opaque_requests_forward_before_the_rest_of_the_body_arrives() {
 async fn gateway(upstream: &Server, routes: Value) -> Server {
     let config = parse_config(
         &json!({
-            "providers": {"api": {"base_url": upstream.url, "auth": "none"}},
+            "clients": {
+                "codex": {"provider": "api", "format": "codex"},
+                "openai": {"provider": "api", "format": "codex"},
+                "anthropic": {"provider": "api", "format": "codex"}
+            },
+            "providers": {"api": {"base_url": upstream.url, "auth": "none", "catalog": {"path": "/models", "format": "codex"}}},
             "routes": routes,
         })
         .to_string(),
@@ -189,7 +194,7 @@ async fn request_bodies_and_checksums_survive_forward_and_model_routes() {
         &upstream,
         json!([
             {"path": "/forward", "action": "forward", "provider": "api"},
-            {"path": "/model", "action": "model", "provider": "api"}
+            {"path": "/model", "action": "model"}
         ]),
     )
     .await;
@@ -331,11 +336,7 @@ async fn rewritten_catalog_drops_stale_integrity_and_trailer_declarations() {
         response
     }
     let upstream = serve(Router::new().fallback(catalog)).await;
-    let gateway = gateway(
-        &upstream,
-        json!([{"path": "/models", "action": "catalog", "format": "codex", "provider": "api"}]),
-    )
-    .await;
+    let gateway = gateway(&upstream, json!([{"path": "/models", "action": "catalog"}])).await;
     let response = reqwest::Client::builder()
         .no_proxy()
         .build()

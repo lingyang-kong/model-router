@@ -71,11 +71,11 @@ async fn catalog_refresh_does_not_change_a_websocket_destination() {
 #[tokio::test]
 async fn model_websockets_select_a_provider_from_handshake_hints() {
     let fixture = Fixture::new().await;
-    let config=parse_config(&json!({"providers":{
-        "live":{"base_url":fixture._live_server.url,"auth":"none"},
+    let config=parse_config(&json!({"clients":{"codex":{"format":"codex"},"openai":{"format":"codex"},"anthropic":{"format":"codex"}},"providers":{
+        "live":{"base_url":fixture._live_server.url,"auth":"none","catalog":{"path":"/models","format":"codex"}},
         "manual":{"base_url":fixture._manual_server.url,"auth":"none","catalog":{"file":"models.json","format":"codex"}}
     },"routes":[
-        {"method":"GET","path":"/models","action":"catalog","format":"codex","provider":"live"},
+        {"method":"GET","path":"/models","action":"catalog"},
         {"action":"model"}
     ]}).to_string(),fixture.root.path()).unwrap();
     let gateway = serve(router(config).unwrap()).await;
