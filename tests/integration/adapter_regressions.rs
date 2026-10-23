@@ -36,7 +36,7 @@ fn config_for(upstream: &str, catalog: Option<&str>) -> (tempfile::TempDir, mode
         provider["catalog"] = json!({"file":"models.json","format":"codex"});
     }
     let config = parse_config(
-        &json!({"providers":{"api":provider},"routes":[{"action":"model","provider":"api"}]})
+        &json!({"clients":{"codex":{"provider":"api"},"openai":{"provider":"api"},"anthropic":{"provider":"api"}},"providers":{"api":provider},"routes":[{"action":"model"}]})
             .to_string(),
         root.path(),
     )

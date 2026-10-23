@@ -4,4 +4,4 @@ mod codex;
 pub(crate) mod websocket;
 
 pub(crate) use catalog::CatalogFormat;
-pub(crate) use client::{Client, ModelHint};
+pub(crate) use client::{Client, ClientKind, ModelHint};

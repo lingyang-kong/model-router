@@ -1,6 +1,6 @@
 # OpenCode
 
-Adapt the `/responses` rule from [router-config.toml](../examples/router-config.toml) for your Responses-compatible upstreams and credentials. Register custom IDs in provider `models` tables or file catalogs as described in [catalog configuration](../README.md#catalogs), so routing does not depend on a client catalog request. OpenCode manages its own picker.
+Use the `/responses` rule from [router-config.toml](../examples/router-config.toml) with your Responses-compatible upstreams and credentials. Set `[clients.openai].provider` if OpenCode needs a default upstream or passes that provider's credentials through the router. Register custom IDs in provider `models` tables or file catalogs as described in [catalog configuration](../README.md#catalogs), so routing does not depend on a client catalog request. OpenCode manages its own picker.
 
 For OpenCode v2, merge this into an existing Responses provider:
 

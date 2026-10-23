@@ -76,12 +76,13 @@ impl CatalogFormat {
     pub fn project(
         self,
         model: &Value,
+        provider: &str,
         source: Self,
         base: Option<(&Value, Self)>,
         capabilities: &Capabilities,
     ) -> Result<Option<Value>> {
         let base_format = base.map(|(_, format)| format);
-        if self != source && base_format != Some(self) {
+        if self == Self::Codex && self != source && base_format != Some(self) {
             return Ok(None);
         }
 
@@ -90,33 +91,58 @@ impl CatalogFormat {
         }
         let local_shared = source.shared_metadata(model);
 
-        let mut result = match base {
-            Some((base_model, base_format)) if base_format == self => {
-                let mut result = base_model.clone();
-                if source == self {
-                    crate::catalog::overlay(
-                        &mut result,
-                        model.as_object().expect("validated model object"),
-                    );
-                } else {
-                    for (key, value) in self.settings(&local_shared) {
-                        result[key] = value;
+        let mut result = if source != self && base_format != Some(self) {
+            let mut shared = base
+                .map(|(model, format)| format.shared_metadata(model))
+                .unwrap_or_default();
+            shared.extend(local_shared.clone());
+            let mut result = Value::Object(self.settings(&shared));
+            match self {
+                Self::Openai => {
+                    result["object"] = Value::String("model".into());
+                    result["created"] = Value::from(0);
+                    result["owned_by"] = Value::String(provider.into());
+                }
+                Self::Anthropic => {
+                    result["type"] = Value::String("model".into());
+                    result["created_at"] = Value::String("1970-01-01T00:00:00Z".into());
+                    if !result.get("display_name").is_some_and(Value::is_string) {
+                        result["display_name"] = Value::String(source.model_id(model)?.into());
                     }
                 }
-                result
+                Self::Codex => unreachable!(),
             }
-            base => {
-                let mut result = if source == self {
-                    model.clone()
-                } else {
-                    Value::Object(Map::new())
-                };
-                if let Some((base_model, base_format)) = base {
-                    for (key, value) in self.settings(&base_format.shared_metadata(base_model)) {
-                        result.as_object_mut().unwrap().entry(key).or_insert(value);
+            result
+        } else {
+            match base {
+                Some((base_model, base_format)) if base_format == self => {
+                    let mut result = base_model.clone();
+                    if source == self {
+                        crate::catalog::overlay(
+                            &mut result,
+                            model.as_object().expect("validated model object"),
+                        );
+                    } else {
+                        for (key, value) in self.settings(&local_shared) {
+                            result[key] = value;
+                        }
                     }
+                    result
                 }
-                result
+                base => {
+                    let mut result = if source == self {
+                        model.clone()
+                    } else {
+                        Value::Object(Map::new())
+                    };
+                    if let Some((base_model, base_format)) = base {
+                        for (key, value) in self.settings(&base_format.shared_metadata(base_model))
+                        {
+                            result.as_object_mut().unwrap().entry(key).or_insert(value);
+                        }
+                    }
+                    result
+                }
             }
         };
 
@@ -198,6 +224,7 @@ mod tests {
         let got = CatalogFormat::Codex
             .project(
                 &local,
+                "provider",
                 CatalogFormat::Openai,
                 Some((&donor, CatalogFormat::Codex)),
                 &Capabilities::default(),
@@ -221,6 +248,7 @@ mod tests {
         let got = CatalogFormat::Codex
             .project(
                 &local,
+                "provider",
                 CatalogFormat::Openai,
                 Some((&donor, CatalogFormat::Codex)),
                 &Capabilities::default(),
@@ -248,6 +276,7 @@ mod tests {
             let got = format
                 .project(
                     &local,
+                    "provider",
                     format,
                     Some((&donor, CatalogFormat::Codex)),
                     &Capabilities::default(),
@@ -266,12 +295,13 @@ mod tests {
     }
 
     #[test]
-    fn same_format_is_passthrough_and_other_unbased_outputs_are_omitted() {
+    fn same_format_is_passthrough_and_codex_requires_a_compatible_row() {
         let native = json!({"id":"local","extension":{"x":1}});
         assert_eq!(
             CatalogFormat::Openai
                 .project(
                     &native,
+                    "provider",
                     CatalogFormat::Openai,
                     None,
                     &Capabilities::default()
@@ -282,14 +312,21 @@ mod tests {
         let codex = json!({"slug":"local","opaque":{"x":1},"base_instructions":"literal"});
         assert_eq!(
             CatalogFormat::Codex
-                .project(&codex, CatalogFormat::Codex, None, &Capabilities::default())
+                .project(
+                    &codex,
+                    "provider",
+                    CatalogFormat::Codex,
+                    None,
+                    &Capabilities::default()
+                )
                 .unwrap(),
             Some(codex)
         );
         assert_eq!(
-            CatalogFormat::Anthropic
+            CatalogFormat::Codex
                 .project(
                     &native,
+                    "provider",
                     CatalogFormat::Openai,
                     None,
                     &Capabilities::default()
@@ -297,6 +334,96 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn generic_rows_use_local_shared_metadata_and_provider_identity() {
+        let local = json!({
+            "slug":"local", "display_name":"Local", "description":null,
+            "opaque":"source secret", "created":123, "owned_by":"wrong"
+        });
+        for format in [CatalogFormat::Openai, CatalogFormat::Anthropic] {
+            let donor = json!({
+                "slug":"donor", "display_name":"Donor", "description":"Donor description",
+                "default_reasoning_level":"high", "opaque":"donor secret",
+                "created":456, "owned_by":"donor", "created_at":"2026-01-01T00:00:00Z"
+            });
+            let row = format
+                .project(
+                    &local,
+                    "local-provider",
+                    CatalogFormat::Codex,
+                    Some((&donor, CatalogFormat::Codex)),
+                    &Capabilities::default(),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(row["id"], "local");
+            assert_eq!(row["display_name"], "Local");
+            assert_eq!(row["description"], Value::Null);
+            assert_eq!(row["reasoning_level"], "high");
+            assert!(row.get("opaque").is_none());
+            match format {
+                CatalogFormat::Openai => {
+                    assert_eq!(row["object"], "model");
+                    assert_eq!(row["created"], 0);
+                    assert_eq!(row["owned_by"], "local-provider");
+                    assert!(row.get("created_at").is_none());
+                }
+                CatalogFormat::Anthropic => {
+                    assert_eq!(row["type"], "model");
+                    assert_eq!(row["created_at"], "1970-01-01T00:00:00Z");
+                    assert!(row.get("owned_by").is_none());
+                    assert!(row.get("created").is_none());
+                }
+                CatalogFormat::Codex => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn generic_rows_without_donors_preserve_shared_settings() {
+        let local = json!({"slug":"local","description":"Source description","opaque":true});
+        for format in [CatalogFormat::Openai, CatalogFormat::Anthropic] {
+            let row = format
+                .project(
+                    &local,
+                    "provider",
+                    CatalogFormat::Codex,
+                    None,
+                    &Capabilities::default(),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(row["id"], "local");
+            assert_eq!(row["description"], "Source description");
+            assert!(row.get("opaque").is_none());
+            if format == CatalogFormat::Anthropic {
+                assert_eq!(row["display_name"], "local");
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_matching_format_donors_keep_native_metadata() {
+        let local = json!({"slug":"local","description":"Local description"});
+        for format in [CatalogFormat::Openai, CatalogFormat::Anthropic] {
+            let donor = json!({"id":"donor","display_name":"Donor","opaque":true});
+            let row = format
+                .project(
+                    &local,
+                    "provider",
+                    CatalogFormat::Codex,
+                    Some((&donor, format)),
+                    &Capabilities::default(),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(row["id"], "local");
+            assert_eq!(row["description"], "Local description");
+            assert_eq!(row["opaque"], true);
+            assert_eq!(row["display_name"], "Donor");
+        }
     }
 
     #[test]
@@ -309,6 +436,7 @@ mod tests {
         let got = CatalogFormat::Codex
             .project(
                 &local,
+                "provider",
                 CatalogFormat::Codex,
                 Some((&donor, CatalogFormat::Codex)),
                 &Capabilities::default(),
@@ -337,7 +465,7 @@ mod tests {
             ..Default::default()
         };
         let got = CatalogFormat::Codex
-            .project(&local, CatalogFormat::Codex, None, &caps)
+            .project(&local, "provider", CatalogFormat::Codex, None, &caps)
             .unwrap()
             .unwrap();
         assert!(got.get("use_responses_lite").is_none());
@@ -357,6 +485,7 @@ mod tests {
         let got = CatalogFormat::Codex
             .project(
                 &local,
+                "provider",
                 CatalogFormat::Openai,
                 Some((&donor, CatalogFormat::Codex)),
                 &Capabilities::default(),
@@ -370,6 +499,7 @@ mod tests {
         let got = CatalogFormat::Codex
             .project(
                 &local,
+                "provider",
                 CatalogFormat::Openai,
                 Some((&donor, CatalogFormat::Codex)),
                 &Capabilities {
@@ -388,6 +518,7 @@ mod tests {
         let got = CatalogFormat::Codex
             .project(
                 &local,
+                "provider",
                 CatalogFormat::Codex,
                 None,
                 &Capabilities {
@@ -412,6 +543,7 @@ mod tests {
             CatalogFormat::Codex
                 .project(
                     &local,
+                    "provider",
                     CatalogFormat::Openai,
                     Some((&donor, CatalogFormat::Codex)),
                     capabilities,
@@ -442,6 +574,7 @@ mod tests {
         let native_got = CatalogFormat::Codex
             .project(
                 &native,
+                "provider",
                 CatalogFormat::Codex,
                 None,
                 &Capabilities::default(),
@@ -461,6 +594,7 @@ mod tests {
         let row = CatalogFormat::Codex
             .project(
                 &local,
+                "provider",
                 CatalogFormat::Openai,
                 Some((&donor, CatalogFormat::Codex)),
                 &Capabilities::default(),

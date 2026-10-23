@@ -39,10 +39,25 @@ Define rules with `[[routes]]`. Rules can match `method`, `path` or `path_prefix
 | Action | Behavior |
 | --- | --- |
 | `forward` | Stream to the required `provider`. |
-| `model` | Route by the top-level JSON `model`; optional `provider` is the fallback for empty bodies, missing HTTP models, or unknown IDs. |
-| `catalog` | Merge provider catalogs into the required `format`, using the required `provider` as the primary source. |
+| `model` | Route by the top-level JSON `model`, using the client's configured provider as a fallback. |
+| `catalog` | Merge all configured provider catalogs in the client's format. |
 
-A model route's fallback also identifies the owner of incoming credentials. Routing from that provider to another `passthrough` provider is rejected; configure the destination's credentials on the router.
+Provider and output format belong to clients, independently of endpoint routing:
+
+```toml
+[clients.codex]
+provider = "chatgpt"
+format = "codex"
+
+[[routes]]
+method = "GET"
+path = "/models"
+action = "catalog"
+```
+
+Supported client profiles are `codex`, `anthropic`, and `openai`. A Codex `originator` header selects `codex`; otherwise `anthropic-version` selects `anthropic`; other requests select `openai`. Profiles are optional. Their `format` defaults to the client's name, and `provider` has no default. For example, an unconfigured OpenAI client gets an OpenAI catalog and can route known model IDs without using ChatGPT credentials.
+
+A client's provider identifies the owner of incoming credentials and supplies fallback routing for empty bodies, missing HTTP models, or unknown IDs. Routing inference from that provider to another `passthrough` provider is rejected; configure the destination's credentials on the router. Catalog and model routes do not accept `provider` or `format`; explicit `forward` routes still name their destination.
 
 The full incoming path is appended to `base_url`: a base ending in `/v1` plus `/responses` becomes `/v1/responses`. Incoming queries are preserved; base URLs cannot contain queries. Paths changed by URL normalization, such as dot segments or backslashes, are rejected. Upstream redirects are not followed. Loopback upstreams bypass proxy environment variables; remote upstreams honor them.
 
@@ -63,9 +78,11 @@ Endpoint paths are appended to `base_url` and cannot contain queries. Relative f
 | `openai` | `data` | `id` |
 | `anthropic` | `data` | `id` |
 
-Source and output formats are independent. Use complete catalog endpoints: pagination is not implemented, and `has_more = true` is rejected. The primary source's envelope is retained when its format matches the output; file sources contribute rows only.
+Source and output formats are independent. Each contributing provider declares its catalog path or file and source format. The selected client profile determines the output format, so one `/models` route serves all clients.
 
-When the primary provider has no configured catalog source, the router fetches its catalog using the client's original method, path, query, and body. This lets a Codex catalog route use the authenticated ChatGPT catalog as an inheritance donor. Auxiliary sources receive their own provider credentials and headers, without client headers.
+The response retains the envelope and headers of the first successful remote source matching the output format, in provider-name order. If none matches, it uses a standard envelope and fresh headers. File sources contribute rows only. Use complete catalog endpoints: upstream pagination is not implemented, and `has_more = true` is rejected. Anthropic `first_id`, `last_id`, and `has_more` describe the final merged list.
+
+Only the selected client's provider receives incoming credentials, headers, and query parameters during catalog fetching. Every remote catalog uses its configured path and a GET request with an empty body. Other sources receive only their own configured credentials and headers; a passthrough source without matching client ownership is queried anonymously. Providers without a catalog source do not participate in catalog refreshes.
 
 ### Metadata and inheritance
 
@@ -90,7 +107,7 @@ reasoning_levels = [
 - References resolve against the same refresh, including hidden donor rows and donor shared settings. The donor's own `extends` is not followed.
 - When the donor matches the output format, its complete row is copied and local shared settings are applied. Same-format local rows also retain their native fields. Provider endpoints and authentication are never inherited.
 - Omitted descriptions and reasoning settings inherit. In Codex output, an omitted local name becomes the local model ID; inherited instruction identities are rewritten as described in [Codex metadata](docs/codex.md#model-metadata).
-- When only the local source matches the output, local fields are retained and missing shared fields can come from the donor. If neither matches, the row is omitted from that output but its ID remains routable. OpenAI rows therefore need a Codex donor to appear in Codex output.
+- When only the local source matches the output, local fields are retained and missing shared fields can come from the donor. If neither matches, OpenAI and Anthropic output use the model ID and shared metadata to build a basic row; opaque native fields are not copied. Synthesized OpenAI rows use the configured provider name for `owned_by`, and synthesized timestamps use the Unix epoch to represent an unknown release time. Codex output still needs a native Codex row or donor; otherwise the row is omitted but its ID remains routable.
 
 Additional metadata keys are merged into source-format rows: objects merge recursively, while arrays and scalars replace earlier values. Cross-format inheritance carries shared metadata rather than arbitrary local native fields. Metadata values are not semantically validated, but rows must have valid IDs and overrides cannot change a source ID.
 
@@ -98,7 +115,9 @@ Additional metadata keys are merged into source-format rows: objects merge recur
 
 Each catalog request refreshes all configured remote catalogs and optional discovery sources. There is no background refresh. IDs in explicit `models` tables and file catalogs are routable at startup; other remote IDs require a successful catalog request. A model-only route does not initiate discovery.
 
-All sources, references, and ownership checks must succeed before a refresh is published. A catalog fetch failure, missing donor, or ownership conflict rejects the refresh and preserves the previous routing data and subagent listing. Optional discovery failures instead contribute no capability facts.
+Catalogs are merged on a best-effort basis: transport failures and non-200 responses omit that source, while successful remote catalogs (including empty ones) and file catalogs still contribute. Each remote catalog request has a three-second timeout covering connection, response headers, and body transfer. Models whose inheritance donor's source is unavailable are omitted from Codex output and subagent listings; OpenAI and Anthropic output can still describe them using their own source metadata. If every catalog source fails, the client's provider supplies the error when it has a catalog source; otherwise the first source in provider-name order supplies it. The previous routing data and subagent listing are preserved.
+
+Successful partial refreshes update the catalog and subagent listing together; unavailable models retain their known routes but are no longer advertised. Invalid catalog data, missing donors from successful sources, and ownership conflicts still reject the refresh without publishing changes. Optional discovery failures contribute no capability facts.
 
 IDs removed by a later successful refresh remain owned and routable until restart, but are no longer advertised. Hidden models likewise remain routable and participate in ownership checks. The router never reads client cache files.
 
@@ -130,7 +149,7 @@ Discovery refines catalog metadata; it does not translate inference requests or 
 
 HTTP model routing buffers requests to read `model`. Forward routes stream requests; inference responses stream except for Codex JSON responses that require inspection. Unchanged traffic preserves payload bytes and trailers. The router adds no payload or concurrency cap.
 
-Merged catalogs use gzip when accepted, otherwise uncompressed JSON. Encoding exclusions and explicit identity preferences are respected; rejecting both supported encodings returns 406. Merged responses discard stale lengths, integrity fields, and cache validators, and vary on `Accept-Encoding`.
+Merged catalogs use gzip when accepted, otherwise uncompressed JSON. Encoding exclusions and explicit identity preferences are respected; rejecting both supported encodings returns 406. Merged responses discard stale lengths, integrity fields, and cache validators, and vary on `Accept-Encoding`, `Originator`, and `Anthropic-Version`.
 
 Generic WebSocket model routes require `x-model: <native ID>` and tunnel bytes after the handshake. Reconnect to change providers. [Codex WebSocket routing](docs/codex.md#websocket-routing) supports per-request selection and has separate fallback behavior. Clients own fallback to HTTP when an upstream rejects WebSocket.
 
