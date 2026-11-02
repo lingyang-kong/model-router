@@ -38,7 +38,7 @@ Define rules with `[[routes]]`. Rules can match `method`, `path` or `path_prefix
 
 | Action | Behavior |
 | --- | --- |
-| `forward` | Stream to the required `provider`. |
+| `forward` | Stream to `provider`, or the selected client's provider when omitted. |
 | `model` | Route by the top-level JSON `model`, using the client's configured provider as a fallback. |
 | `catalog` | Merge all configured provider catalogs in the client's format. |
 
@@ -57,7 +57,16 @@ action = "catalog"
 
 Supported client profiles are `codex`, `anthropic`, and `openai`. A Codex `originator` header selects `codex`; otherwise `anthropic-version` selects `anthropic`; other requests select `openai`. Profiles are optional. Their `format` defaults to the client's name, and `provider` has no default. For example, an unconfigured OpenAI client gets an OpenAI catalog and can route known model IDs without using ChatGPT credentials.
 
-A client's provider identifies the owner of incoming credentials and supplies fallback routing for empty bodies, missing HTTP models, or unknown IDs. Routing inference from that provider to another `passthrough` provider is rejected; configure the destination's credentials on the router. Catalog and model routes do not accept `provider` or `format`; explicit `forward` routes still name their destination.
+A client's provider identifies the owner of incoming credentials and supplies fallback routing for empty bodies, missing HTTP models, or unknown IDs. Routing inference from that provider to another `passthrough` provider is rejected; configure the destination's credentials on the router. Catalog and model routes do not accept `provider` or `format`; `forward` routes can name their destination explicitly.
+
+To forward auxiliary requests such as webtools, append a catch-all after the catalog and model rules:
+
+```toml
+[[routes]]
+action = "forward"
+```
+
+This streams HTTP bodies and tunnels WebSockets to the selected client's provider without model inspection or inference adaptation. Each client using this route needs a `provider` in its profile (`codex`, `openai`, or `anthropic`); a missing provider returns 400. The example config enables this for Codex. Earlier matching rules retain priority, and configurations without a catch-all still reject unmatched requests with 404.
 
 The full incoming path is appended to `base_url`: a base ending in `/v1` plus `/responses` becomes `/v1/responses`. Incoming queries are preserved; base URLs cannot contain queries. Paths changed by URL normalization, such as dot segments or backslashes, are rejected. Upstream redirects are not followed. Loopback upstreams bypass proxy environment variables; remote upstreams honor them.
 

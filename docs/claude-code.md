@@ -30,9 +30,14 @@ provider = "anthropic"
 [[routes]]
 path_prefix = "/v1/messages"
 action = "model"
+
+[[routes]]
+action = "forward"
 ```
 
 Replace the inference URL and `vendor/model` with your server's URL and exact model ID. The explicit model table registers its route at startup; other IDs use Anthropic. These base URLs omit `/v1` because Claude supplies `/v1/messages` and `/v1/messages/count_tokens`.
+
+Keep the catch-all `forward` rule last. It sends auxiliary requests, including `/v1/models/<id>` and `/v1/files`, to `[clients.anthropic].provider` without inspecting their bodies. The earlier Messages rule still routes inference and token counting by model.
 
 ## Client setup
 
