@@ -166,6 +166,11 @@ async fn handle_request(
         .or_else(|| profile.and_then(|profile| profile.provider.as_deref()))
         .map(|name| state.config.provider(name))
         .transpose()?;
+    if matches!(action, RouteAction::Forward { .. }) && origin.is_none() {
+        return Err(Error::bad_request(
+            "Forward routes require a provider in the route or selected client profile",
+        ));
+    }
     if header_has_token(request.headers(), "upgrade", "websocket") {
         return websocket::forward(&state, request, action, origin, adapter).await;
     }

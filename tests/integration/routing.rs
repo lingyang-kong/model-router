@@ -20,6 +20,174 @@ use tokio::{
 use crate::common::*;
 
 #[tokio::test]
+async fn example_auxiliary_routes_use_each_clients_provider_without_model_inspection() {
+    async fn capture(request: Request) -> Json<Value> {
+        let (parts, body) = request.into_parts();
+        let bytes = to_bytes(body, usize::MAX).await.unwrap();
+        Json(json!({
+            "method":parts.method.as_str(), "path":parts.uri.path(),
+            "query":parts.uri.query(), "bytes":bytes.to_vec(),
+            "authorization":parts.headers.get("authorization").and_then(|v| v.to_str().ok()),
+            "cookie":parts.headers.get("cookie").and_then(|v| v.to_str().ok()),
+            "encoding":parts.headers.get("content-encoding").and_then(|v| v.to_str().ok()),
+        }))
+    }
+    let backend = serve(Router::new().fallback(capture)).await;
+    let root = tempfile::tempdir().unwrap();
+    let configuration = include_str!("../../examples/router-config.toml")
+        .replace(
+            "https://chatgpt.com/backend-api/codex",
+            &(backend.url.clone() + "/chatgpt"),
+        )
+        .replace("http://localhost:30000", &backend.url)
+        + "\n[clients.openai]\nprovider = 'sglang'\n[clients.anthropic]\nprovider = 'chatgpt'\n";
+    let gateway = serve(
+        router(model_router::Config::from_toml(&configuration, root.path()).unwrap()).unwrap(),
+    )
+    .await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let native = "RadixArk/Qwen3.8-Flash-Next-NVFP4";
+    let model_body = json!({"model":native}).to_string();
+    for (header, value, prefix, credentials) in [
+        ("originator", "codex_cli_rs", "/chatgpt", true),
+        ("originator", "opencode", "/v1", false),
+        ("anthropic-version", "2023-06-01", "/chatgpt", true),
+    ] {
+        for (method, path, body) in [
+            (
+                Method::POST,
+                "/webtools?query=a%2Fb&query=c",
+                br#"{"search_query":[{"q":"test"}]}"#.as_slice(),
+            ),
+            (Method::POST, "/webtools", model_body.as_bytes()),
+            (Method::POST, "/tools/execute", br#"{"model":7}"#),
+            (Method::PUT, "/files/upload", b"\x00\xff\x03\r"),
+            (Method::GET, "/tools?list=1", b""),
+            (Method::DELETE, "/files/id", b""),
+        ] {
+            let response = client
+                .request(method.clone(), gateway.url.clone() + path)
+                .header(header, value)
+                .bearer_auth("client-token")
+                .header("cookie", "client-cookie")
+                .body(body.to_vec())
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{value}: {path}");
+            let response: Value = response.json().await.unwrap();
+            let (path, query) = path
+                .split_once('?')
+                .map_or((path, None), |(p, q)| (p, Some(q)));
+            assert_eq!(response["path"], format!("{prefix}{path}"));
+            assert_eq!(response["query"], json!(query));
+            assert_eq!(response["method"], method.as_str());
+            assert_eq!(response["bytes"], json!(body));
+            assert_eq!(
+                response["authorization"],
+                json!(credentials.then_some("Bearer client-token"))
+            );
+            assert_eq!(
+                response["cookie"],
+                json!(credentials.then_some("client-cookie"))
+            );
+        }
+        // The preceding model rule still owns inference and validates its selector.
+        let response: Value = client
+            .post(gateway.url.clone() + "/responses")
+            .header(header, value)
+            .body(model_body.clone())
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(response["path"], "/v1/responses");
+        assert_eq!(
+            client
+                .post(gateway.url.clone() + "/responses")
+                .header(header, value)
+                .body(r#"{"model":7}"#)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    // An opaque forward route must not attempt to decode even an unknown encoding.
+    let response: Value = client
+        .post(gateway.url.clone() + "/webtools")
+        .header("originator", "codex_cli_rs")
+        .header("content-encoding", "custom")
+        .body(vec![0, 255, 3])
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(response["encoding"], "custom");
+    assert_eq!(response["bytes"], json!([0, 255, 3]));
+}
+
+#[tokio::test]
+async fn forward_requires_a_route_or_selected_client_provider() {
+    let backend = serve(Router::new().fallback(|| async { StatusCode::NO_CONTENT })).await;
+    let root = tempfile::tempdir().unwrap();
+    let config = parse_config(
+        &json!({
+            "providers":{"api":{"base_url":backend.url,"auth":"none"}},
+            "clients":{"codex":{"provider":"api"},"anthropic":{"format":"anthropic"}},
+            "routes":[
+                {"path":"/explicit","action":"forward","provider":"api"},
+                {"action":"forward"}
+            ]
+        })
+        .to_string(),
+        root.path(),
+    )
+    .unwrap();
+    let gateway = serve(router(config).unwrap()).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for (header, value) in [
+        ("originator", "opencode"),
+        ("anthropic-version", "2023-06-01"),
+    ] {
+        let response = client
+            .post(gateway.url.clone() + "/webtools")
+            .header(header, value)
+            .body(r#"{"model":"anything"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            response
+                .text()
+                .await
+                .unwrap()
+                .contains("selected client profile")
+        );
+        assert_eq!(
+            client
+                .post(gateway.url.clone() + "/explicit")
+                .header(header, value)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+}
+
+#[tokio::test]
 async fn path_normalization_cannot_escape_route_or_provider_prefix() {
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let captured = seen.clone();

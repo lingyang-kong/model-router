@@ -103,7 +103,7 @@ pub(crate) struct Route {
 #[derive(Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum RouteAction {
-    Forward { provider: String },
+    Forward { provider: Option<String> },
     Model {},
     Catalog {},
 }
@@ -161,7 +161,7 @@ fn deserialize_static_headers<'de, D: Deserializer<'de>>(
 impl RouteAction {
     pub fn provider(&self) -> Option<&str> {
         match self {
-            Self::Forward { provider } => Some(provider),
+            Self::Forward { provider } => provider.as_deref(),
             Self::Model {} | Self::Catalog {} => None,
         }
     }
