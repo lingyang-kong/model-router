@@ -41,3 +41,6 @@ action = "catalog"
 [[routes]]
 path_prefix = "/responses"
 action = "model"
+
+[[routes]]
+action = "forward"

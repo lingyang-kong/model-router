@@ -263,31 +263,38 @@ async fn opaque_requests_forward_before_the_rest_of_the_body_arrives() {
     }
     let backend = serve(Router::new().fallback(receive).with_state(arrived.clone())).await;
     let root = tempfile::tempdir().unwrap();
-    let config = parse_config(&json!({"providers":{"backend":{"base_url":backend.url,"auth":"none"}},"routes":[{"headers":{"x-target":"backend"},"action":"forward","provider":"backend"}]}).to_string(),root.path()).unwrap();
+    let config = parse_config(&json!({"clients":{"codex":{"provider":"backend"}},"providers":{"backend":{"base_url":backend.url,"auth":"none"}},"routes":[{"headers":{"x-target":"backend"},"action":"forward","provider":"backend"},{"action":"forward"}]}).to_string(),root.path()).unwrap();
     let gateway = serve(router(config).unwrap()).await;
-    let first = Bytes::from_static(b"opaque-prefix|");
-    let remaining = futures_util::stream::once(async move {
-        timeout(Duration::from_secs(2), arrived.notified())
+    for explicit in [true, false] {
+        let arrived = arrived.clone();
+        let first = Bytes::from_static(b"opaque-prefix|");
+        let remaining = futures_util::stream::once(async move {
+            timeout(Duration::from_secs(2), arrived.notified())
+                .await
+                .expect("router waited for the request body before forwarding");
+            Ok::<_, std::io::Error>(Bytes::from_static(b"opaque-suffix"))
+        });
+        let stream = futures_util::stream::once(async move { Ok::<_, std::io::Error>(first) })
+            .chain(remaining);
+        let mut request = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .post(gateway.url.clone() + "/anything")
+            .header("originator", "codex_cli_rs");
+        if explicit {
+            request = request.header("x-target", "backend");
+        }
+        let response: Value = request
+            .body(reqwest::Body::wrap_stream(stream))
+            .send()
             .await
-            .expect("router waited for the request body before forwarding");
-        Ok::<_, std::io::Error>(Bytes::from_static(b"opaque-suffix"))
-    });
-    let stream =
-        futures_util::stream::once(async move { Ok::<_, std::io::Error>(first) }).chain(remaining);
-    let response: Value = reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .unwrap()
-        .post(gateway.url.clone() + "/anything")
-        .header("x-target", "backend")
-        .body(reqwest::Body::wrap_stream(stream))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(response["body"], "opaque-prefix|opaque-suffix");
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(response["body"], "opaque-prefix|opaque-suffix");
+    }
 }
 
 async fn gateway(upstream: &Server, routes: Value) -> Server {

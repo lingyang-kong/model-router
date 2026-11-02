@@ -455,6 +455,71 @@ async fn client_disconnect_cancels_a_pending_upstream_handshake() {
 }
 
 #[tokio::test]
+async fn profile_forward_websockets_use_client_provider_without_model_hints() {
+    async fn upgrade(request: Request) -> Response {
+        let (mut parts, _) = request.into_parts();
+        let path = parts.uri.path().to_owned();
+        let websocket = WebSocketUpgrade::from_request_parts(&mut parts, &())
+            .await
+            .unwrap();
+        websocket.on_upgrade(move |mut socket| async move {
+            socket.send(Message::Text(path.into())).await.unwrap();
+            while let Some(Ok(message)) = socket.recv().await {
+                if matches!(message, Message::Text(_) | Message::Binary(_)) {
+                    if socket.send(message).await.is_err() {
+                        break;
+                    }
+                } else if matches!(message, Message::Close(_)) {
+                    break;
+                }
+            }
+        })
+    }
+    let backend = serve(Router::new().fallback(upgrade)).await;
+    let root = tempfile::tempdir().unwrap();
+    let config = parse_config(&json!({"clients":{"codex":{"provider":"codex"},"openai":{"provider":"openai"}},"providers":{"codex":{"base_url":format!("{}/codex",backend.url),"auth":"none"},"openai":{"base_url":format!("{}/openai",backend.url),"auth":"none"}},"routes":[{"action":"forward"}]}).to_string(), root.path()).unwrap();
+    let gateway = serve(router(config).unwrap()).await;
+    let url = gateway.url.replace("http:", "ws:") + "/webtools";
+    for (originator, expected) in [
+        ("codex_cli_rs", "/codex/webtools"),
+        ("opencode", "/openai/webtools"),
+    ] {
+        let mut request = url.clone().into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("originator", originator.parse().unwrap());
+        let (mut socket, _) = connect_async(request).await.unwrap();
+        assert_eq!(
+            socket.next().await.unwrap().unwrap().into_text().unwrap(),
+            expected
+        );
+        for frame in [
+            tungstenite::Message::Text("opaque frame".into()),
+            tungstenite::Message::Binary(vec![0, 255, 9].into()),
+        ] {
+            socket.send(frame.clone()).await.unwrap();
+            assert_eq!(
+                timeout(Duration::from_secs(2), socket.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap(),
+                frame
+            );
+        }
+        socket.close(None).await.unwrap();
+    }
+    let mut request = url.into_client_request().unwrap();
+    request
+        .headers_mut()
+        .insert("anthropic-version", "2023-06-01".parse().unwrap());
+    let tungstenite::Error::Http(response) = connect_async(request).await.unwrap_err() else {
+        panic!("Expected missing provider rejection");
+    };
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn forwarding_rule_relays_non_json_websocket_frames() {
     async fn upgrade(request: Request) -> Response {
         let (mut parts, _) = request.into_parts();
