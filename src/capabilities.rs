@@ -105,18 +105,33 @@ pub(crate) fn parse(document: &Value) -> Discovery {
     found.tools_paths = declared_tool_paths(document);
 
     // Agreeing detail enums establish whether `original` is accepted.
-    let mut visited = BTreeSet::new();
     let mut image_constraints = Vec::new();
     if let Some(paths) = root.get("paths").and_then(Value::as_object) {
         for (path, item) in paths {
             if !path.ends_with("/responses") {
                 continue;
             }
+            if !item.get("post").is_some_and(Value::is_object) {
+                continue;
+            }
             let Some(schema) = item.pointer("/post/requestBody/content/application~1json/schema")
             else {
+                image_constraints.push(None);
                 continue;
             };
-            image_original_from_schema(schema, document, &mut visited, &mut image_constraints, 0);
+            let mut constraints = Vec::new();
+            image_original_from_schema(
+                schema,
+                document,
+                &mut BTreeSet::new(),
+                &mut constraints,
+                0,
+                false,
+            );
+            if constraints.is_empty() {
+                constraints.push(None);
+            }
+            image_constraints.extend(constraints);
         }
     }
     if found.capabilities.image_detail_original.is_none()
@@ -577,24 +592,42 @@ fn image_original_from_schema(
     visited: &mut BTreeSet<String>,
     constraints: &mut Vec<Option<bool>>,
     depth: usize,
+    variant: bool,
 ) {
     if depth > 32 {
+        constraints.push(None);
         return;
     }
     if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
         if !visited.insert(reference.to_owned()) {
+            constraints.push(None);
             return;
         }
         let Some(target) = reference.strip_prefix("#/components/schemas/") else {
+            constraints.push(None);
             return;
         };
         let Some(schema) = document.pointer(&format!("/components/schemas/{target}")) else {
+            constraints.push(None);
             return;
         };
-        image_original_from_schema(schema, document, visited, constraints, depth + 1);
+        image_original_from_schema(schema, document, visited, constraints, depth + 1, variant);
+        visited.remove(reference);
         return;
     }
     let props = schema.get("properties").and_then(Value::as_object);
+    let initial_constraints = constraints.len();
+    // An unconstrained branch may describe an image whose detail support is unknown.
+    if variant
+        && props.is_none()
+        && ["anyOf", "oneOf", "allOf", "items", "const", "enum"]
+            .iter()
+            .all(|key| schema.get(key).is_none())
+        && !matches!(schema.get("type").and_then(Value::as_str), Some(kind) if kind != "object")
+        && schema != &Value::Bool(false)
+    {
+        constraints.push(None);
+    }
     let is_input_image = props
         .and_then(|p| p.get("type"))
         .and_then(|t| t.get("const"))
@@ -603,23 +636,33 @@ fn image_original_from_schema(
     if is_input_image {
         let fact = props
             .and_then(|p| p.get("detail"))
-            .and_then(|detail| find_closed_enum(detail, document, visited, depth + 1))
+            .and_then(|detail| find_closed_enum(detail, document, &mut visited.clone(), depth + 1))
             .map(|values| values.iter().any(|v| v.as_str() == Some("original")));
         constraints.push(fact);
     }
     for key in ["anyOf", "oneOf", "allOf"] {
         if let Some(items) = schema.get(key).and_then(Value::as_array) {
             for item in items {
-                image_original_from_schema(item, document, visited, constraints, depth + 1);
+                image_original_from_schema(item, document, visited, constraints, depth + 1, true);
             }
         }
     }
     if let Some(item_schema) = schema.get("items") {
-        image_original_from_schema(item_schema, document, visited, constraints, depth + 1);
+        image_original_from_schema(item_schema, document, visited, constraints, depth + 1, true);
     }
     if let Some(props) = props {
         for child in props.values() {
-            image_original_from_schema(child, document, visited, constraints, depth + 1);
+            image_original_from_schema(child, document, visited, constraints, depth + 1, false);
+        }
+        // Untagged objects with no known image descendant do not establish that
+        // every image variant was described. Explicit non-image tags can be skipped.
+        let non_image_tag = props
+            .get("type")
+            .and_then(|tag| tag.get("const"))
+            .and_then(Value::as_str)
+            .is_some_and(|tag| tag != "input_image");
+        if variant && constraints.len() == initial_constraints && !non_image_tag {
+            constraints.push(None);
         }
     }
 }
@@ -641,12 +684,14 @@ fn find_closed_enum(
             return None;
         }
         let target = reference.strip_prefix("#/components/schemas/")?;
-        return find_closed_enum(
+        let result = find_closed_enum(
             document.pointer(&format!("/components/schemas/{target}"))?,
             document,
             visited,
             depth + 1,
         );
+        visited.remove(reference);
+        return result;
     }
     for key in ["anyOf", "oneOf"] {
         if let Some(items) = schema.get(key).and_then(Value::as_array) {
@@ -1242,6 +1287,92 @@ mod tests {
                 .image_detail_original,
             None
         );
+    }
+
+    #[test]
+    fn every_responses_post_schema_must_establish_image_detail_support() {
+        for original in [false, true] {
+            let details = if original {
+                json!(["low", "original"])
+            } else {
+                json!(["low"])
+            };
+            let image = json!({"properties": {
+                "type":{"const":"input_image"}, "detail":{"enum":details}
+            }});
+            let known_post =
+                json!({"requestBody":{"content":{"application/json":{"schema":image}}}});
+            for unknown_post in [
+                json!({}),
+                json!({"requestBody":{"content":{"application/json":{"schema":{}}}}}),
+                json!({"requestBody":{"content":{"application/json":{"schema":{"$ref":"#/components/schemas/Missing"}}}}}),
+                json!({"requestBody":{"content":{"application/json":{"schema":{"properties":{"input":{"type":"string"}}}}}}}),
+            ] {
+                let d = parse(&json!({"paths":{
+                    "/responses":{"post":known_post},
+                    "/v1/responses":{"post":unknown_post}
+                }}));
+                assert_eq!(d.capabilities.image_detail_original, None);
+            }
+            let d = parse(&json!({"paths":{
+                "/responses":{"post":known_post},
+                "/v1/responses":{"get":{}},
+                "/other":{"post":{}}
+            }}));
+            assert_eq!(d.capabilities.image_detail_original, Some(original));
+        }
+    }
+
+    #[test]
+    fn unknown_image_schema_branches_are_not_dropped() {
+        let image = json!({"properties": {
+            "type":{"const":"input_image"}, "detail":{"enum":["low"]}
+        }});
+        for unknown in [
+            json!({}),
+            json!({"type":"object"}),
+            json!({"properties":{"detail":{"type":"string"}}}),
+            json!(true),
+            json!({"$ref":"#/components/schemas/Missing"}),
+            json!({"$ref":"https://example.com/schema"}),
+            json!({"$ref":"#/components/schemas/Cycle"}),
+        ] {
+            let d = parse(&json!({
+                "paths":{"/responses":{"post":{"requestBody":{"content":{
+                    "application/json":{"schema":{"anyOf":[image, unknown]}}
+                }}}}},
+                "components":{"schemas":{"Cycle":{"$ref":"#/components/schemas/Cycle"}}}
+            }));
+            assert_eq!(d.capabilities.image_detail_original, None);
+        }
+    }
+
+    #[test]
+    fn repeated_image_references_keep_known_facts() {
+        for original in [false, true] {
+            let details = if original {
+                json!(["low", "original"])
+            } else {
+                json!(["low"])
+            };
+            let post = json!({"requestBody":{"content":{"application/json":{"schema":{"properties":{
+                "metadata":{},
+                "input":{"items":{"anyOf":[
+                    {"$ref":"#/components/schemas/Image"},
+                    {"$ref":"#/components/schemas/Image"},
+                    {"$ref":"#/components/schemas/Text"}
+                ]}}
+            }}}}}});
+            let d = parse(&json!({
+                "paths":{"/responses":{"post":post}, "/v1/responses":{"post":post}},
+                "components":{"schemas":{"Image":{"properties":{
+                    "type":{"const":"input_image"}, "detail":{"$ref":"#/components/schemas/Detail"}
+                }}, "Detail":{"enum":details}, "Text":{"properties":{
+                    "type":{"const":"input_text"}, "text":{"type":"string"}
+                }}}}
+            }));
+            assert_eq!(d.capabilities.image_detail_original, Some(original));
+        }
     }
 
     #[test]
