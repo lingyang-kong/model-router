@@ -125,7 +125,7 @@ pub fn router(config: Config) -> anyhow::Result<Router> {
             .all(|provider| provider.catalog.is_none() || from_file(provider));
     let state = RouterState {
         config,
-        catalog: RwLock::new(CatalogState { models, ready }),
+        catalog: RwLock::new(CatalogState::new(models, ready)),
         client: build_http_client(false)?,
         loopback_client: build_http_client(true)?,
     };

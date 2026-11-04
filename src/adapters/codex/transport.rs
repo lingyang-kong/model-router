@@ -137,7 +137,7 @@ pub(in crate::adapters) async fn websocket_request(
     let prepared = match prepare_request(
         &context.state,
         &context.provider,
-        Some(&context.provider),
+        context.origin.as_ref(),
         &parts,
         text.as_bytes(),
         metadata.model.as_deref().or(context.model.as_deref()),
@@ -245,7 +245,12 @@ async fn prepare_request(
     }
     let bytes = prepared.rewritten.as_deref().unwrap_or(bytes);
     if multiagent::request_may_need_adaptation(bytes) {
-        let listing = model_listing(state).await;
+        let listing = state
+            .catalog
+            .read()
+            .await
+            .listing(&parts.headers, origin)
+            .to_owned();
         let rewritten =
             prepare_multiagent(state, provider, origin, parts, bytes, model, &listing).await?;
         prepared.rewritten = rewritten.or(prepared.rewritten);
@@ -277,40 +282,4 @@ pub(super) async fn prepare_multiagent(
             .await
             == Some(false);
     multiagent::prepare_bytes(bytes, convert, listing).map_err(Error::bad_request)
-}
-
-async fn model_listing(state: &RouterState) -> String {
-    let catalog = state.catalog.read().await;
-    if !catalog.ready {
-        return String::new();
-    }
-    let mut listing = String::from(
-        "Available model overrides (optional; inherited parent model is preferred):\n",
-    );
-    for (id, entry) in &catalog.models {
-        if !entry.listed || entry.provider.hidden_models.is_match(id) {
-            continue;
-        }
-        listing.push_str("- ");
-        listing.push_str(id);
-        if let Some(description) = entry.metadata.get("description").and_then(Value::as_str) {
-            listing.push_str(": ");
-            listing.push_str(description);
-        }
-        let shared = entry.format.shared_metadata(&entry.metadata);
-        if let Some(levels) = shared.get("reasoning_levels").and_then(Value::as_array) {
-            let levels: Vec<_> = levels
-                .iter()
-                .filter_map(|level| level.get("level").and_then(Value::as_str))
-                .collect();
-            if !levels.is_empty() {
-                listing.push_str(". Reasoning efforts: ");
-                listing.push_str(&levels.join(", "));
-                listing.push('.');
-            }
-        }
-        listing.push('\n');
-    }
-    listing.push('\n');
-    listing
 }

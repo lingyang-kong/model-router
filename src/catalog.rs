@@ -1,4 +1,10 @@
-use std::{io, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, hash_map::RandomState},
+    hash::{BuildHasher, Hash, Hasher},
+    io,
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     body::Body,
@@ -13,7 +19,7 @@ use tokio_util::io::StreamReader;
 
 use crate::{
     Config,
-    adapters::CatalogFormat,
+    adapters::{CatalogFormat, ClientKind},
     capabilities::{self, Discovery},
     compression::{accepts_gzip, decode_body, encode_body},
     config::{Provider, header_has_token},
@@ -35,8 +41,100 @@ pub(crate) type ModelRegistry = IndexMap<String, ModelEntry>;
 
 pub(crate) struct CatalogState {
     pub models: ModelRegistry,
-    /// Distinguishes an authoritative empty catalog from discovery not yet completed.
-    pub ready: bool,
+    listings: BTreeMap<(ClientKind, Option<usize>, u64), String>,
+    credentials: RandomState,
+    file_listing: Option<String>,
+}
+
+impl CatalogState {
+    pub fn new(models: ModelRegistry, ready: bool) -> Self {
+        let file_listing = ready.then(|| model_listing(&models));
+        Self {
+            models,
+            listings: BTreeMap::new(),
+            credentials: RandomState::new(),
+            file_listing,
+        }
+    }
+
+    fn scope(
+        &self,
+        headers: &HeaderMap,
+        origin: Option<&Arc<Provider>>,
+    ) -> (ClientKind, Option<usize>, u64) {
+        // Keep only a process-keyed fingerprint, never the incoming credentials.
+        // Sorting names makes header insertion order irrelevant; repeated values matter.
+        let mut names: Vec<_> = headers
+            .keys()
+            .filter(|name| {
+                matches!(
+                    name.as_str(),
+                    "authorization"
+                        | "cookie"
+                        | "openai-organization"
+                        | "openai-project"
+                        | "x-api-key"
+                        | "api-key"
+                        | "chatgpt-account-id"
+                        | "x-openai-organization"
+                        | "x-openai-project"
+                )
+            })
+            .collect();
+        names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        let mut fingerprint = self.credentials.build_hasher();
+        for name in names {
+            name.as_str().hash(&mut fingerprint);
+            for value in headers.get_all(name) {
+                value.as_bytes().hash(&mut fingerprint);
+            }
+        }
+        (
+            ClientKind::from_headers(headers),
+            origin.map(|provider| Arc::as_ptr(provider) as usize),
+            fingerprint.finish(),
+        )
+    }
+
+    pub fn listing(&self, headers: &HeaderMap, origin: Option<&Arc<Provider>>) -> &str {
+        self.listings
+            .get(&self.scope(headers, origin))
+            .or(self.file_listing.as_ref())
+            .map(String::as_str)
+            .unwrap_or_default()
+    }
+}
+
+fn model_listing(models: &ModelRegistry) -> String {
+    let mut listing = String::from(
+        "Available model overrides (optional; inherited parent model is preferred):\n",
+    );
+    for (id, entry) in models {
+        if !entry.listed || entry.provider.hidden_models.is_match(id) {
+            continue;
+        }
+        listing.push_str("- ");
+        listing.push_str(id);
+        if let Some(description) = entry.metadata.get("description").and_then(Value::as_str) {
+            listing.push_str(": ");
+            listing.push_str(description);
+        }
+        let shared = entry.format.shared_metadata(&entry.metadata);
+        if let Some(levels) = shared.get("reasoning_levels").and_then(Value::as_array) {
+            let levels: Vec<_> = levels
+                .iter()
+                .filter_map(|level| level.get("level").and_then(Value::as_str))
+                .collect();
+            if !levels.is_empty() {
+                listing.push_str(". Reasoning efforts: ");
+                listing.push_str(&levels.join(", "));
+                listing.push('.');
+            }
+        }
+        listing.push('\n');
+    }
+    listing.push('\n');
+    listing
 }
 
 /// Object fields combine recursively; arrays and scalar values replace the old value.
@@ -473,15 +571,9 @@ impl RouterState {
         for (id, entry) in &staged {
             validate_ownership(&self.config, &catalog.models, id, &entry.provider)?;
         }
-        for entry in catalog.models.values_mut() {
-            if origin.is_some_and(|origin| Arc::ptr_eq(&entry.provider, origin))
-                || entry.provider.catalog.is_some()
-            {
-                entry.listed = false;
-            }
-        }
+        let scope = catalog.scope(&incoming_headers, origin);
+        catalog.listings.insert(scope, model_listing(&staged));
         catalog.models.extend(staged);
-        catalog.ready = true;
         drop(catalog);
         // FuturesOrdered preserves provider-name order. File sources supply rows
         // only; credentials never determine the response envelope.
