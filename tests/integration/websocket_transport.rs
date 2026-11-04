@@ -30,6 +30,286 @@ struct Backend {
 }
 type RecordedRequest = (bool, Option<String>, Value);
 
+#[derive(Clone, Default)]
+struct PreparationGate {
+    started: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    worker_finish: Arc<tokio::sync::Notify>,
+    worker_closed: Arc<tokio::sync::Notify>,
+    primary_close: Arc<tokio::sync::Notify>,
+    primary_closed: Arc<tokio::sync::Notify>,
+    probes: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy)]
+enum DuringPreparation {
+    Complete,
+    Cancel,
+    Reconnect,
+}
+
+#[tokio::test]
+async fn upstream_close_racing_opaque_and_pong_frames_ends_session() {
+    for eof in [false, true] {
+        let close = Arc::new(tokio::sync::Notify::new());
+        let primary = serve(Router::new().fallback({
+            let close = Arc::clone(&close);
+            move |ws: WebSocketUpgrade| {
+                let close = Arc::clone(&close);
+                async move {
+                    ws.on_upgrade(move |mut socket| async move {
+                        close.notified().await;
+                        if !eof {
+                            let _ = socket
+                                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                                    code: 1001,
+                                    reason: "upstream leaving".into(),
+                                })))
+                                .await;
+                            let _ = socket.recv().await;
+                        }
+                    })
+                }
+            }
+        }))
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let config = parse_config(&json!({
+            "clients":{"codex":{"provider":"primary"},"openai":{"provider":"primary"},"anthropic":{"provider":"primary"}},
+            "providers":{"primary":{"base_url":primary.url,"auth":"none","models":{"primary":{}}}},
+            "routes":[{"action":"model"}]
+        }).to_string(), root.path()).unwrap();
+        let gateway = serve(router(config).unwrap()).await;
+        for i in 0..80 {
+            let mut request = format!("{}/responses", gateway.url.replace("http:", "ws:"))
+                .into_client_request()
+                .unwrap();
+            request
+                .headers_mut()
+                .insert("originator", "codex_cli_rs".parse().unwrap());
+            request
+                .headers_mut()
+                .insert("x-codex-routing-hint", "model=primary".parse().unwrap());
+            let (mut socket, _) = connect_async(request).await.unwrap();
+            let frame = if i % 2 == 0 {
+                tungstenite::Message::Text("opaque frame".into())
+            } else {
+                tungstenite::Message::Pong(vec![1, 2].into())
+            };
+            socket.send(frame).await.unwrap();
+            close.notify_one();
+            let received = timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("session hung after upstream closed");
+            if eof {
+                assert!(
+                    received.is_none() || matches!(received, Some(Err(_))),
+                    "unexpected frame: {received:?}"
+                );
+            } else {
+                let frame = received
+                    .expect("missing upstream close")
+                    .expect("invalid close");
+                let tungstenite::Message::Close(Some(frame)) = frame else {
+                    panic!("unexpected frame: {frame:?}")
+                };
+                assert_eq!(u16::from(frame.code), 1001);
+                assert_eq!(frame.reason, "upstream leaving");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn pending_preparation_allows_active_response_and_preserves_request_order() {
+    preparation_during_response(DuringPreparation::Complete).await;
+}
+
+#[tokio::test]
+async fn downstream_close_cancels_active_response_during_preparation() {
+    preparation_during_response(DuringPreparation::Cancel).await;
+}
+
+#[tokio::test]
+async fn original_close_during_preparation_reconnects_pending_request() {
+    preparation_during_response(DuringPreparation::Reconnect).await;
+}
+
+async fn preparation_during_response(during: DuringPreparation) {
+    let gate = PreparationGate::default();
+    let backend = Backend {
+        name: "primary",
+        handshake: StatusCode::SWITCHING_PROTOCOLS,
+        upgrades: Arc::default(),
+        requests: Arc::default(),
+    };
+    let primary = serve(Router::new().fallback({
+        let gate = gate.clone();
+        let backend = backend.clone();
+        move |request: Request| {
+            let gate = gate.clone();
+            let backend = backend.clone();
+            async move {
+                if request.headers().contains_key("upgrade") {
+                    if matches!(during, DuringPreparation::Reconnect) && backend.upgrades.load(Ordering::Relaxed) == 0 {
+                        backend.upgrades.fetch_add(1, Ordering::Relaxed);
+                        let (mut parts, _) = request.into_parts();
+                        return WebSocketUpgrade::from_request_parts(&mut parts, &()).await.unwrap().on_upgrade(move |mut socket| async move {
+                            gate.primary_close.notified().await;
+                            socket.send(Message::Close(None)).await.unwrap();
+                            let _ = socket.recv().await;
+                            gate.primary_closed.notify_one();
+                        });
+                    }
+                    return endpoint(State(backend), request).await;
+                }
+                if gate.probes.fetch_add(1, Ordering::Relaxed) == 0 {
+                    gate.started.notify_one();
+                    gate.release.notified().await;
+                }
+                (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(json!({"error":{"message":"Unsupported Responses API input item type: 'agent_message'"}}))).into_response()
+            }
+        }
+    })).await;
+    let worker = serve(Router::new().fallback({
+        let gate = gate.clone();
+        move |ws: WebSocketUpgrade| {
+            let gate = gate.clone();
+            async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    socket.recv().await.unwrap().unwrap();
+                    socket.send(Message::Text(json!({"type":"response.created"}).to_string().into())).await.unwrap();
+                    tokio::select! {
+                        _ = gate.worker_finish.notified() => {
+                            let _ = socket.send(Message::Text(json!({"type":"response.completed"}).to_string().into())).await;
+                        }
+                        _ = socket.recv() => gate.worker_closed.notify_one(),
+                    }
+                })
+            }
+        }
+    })).await;
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("models.json"),
+        json!({"models":[{"slug":"primary"}]}).to_string(),
+    )
+    .unwrap();
+    let config = parse_config(&json!({
+        "clients":{"codex":{"provider":"primary"},"openai":{"provider":"primary"},"anthropic":{"provider":"primary"}},
+        "providers":{
+            "primary":{"base_url":primary.url,"auth":"none","catalog":{"file":"models.json","format":"codex"}},
+            "worker":{"base_url":worker.url,"auth":"none","models":{"worker":{}}}
+        },"routes":[{"action":"model"}]
+    }).to_string(),root.path()).unwrap();
+    let gateway = serve(router(config).unwrap()).await;
+    let mut request = format!("{}/responses", gateway.url.replace("http:", "ws:"))
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("originator", "codex_cli_rs".parse().unwrap());
+    request
+        .headers_mut()
+        .insert("x-codex-routing-hint", "model=primary".parse().unwrap());
+    let (mut socket, _) = connect_async(request).await.unwrap();
+    if !matches!(during, DuringPreparation::Reconnect) {
+        socket
+            .send(tungstenite::Message::Text(
+                json!({"type":"response.create","model":"worker"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let created = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&created.into_data()).unwrap()["type"],
+            "response.created"
+        );
+    }
+    socket.send(tungstenite::Message::Text(json!({"type":"response.create","model":"primary","stream_id":"first","tools":[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"spawn_agent","description":"d"}]}],"input":[{"type":"agent_message","author":"worker","content":[{"type":"input_text","text":"hello"}]}]}).to_string().into())).await.unwrap();
+    timeout(Duration::from_secs(2), gate.started.notified())
+        .await
+        .unwrap();
+    socket
+        .send(tungstenite::Message::Text(
+            json!({"type":"response.create","model":"primary","stream_id":"second","input":[]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    if matches!(during, DuringPreparation::Cancel) {
+        socket
+            .send(tungstenite::Message::Close(None))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), gate.worker_closed.notified())
+            .await
+            .expect("active worker was not canceled while preparation was blocked");
+        assert!(backend.requests.lock().unwrap().is_empty());
+    } else {
+        if matches!(during, DuringPreparation::Reconnect) {
+            gate.primary_close.notify_one();
+            timeout(Duration::from_secs(2), gate.primary_closed.notified())
+                .await
+                .unwrap();
+        }
+        if matches!(during, DuringPreparation::Complete) {
+            gate.worker_finish.notify_one();
+            let completed = timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("active response was starved by preparation")
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(&completed.into_data()).unwrap()["type"],
+                "response.completed"
+            );
+        }
+        assert!(backend.requests.lock().unwrap().is_empty());
+        gate.release.notify_one();
+        timeout(Duration::from_secs(2), async {
+            let mut completed = 0;
+            while completed < 2 {
+                let message = socket.next().await.unwrap().unwrap();
+                let event: Value = serde_json::from_slice(&message.into_data()).unwrap();
+                if event["type"] == "response.completed" {
+                    completed += 1;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let requests = backend.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let first = requests
+            .iter()
+            .find(|request| request.2["stream_id"] == "first")
+            .unwrap();
+        let description = first.2["tools"][0]["tools"][0]["description"]
+            .as_str()
+            .unwrap();
+        assert_eq!(description.matches("Available model overrides").count(), 1);
+        let mut ids: Vec<_> = requests
+            .iter()
+            .map(|request| request.2["stream_id"].as_str().unwrap())
+            .collect();
+        if matches!(during, DuringPreparation::Reconnect) {
+            // Reconnected responses use independent sockets; only the original hop
+            // guarantees wire order.
+            ids.sort_unstable();
+            assert_eq!(backend.upgrades.load(Ordering::Relaxed), 3);
+        }
+        assert_eq!(ids, ["first", "second"]);
+    }
+}
+
 #[tokio::test]
 async fn original_socket_close_during_switched_response_allows_reconnection() {
     original_socket_close(true).await;
