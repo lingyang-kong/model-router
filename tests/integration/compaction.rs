@@ -40,6 +40,7 @@ struct Upstream {
     entered: Arc<Notify>,
     cancelled: Arc<AtomicBool>,
     probe_mode: Arc<Mutex<String>>,
+    close_websocket: Arc<Notify>,
 }
 
 async fn endpoint(State(state): State<Upstream>, request: Request) -> Response {
@@ -50,7 +51,15 @@ async fn endpoint(State(state): State<Upstream>, request: Request) -> Response {
             .unwrap();
         return upgrade.on_upgrade(move |mut socket| async move {
             use axum::extract::ws::Message;
-            while let Some(Ok(message)) = socket.recv().await {
+            loop {
+                let incoming = tokio::select! {
+                    _ = state.close_websocket.notified() => {
+                        let _ = socket.send(Message::Close(None)).await;
+                        break;
+                    }
+                    incoming = socket.recv() => incoming,
+                };
+                let Some(Ok(message)) = incoming else { break };
                 let bytes = match message { Message::Text(t) => t.as_bytes().to_vec(), Message::Binary(b) => b.to_vec(), Message::Close(_) => break, _ => continue };
                 state.seen.lock().unwrap().push(Captured { body: bytes.clone(), path: String::new(), headers: HeaderMap::new() });
                 let value: Value = serde_json::from_slice(&bytes).unwrap();
@@ -200,6 +209,7 @@ async fn fixture_with_headers(mode: &str, probe_mode: &str, headers: Value) -> F
         entered: Arc::new(Notify::new()),
         cancelled: Arc::new(AtomicBool::new(false)),
         probe_mode: Arc::new(Mutex::new(probe_mode.into())),
+        close_websocket: Arc::new(Notify::new()),
     };
     let backend = serve(
         Router::new()
@@ -876,27 +886,39 @@ async fn websocket_trigger_uses_http_summary_and_native_messages_still_forward()
 }
 
 #[tokio::test]
-async fn closing_websocket_cancels_pending_http_summary() {
-    let f = fixture("delay", "custom").await;
-    let url = format!("{}/responses", f.server.url.replace("http:", "ws:"));
-    let mut request = url.into_client_request().unwrap();
-    request
-        .headers_mut()
-        .insert("originator", "codex_cli_rs".parse().unwrap());
-    request
-        .headers_mut()
-        .insert("x-model", "gpt-test".parse().unwrap());
-    let (mut socket, _) = connect_async(request).await.unwrap();
-    socket.send(tungstenite::Message::Text(json!({"model":"gpt-test","stream_id":"cancel-1","input":[{"type":"message","role":"user","content":"history"},trigger()]}).to_string().into())).await.unwrap();
-    timeout(Duration::from_secs(2), f.upstream.entered.notified())
+async fn closing_either_websocket_hop_cancels_pending_http_summary() {
+    for upstream in [false, true] {
+        let f = fixture("delay", "custom").await;
+        let url = format!("{}/responses", f.server.url.replace("http:", "ws:"));
+        let mut request = url.into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("originator", "codex_cli_rs".parse().unwrap());
+        request
+            .headers_mut()
+            .insert("x-model", "gpt-test".parse().unwrap());
+        let (mut socket, _) = connect_async(request).await.unwrap();
+        socket.send(tungstenite::Message::Text(json!({"model":"gpt-test","stream_id":"cancel-1","input":[{"type":"message","role":"user","content":"history"},trigger()]}).to_string().into())).await.unwrap();
+        timeout(Duration::from_secs(2), f.upstream.entered.notified())
+            .await
+            .unwrap();
+        if upstream {
+            f.upstream.close_websocket.notify_one();
+            let close = timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("upstream closure was hidden by pending compaction")
+                .unwrap()
+                .unwrap();
+            assert!(close.is_close());
+        } else {
+            socket.close(None).await.unwrap();
+        }
+        timeout(Duration::from_secs(2), async {
+            while !f.upstream.cancelled.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
         .await
         .unwrap();
-    socket.close(None).await.unwrap();
-    timeout(Duration::from_secs(2), async {
-        while !f.upstream.cancelled.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    }
 }

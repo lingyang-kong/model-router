@@ -68,7 +68,6 @@ pub(crate) async fn forward(
         uri: parts.uri,
         model,
         origin: origin.cloned(),
-        connected: true,
     };
     tokio::spawn(async move {
         if let Ok(downstream) = downstream.await {
