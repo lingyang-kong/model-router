@@ -53,10 +53,17 @@ async fn restore_json(
     original: Bytes,
     trailers: Option<HeaderMap>,
 ) -> Result<Response> {
-    let bytes = decode_body(io::Cursor::new(original.as_ref()), &headers)
-        .await
-        .map_err(Error::bad_gateway)?;
-    if let Ok(Some(output)) = super::multiagent::restore_bytes(&bytes) {
+    let decoded = if headers.contains_key(header::CONTENT_ENCODING) {
+        Some(
+            decode_body(io::Cursor::new(original.as_ref()), &headers)
+                .await
+                .map_err(Error::bad_gateway)?,
+        )
+    } else {
+        None
+    };
+    let bytes = decoded.as_deref().unwrap_or(&original);
+    if let Ok(Some(output)) = super::multiagent::restore_bytes(bytes) {
         return Ok(response_from_parts(
             status,
             headers,
@@ -112,7 +119,7 @@ fn transform_sse<S>(input: S) -> impl Stream<Item = std::result::Result<Bytes, i
 where
     S: Stream<Item = std::result::Result<Bytes, io::Error>> + Send + 'static,
 {
-    frame_sse(input).map(|result| result.map(|event| Bytes::from(transform_event(&event))))
+    frame_sse(input).map(|result| result.map(transform_event))
 }
 
 fn frame_sse<S>(input: S) -> impl Stream<Item = std::result::Result<Bytes, io::Error>> + Send
@@ -236,13 +243,13 @@ impl SseParser {
 }
 
 /// Event field lines have already been normalized to LF by the streaming parser.
-fn transform_event(event: &[u8]) -> Vec<u8> {
-    if !super::multiagent::response_may_need_adaptation(event) {
-        return event.to_vec();
+fn transform_event(event: Bytes) -> Bytes {
+    if !super::multiagent::response_may_need_adaptation(&event) {
+        return event;
     }
-    let text = match std::str::from_utf8(event) {
+    let text = match std::str::from_utf8(&event) {
         Ok(text) => text,
-        Err(_) => return event.to_vec(),
+        Err(_) => return event,
     };
     let lines: Vec<_> = text.split_inclusive('\n').collect();
     let data: Vec<&str> = lines
@@ -254,11 +261,11 @@ fn transform_event(event: &[u8]) -> Vec<u8> {
         })
         .collect();
     if data.is_empty() {
-        return event.to_vec();
+        return event;
     }
     let joined = data.join("\n");
     let Ok(Some(mut rewritten)) = super::multiagent::restore_bytes(joined.as_bytes()) else {
-        return event.to_vec();
+        return event;
     };
     // Valid JSON cannot contain literal CR/LF inside strings. RawValue may keep
     // them as formatting whitespace; escaped newlines and all string bytes survive.
@@ -278,7 +285,7 @@ fn transform_event(event: &[u8]) -> Vec<u8> {
             out.extend_from_slice(line.as_bytes());
         }
     }
-    out
+    Bytes::from(out)
 }
 
 #[cfg(test)]
@@ -289,13 +296,33 @@ mod tests {
     use tokio::io::{AsyncReadExt, BufReader};
 
     #[test]
+    fn unchanged_events_reuse_the_framed_buffer() {
+        for event in [
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n".as_slice(),
+            b"data: collaboration_compat\xff\n\n",
+            b"event: collaboration_compat\n\n",
+            b"data: collaboration_compat\n\n",
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"collaboration_compat\"}\n\n",
+        ] {
+            let bytes = Bytes::copy_from_slice(event);
+            let pointer = bytes.as_ptr();
+            let output = transform_event(bytes);
+            assert_eq!(output.as_ref(), event);
+            assert_eq!(output.as_ptr(), pointer);
+        }
+    }
+
+    #[test]
     fn prefilter_preserves_deltas_and_restores_escaped_namespaces() {
         let ordinary = b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n";
-        assert_eq!(transform_event(ordinary), ordinary);
+        assert_eq!(
+            transform_event(Bytes::from_static(ordinary)),
+            ordinary.as_slice()
+        );
         let escaped = br#"data: {"type":"response.output_item.done","item":{"type":"function_call","namespace":"collab\u006fration_compat","name":"spawn_agent","arguments":"unchanged"}}
 
 "#;
-        let output = transform_event(escaped);
+        let output = transform_event(Bytes::from_static(escaped));
         let document: Value =
             serde_json::from_slice(output.strip_prefix(b"data: ").unwrap()).unwrap();
         assert_eq!(document["item"]["namespace"], "collaboration");
@@ -336,25 +363,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unchanged_and_invalid_gzip_json_forward_original_bytes_and_trailers() {
+    async fn unchanged_and_invalid_json_forward_original_bytes_and_trailers() {
         for original in [br#"{"ok":true}"#.as_slice(), b"not json"] {
-            let encoded = gzip(original).await;
-            let mut headers = HeaderMap::new();
-            headers.insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
-            let mut trailers = HeaderMap::new();
-            trailers.insert("x-checksum", "kept".parse().unwrap());
-            let response = restore_json(
-                axum::http::StatusCode::OK,
-                headers,
-                Bytes::from(encoded.clone()),
-                Some(trailers),
-            )
-            .await
-            .unwrap();
-            assert_eq!(response.headers()[header::CONTENT_ENCODING], "gzip");
-            let collected = response.into_body().collect().await.unwrap();
-            assert_eq!(collected.trailers().unwrap()["x-checksum"], "kept");
-            assert_eq!(collected.to_bytes().as_ref(), encoded);
+            for encoding in [None, Some("identity"), Some("gzip")] {
+                let bytes = match encoding {
+                    Some("gzip") => gzip(original).await,
+                    _ => original.to_vec(),
+                };
+                let mut headers = HeaderMap::new();
+                if let Some(encoding) = encoding {
+                    headers.insert(header::CONTENT_ENCODING, encoding.parse().unwrap());
+                }
+                let mut trailers = HeaderMap::new();
+                trailers.insert("x-checksum", "kept".parse().unwrap());
+                let response = restore_json(
+                    axum::http::StatusCode::OK,
+                    headers.clone(),
+                    Bytes::from(bytes.clone()),
+                    Some(trailers),
+                )
+                .await
+                .unwrap();
+                assert_eq!(response.headers(), &headers);
+                let collected = response.into_body().collect().await.unwrap();
+                assert_eq!(collected.trailers().unwrap()["x-checksum"], "kept");
+                assert_eq!(collected.to_bytes().as_ref(), bytes);
+            }
         }
     }
 
@@ -493,8 +527,8 @@ mod tests {
     #[tokio::test]
     async fn leading_bom_allows_first_tool_event_restoration_at_every_split() {
         let event = b"data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"namespace\":\"collaboration_compat\",\"name\":\"collaboration_compat.spawn_agent\"}}\n\n";
-        let expected = transform_event(event);
-        assert_ne!(expected, event);
+        let expected = transform_event(Bytes::from_static(event));
+        assert_ne!(expected, event.as_slice());
         let input = [SseParser::UTF8_BOM, event].concat();
         for split in 0..=input.len() {
             let chunks = [input[..split].to_vec(), input[split..].to_vec()];
@@ -586,7 +620,7 @@ mod tests {
             r#"{{"type":"response.output_item.done","item":{{"type":"function_call","namespace":"collaboration_compat","name":"spawn_agent"}},"deep":{deep},"opaque":{opaque}}}"#
         );
         let input = format!("data: {}\n\n", json.replace('\n', "\ndata: "));
-        let output = transform_event(input.as_bytes());
+        let output = transform_event(Bytes::from(input));
         let output = std::str::from_utf8(&output).unwrap();
         assert_eq!(
             output
@@ -618,7 +652,7 @@ mod tests {
             b"event: response.delta\ndata: {\"type\":\"response.delta\"}\n\n".as_slice(),
             b"event: response.completed\ndata: {\"type\":\ndata: \"response.completed\"}\n\n",
         ] {
-            assert_eq!(transform_event(event), event);
+            assert_eq!(transform_event(Bytes::from_static(event)), event);
         }
     }
 
@@ -630,7 +664,7 @@ mod tests {
         parser.push(event, &mut ready);
         let output: Vec<_> = ready
             .into_iter()
-            .flat_map(|event| transform_event(&event))
+            .flat_map(|event| transform_event(Bytes::from(event)))
             .collect();
         assert!(
             output

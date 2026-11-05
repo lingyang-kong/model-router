@@ -19,6 +19,11 @@ struct ModelSelector {
     model: Option<String>,
 }
 
+/// Only Unicode escapes can hide the ASCII letters in inspected JSON tokens.
+pub(crate) fn has_json_unicode_escape(bytes: &[u8]) -> bool {
+    memchr::memmem::find(bytes, b"\\u").is_some()
+}
+
 pub(crate) fn request_model(bytes: &[u8]) -> RouterResult<Option<String>> {
     if bytes.is_empty() {
         return Ok(None);

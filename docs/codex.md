@@ -50,7 +50,7 @@ Some compatibility decisions use a POST to the selected provider's Responses end
 | --- | --- | --- |
 | `additional_tools` | Catalog projection enables Responses Lite and its capability is unknown. | Disable Lite in the projected row. |
 | `tool_search_output` | Catalog projection enables tool search and its capability is unknown. | Disable search support in the projected row. |
-| `agent_message` | An inference request contains an actual item of that type. | Convert it to an ordinary user-message envelope. |
+| `agent_message` | An inference request contains an actual item of that type without encrypted content. | Convert it to an ordinary user-message envelope. |
 | `compaction_trigger` | A request contains an actual trigger item. | Generate a synthetic text summary. |
 
 Each probe appends an invalid sentinel, uses `max_output_tokens: 1` and `store: false`, and has a three-second timeout. Only HTTP 400/422 with an error message beginning `Unsupported Responses API input item type: '<tested type>'` establishes rejection. Other outcomes remain unknown and retain inherited or native behavior. A loosely validating provider could generate up to one token. Results are not cached; catalog probes repeat on refresh and request probes repeat on applicable inference requests.
