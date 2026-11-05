@@ -27,8 +27,25 @@ struct Backend {
     handshake: StatusCode,
     upgrades: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
+    hints: Arc<Mutex<Vec<Option<String>>>>,
+    live: Option<Arc<LiveConnections>>,
 }
 type RecordedRequest = (bool, Option<String>, Value);
+
+#[derive(Default)]
+struct LiveConnections {
+    count: AtomicUsize,
+    closed: tokio::sync::Notify,
+}
+
+struct LiveConnection(Arc<LiveConnections>);
+
+impl Drop for LiveConnection {
+    fn drop(&mut self) {
+        self.0.count.fetch_sub(1, Ordering::SeqCst);
+        self.0.closed.notify_one();
+    }
+}
 
 #[derive(Clone, Default)]
 struct PreparationGate {
@@ -36,8 +53,6 @@ struct PreparationGate {
     release: Arc<tokio::sync::Notify>,
     worker_finish: Arc<tokio::sync::Notify>,
     worker_closed: Arc<tokio::sync::Notify>,
-    primary_close: Arc<tokio::sync::Notify>,
-    primary_closed: Arc<tokio::sync::Notify>,
     probes: Arc<AtomicUsize>,
 }
 
@@ -45,7 +60,6 @@ struct PreparationGate {
 enum DuringPreparation {
     Complete,
     Cancel,
-    Reconnect,
 }
 
 #[tokio::test]
@@ -130,11 +144,6 @@ async fn downstream_close_cancels_active_response_during_preparation() {
     preparation_during_response(DuringPreparation::Cancel).await;
 }
 
-#[tokio::test]
-async fn original_close_during_preparation_reconnects_pending_request() {
-    preparation_during_response(DuringPreparation::Reconnect).await;
-}
-
 async fn preparation_during_response(during: DuringPreparation) {
     let gate = PreparationGate::default();
     let backend = Backend {
@@ -142,6 +151,8 @@ async fn preparation_during_response(during: DuringPreparation) {
         handshake: StatusCode::SWITCHING_PROTOCOLS,
         upgrades: Arc::default(),
         requests: Arc::default(),
+        hints: Arc::default(),
+        live: None,
     };
     let primary = serve(Router::new().fallback({
         let gate = gate.clone();
@@ -151,41 +162,36 @@ async fn preparation_during_response(during: DuringPreparation) {
             let backend = backend.clone();
             async move {
                 if request.headers().contains_key("upgrade") {
-                    if matches!(during, DuringPreparation::Reconnect) && backend.upgrades.load(Ordering::Relaxed) == 0 {
-                        backend.upgrades.fetch_add(1, Ordering::Relaxed);
-                        let (mut parts, _) = request.into_parts();
-                        return WebSocketUpgrade::from_request_parts(&mut parts, &()).await.unwrap().on_upgrade(move |mut socket| async move {
-                            gate.primary_close.notified().await;
-                            socket.send(Message::Close(None)).await.unwrap();
-                            let _ = socket.recv().await;
-                            gate.primary_closed.notify_one();
-                        });
-                    }
-                    return endpoint(State(backend), request).await;
+                    backend.upgrades.fetch_add(1, Ordering::Relaxed);
+                    let (mut parts, _) = request.into_parts();
+                    return WebSocketUpgrade::from_request_parts(&mut parts, &()).await.unwrap().on_upgrade(move |mut socket| async move {
+                        socket.recv().await.unwrap().unwrap();
+                        socket.send(Message::Text(json!({"type":"response.created"}).to_string().into())).await.unwrap();
+                        tokio::select! {
+                            _ = gate.worker_finish.notified() => {
+                                socket.send(Message::Text(json!({"type":"response.completed"}).to_string().into())).await.unwrap();
+                            }
+                            _ = socket.recv() => {
+                                gate.worker_closed.notify_one();
+                                return;
+                            }
+                        }
+                        while let Some(Ok(Message::Text(text))) = socket.recv().await {
+                            let body: Value = serde_json::from_str(&text).unwrap();
+                            backend.requests.lock().unwrap().push((true, None, body.clone()));
+                            for event in events(backend.name, &body["model"]) {
+                                if socket.send(Message::Text(event.to_string().into())).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    });
                 }
                 if gate.probes.fetch_add(1, Ordering::Relaxed) == 0 {
                     gate.started.notify_one();
                     gate.release.notified().await;
                 }
                 (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(json!({"error":{"message":"Unsupported Responses API input item type: 'agent_message'"}}))).into_response()
-            }
-        }
-    })).await;
-    let worker = serve(Router::new().fallback({
-        let gate = gate.clone();
-        move |ws: WebSocketUpgrade| {
-            let gate = gate.clone();
-            async move {
-                ws.on_upgrade(move |mut socket| async move {
-                    socket.recv().await.unwrap().unwrap();
-                    socket.send(Message::Text(json!({"type":"response.created"}).to_string().into())).await.unwrap();
-                    tokio::select! {
-                        _ = gate.worker_finish.notified() => {
-                            let _ = socket.send(Message::Text(json!({"type":"response.completed"}).to_string().into())).await;
-                        }
-                        _ = socket.recv() => gate.worker_closed.notify_one(),
-                    }
-                })
             }
         }
     })).await;
@@ -198,8 +204,7 @@ async fn preparation_during_response(during: DuringPreparation) {
     let config = parse_config(&json!({
         "clients":{"codex":{"provider":"primary"},"openai":{"provider":"primary"},"anthropic":{"provider":"primary"}},
         "providers":{
-            "primary":{"base_url":primary.url,"auth":"none","catalog":{"file":"models.json","format":"codex"}},
-            "worker":{"base_url":worker.url,"auth":"none","models":{"worker":{}}}
+            "primary":{"base_url":primary.url,"auth":"none","catalog":{"file":"models.json","format":"codex"}}
         },"routes":[{"action":"model"}]
     }).to_string(),root.path()).unwrap();
     let gateway = serve(router(config).unwrap()).await;
@@ -213,25 +218,23 @@ async fn preparation_during_response(during: DuringPreparation) {
         .headers_mut()
         .insert("x-codex-routing-hint", "model=primary".parse().unwrap());
     let (mut socket, _) = connect_async(request).await.unwrap();
-    if !matches!(during, DuringPreparation::Reconnect) {
-        socket
-            .send(tungstenite::Message::Text(
-                json!({"type":"response.create","model":"worker"})
-                    .to_string()
-                    .into(),
-            ))
-            .await
-            .unwrap();
-        let created = timeout(Duration::from_secs(2), socket.next())
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            serde_json::from_slice::<Value>(&created.into_data()).unwrap()["type"],
-            "response.created"
-        );
-    }
+    socket
+        .send(tungstenite::Message::Text(
+            json!({"type":"response.create","model":"primary"})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let created = timeout(Duration::from_secs(2), socket.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&created.into_data()).unwrap()["type"],
+        "response.created"
+    );
     socket.send(tungstenite::Message::Text(json!({"type":"response.create","model":"primary","stream_id":"first","tools":[{"type":"namespace","name":"collaboration","tools":[{"type":"function","name":"spawn_agent","description":"d"}]}],"input":[{"type":"agent_message","author":"worker","content":[{"type":"input_text","text":"hello"}]}]}).to_string().into())).await.unwrap();
     timeout(Duration::from_secs(2), gate.started.notified())
         .await
@@ -254,24 +257,16 @@ async fn preparation_during_response(during: DuringPreparation) {
             .expect("active worker was not canceled while preparation was blocked");
         assert!(backend.requests.lock().unwrap().is_empty());
     } else {
-        if matches!(during, DuringPreparation::Reconnect) {
-            gate.primary_close.notify_one();
-            timeout(Duration::from_secs(2), gate.primary_closed.notified())
-                .await
-                .unwrap();
-        }
-        if matches!(during, DuringPreparation::Complete) {
-            gate.worker_finish.notify_one();
-            let completed = timeout(Duration::from_secs(2), socket.next())
-                .await
-                .expect("active response was starved by preparation")
-                .unwrap()
-                .unwrap();
-            assert_eq!(
-                serde_json::from_slice::<Value>(&completed.into_data()).unwrap()["type"],
-                "response.completed"
-            );
-        }
+        gate.worker_finish.notify_one();
+        let completed = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("active response was starved by preparation")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&completed.into_data()).unwrap()["type"],
+            "response.completed"
+        );
         assert!(backend.requests.lock().unwrap().is_empty());
         gate.release.notify_one();
         timeout(Duration::from_secs(2), async {
@@ -296,91 +291,60 @@ async fn preparation_during_response(during: DuringPreparation) {
             .as_str()
             .unwrap();
         assert_eq!(description.matches("Available model overrides").count(), 1);
-        let mut ids: Vec<_> = requests
+        let ids: Vec<_> = requests
             .iter()
             .map(|request| request.2["stream_id"].as_str().unwrap())
             .collect();
-        if matches!(during, DuringPreparation::Reconnect) {
-            // Reconnected responses use independent sockets; only the original hop
-            // guarantees wire order.
-            ids.sort_unstable();
-            assert_eq!(backend.upgrades.load(Ordering::Relaxed), 3);
-        }
         assert_eq!(ids, ["first", "second"]);
     }
 }
 
 #[tokio::test]
-async fn original_socket_close_during_switched_response_allows_reconnection() {
-    original_socket_close(true).await;
-}
-
-#[tokio::test]
-async fn original_socket_close_after_switched_response_allows_reconnection() {
-    original_socket_close(false).await;
-}
-
-async fn original_socket_close(during_response: bool) {
-    let close = Arc::new(tokio::sync::Notify::new());
-    let finish = Arc::new(tokio::sync::Notify::new());
-    let upgrades = Arc::new(AtomicUsize::new(0));
-    let primary = serve(Router::new().fallback({
-        let close = Arc::clone(&close);
-        let upgrades = Arc::clone(&upgrades);
-        move |ws: WebSocketUpgrade| {
-            let close = Arc::clone(&close);
-            let first = upgrades.fetch_add(1, Ordering::Relaxed) == 0;
-            async move {
-                ws.on_upgrade(move |mut socket| async move {
-                    if first {
-                        close.notified().await;
-                        socket.send(Message::Close(None)).await.unwrap();
-                        let _ = socket.recv().await;
-                    } else {
-                        let _ = socket.recv().await;
-                        socket
-                            .send(Message::Text(
-                                json!({"type":"response.completed"}).to_string().into(),
-                            ))
-                            .await
-                            .unwrap();
-                    }
-                })
+async fn active_original_response_loss_after_local_work_ends_session() {
+    for eof in [false, true] {
+        for started in [false, true] {
+            for concurrent in [false, true] {
+                for stream_ids in [false, true] {
+                    original_response_loss(eof, started, concurrent, stream_ids).await;
+                }
             }
         }
-    }))
-    .await;
-    let worker = serve(Router::new().fallback({
-        let finish = Arc::clone(&finish);
-        move |ws: WebSocketUpgrade| {
-            let finish = Arc::clone(&finish);
-            async move {
-                ws.on_upgrade(move |mut socket| async move {
-                    let _ = socket.recv().await;
-                    socket
-                        .send(Message::Text(
-                            json!({"type":"response.created"}).to_string().into(),
-                        ))
-                        .await
-                        .unwrap();
-                    finish.notified().await;
-                    socket
-                        .send(Message::Text(
-                            json!({"type":"response.completed"}).to_string().into(),
-                        ))
-                        .await
-                        .unwrap();
-                })
+    }
+}
+
+async fn original_response_loss(eof: bool, started: bool, concurrent: bool, stream_ids: bool) {
+    let primary = serve(Router::new().fallback(move |ws: WebSocketUpgrade| async move {
+        ws.on_upgrade(move |mut socket| async move {
+            for i in 0..if concurrent { 2 } else { 1 } {
+                let request = socket.recv().await.unwrap().unwrap();
+                let request: Value = serde_json::from_slice(&request.into_data()).unwrap();
+                if started {
+                    let mut event = json!({"type":"response.created","response":{"id":format!("resp_{i}"),"status":"in_progress"}});
+                    if stream_ids { event["stream_id"] = request["stream_id"].clone(); }
+                    socket.send(Message::Text(event.to_string().into())).await.unwrap();
+                }
+                if concurrent && i == 1 {
+                    let mut event = json!({"type":"response.completed","response":{"id":"resp_1","status":"completed"}});
+                    if stream_ids { event["stream_id"] = request["stream_id"].clone(); }
+                    socket.send(Message::Text(event.to_string().into())).await.unwrap();
+                }
             }
-        }
-    }))
-    .await;
+            socket.send(Message::Text(json!({"type":"error","stream_id":"unrelated","error":{"message":"another request failed"}}).to_string().into())).await.unwrap();
+            if !eof {
+                socket.send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: 1011, reason: "generation failed".into(),
+                }))).await.unwrap();
+                let _ = socket.recv().await;
+            }
+        })
+    })).await;
     let root = tempfile::tempdir().unwrap();
     let config = parse_config(
-        &json!({"clients":{"codex":{"provider":"primary"},"openai":{"provider":"primary"},"anthropic":{"provider":"primary"}},"providers":{
-        "primary":{"base_url":primary.url,"auth":"none","models":{"primary":{}}},
-        "worker":{"base_url":worker.url,"auth":"none","models":{"worker":{}}}
-    },"routes":[{"action":"model"}]})
+        &json!({
+            "providers":{
+                "primary":{"base_url":primary.url,"auth":"none","models":{"primary":{}}}
+            },"routes":[{"action":"model"}]
+        })
         .to_string(),
         root.path(),
     )
@@ -396,54 +360,131 @@ async fn original_socket_close(during_response: bool) {
         .headers_mut()
         .insert("x-codex-routing-hint", "model=primary".parse().unwrap());
     let (mut socket, _) = connect_async(request).await.unwrap();
-    socket
-        .send(tungstenite::Message::Text(
-            json!({"type":"response.create","model":"worker"})
-                .to_string()
-                .into(),
-        ))
-        .await
-        .unwrap();
-    let first = timeout(Duration::from_secs(2), socket.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert!(first.is_text());
-    if during_response {
-        close.notify_one();
-        assert!(
-            timeout(Duration::from_millis(100), socket.next())
-                .await
-                .is_err()
-        );
-        // A late control frame for the closed hop must not cancel the active provider.
+    assert_eq!(
+        turn(&mut socket, "missing").await.last().unwrap()["type"],
+        "error"
+    );
+    for i in 0..if concurrent { 2 } else { 1 } {
+        let mut request = json!({"type":"response.create","model":"primary","input":[]});
+        if stream_ids {
+            request["stream_id"] = json!(format!("lane_{i}"));
+        }
         socket
-            .send(tungstenite::Message::Pong(Vec::new().into()))
+            .send(tungstenite::Message::Text(request.to_string().into()))
             .await
             .unwrap();
     }
-    finish.notify_one();
-    let completed = timeout(Duration::from_secs(2), socket.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let completed: Value = serde_json::from_slice(&completed.into_data()).unwrap();
-    assert_eq!(completed["type"], "response.completed");
-    if !during_response {
-        close.notify_one();
-        assert!(
-            timeout(Duration::from_millis(100), socket.next())
-                .await
-                .is_err()
-        );
-    }
+    let mut created = 0;
+    let mut completed = 0;
+    let mut unrelated_errors = 0;
+    timeout(Duration::from_secs(2), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(tungstenite::Message::Text(text))) => {
+                    let event: Value = serde_json::from_str(&text).unwrap();
+                    match event["type"].as_str().unwrap() {
+                        "response.created" => created += 1,
+                        "response.completed" => completed += 1,
+                        "error" => {
+                            assert_eq!(event["stream_id"], "unrelated");
+                            unrelated_errors += 1;
+                        }
+                        other => panic!("unexpected event {other}"),
+                    }
+                }
+                Some(Ok(tungstenite::Message::Close(Some(frame)))) if !eof => {
+                    assert_eq!(u16::from(frame.code), 1011);
+                    assert_eq!(frame.reason, "generation failed");
+                    break;
+                }
+                None | Some(Err(_)) if eof => break,
+                other => panic!("unexpected close {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("active original response disappeared after upstream loss");
     assert_eq!(
-        turn(&mut socket, "primary").await.last().unwrap()["type"],
-        "response.completed"
+        created,
+        if started {
+            if concurrent { 2 } else { 1 }
+        } else {
+            0
+        }
     );
-    assert_eq!(upgrades.load(Ordering::Relaxed), 2);
+    assert_eq!(completed, usize::from(concurrent));
+    assert_eq!(unrelated_errors, 1);
+}
+
+#[tokio::test]
+async fn idle_upstream_loss_after_local_reply_ends_session() {
+    for eof in [false, true] {
+        for terminal in [None, Some("response.completed"), Some("error")] {
+            let close = Arc::new(tokio::sync::Notify::new());
+            let primary = serve(Router::new().fallback({
+                let close = close.clone();
+                move |ws: WebSocketUpgrade| {
+                    let close = close.clone();
+                    async move {
+                        ws.on_upgrade(move |mut socket| async move {
+                            if let Some(terminal) = terminal {
+                                socket.recv().await.unwrap().unwrap();
+                                socket
+                                    .send(Message::Text(
+                                        json!({"type":terminal}).to_string().into(),
+                                    ))
+                                    .await
+                                    .unwrap();
+                            }
+                            close.notified().await;
+                            if !eof {
+                                socket.send(Message::Close(None)).await.unwrap();
+                                let _ = socket.recv().await;
+                            }
+                        })
+                    }
+                }
+            }))
+            .await;
+            let root = tempfile::tempdir().unwrap();
+            let config = parse_config(&json!({
+                "providers":{"primary":{"base_url":primary.url,"auth":"none","models":{"primary":{}}}},
+                "routes":[{"action":"model"}]
+            }).to_string(), root.path()).unwrap();
+            let gateway = serve(router(config).unwrap()).await;
+            let mut request = format!("{}/responses", gateway.url.replace("http:", "ws:"))
+                .into_client_request()
+                .unwrap();
+            request
+                .headers_mut()
+                .insert("originator", "codex_cli_rs".parse().unwrap());
+            request
+                .headers_mut()
+                .insert("x-codex-routing-hint", "model=primary".parse().unwrap());
+            let (mut socket, _) = connect_async(request).await.unwrap();
+            if let Some(terminal) = terminal {
+                assert_eq!(
+                    turn(&mut socket, "primary").await.last().unwrap()["type"],
+                    terminal
+                );
+            }
+            // A locally generated reply previously enabled permanent Close suppression,
+            // even with only one upstream connection and no inference in progress.
+            assert_eq!(
+                turn(&mut socket, "missing").await.last().unwrap()["type"],
+                "error"
+            );
+            close.notify_one();
+            let received = timeout(Duration::from_secs(2), socket.next())
+                .await
+                .expect("idle upstream loss was hidden after a local reply");
+            if eof {
+                assert!(received.is_none() || matches!(received, Some(Err(_))));
+            } else {
+                assert!(received.unwrap().unwrap().is_close());
+            }
+        }
+    }
 }
 
 fn events(name: &str, model: &Value) -> Vec<Value> {
@@ -463,7 +504,26 @@ async fn endpoint(State(state): State<Backend>, request: Request) -> Response {
         .get("authorization")
         .map(|value| value.to_str().unwrap().to_owned());
     if request.headers().contains_key("upgrade") {
+        if let Some(live) = &state.live {
+            timeout(Duration::from_secs(2), async {
+                loop {
+                    let closed = live.closed.notified();
+                    if live.count.load(Ordering::SeqCst) == 0 {
+                        break;
+                    }
+                    closed.await;
+                }
+            })
+            .await
+            .expect("old upstream remained open while switching providers");
+        }
         state.upgrades.fetch_add(1, Ordering::Relaxed);
+        state.hints.lock().unwrap().push(
+            request
+                .headers()
+                .get("x-codex-routing-hint")
+                .map(|value| value.to_str().unwrap().to_owned()),
+        );
         if state.handshake != StatusCode::SWITCHING_PROTOCOLS {
             return crate::common::json_response(
                 state.handshake,
@@ -477,6 +537,10 @@ async fn endpoint(State(state): State<Backend>, request: Request) -> Response {
             .await
             .unwrap()
             .on_upgrade(move |mut socket| async move {
+                let _live = state.live.clone().map(|live| {
+                    assert_eq!(live.count.fetch_add(1, Ordering::SeqCst), 0);
+                    LiveConnection(live)
+                });
                 while let Some(Ok(message)) = socket.recv().await {
                     match message {
                         Message::Text(text) => {
@@ -529,11 +593,14 @@ async fn fixture(second: StatusCode) -> Fixture {
 }
 
 async fn fixture_with_handshakes(first: StatusCode, second: StatusCode) -> Fixture {
+    let live = Arc::new(LiveConnections::default());
     let backend = |name, handshake| Backend {
         name,
         handshake,
         upgrades: Arc::default(),
         requests: Arc::default(),
+        hints: Arc::default(),
+        live: Some(Arc::clone(&live)),
     };
     let a = backend("a", first);
     let b = backend("b", second);
@@ -614,14 +681,34 @@ async fn switches_between_websocket_providers_without_sending_worker_to_primary(
     let (mut socket, _) = connect_async(handshake(&f, Some("gpt-test")))
         .await
         .unwrap();
-    for model in ["gpt-test", "worker", "gpt-test", "worker"] {
-        let response = turn(&mut socket, model).await;
+    for model in ["gpt-test", "worker", "worker", "gpt-test"] {
+        let response = if model == "worker" && f.b.requests.lock().unwrap().len() == 1 {
+            socket.send(tungstenite::Message::Text(json!({"type":"response.create","model":"worker","previous_response_id":"resp_b","input":[],"stream_id":"lane"}).to_string().into())).await.unwrap();
+            timeout(Duration::from_secs(3), async {
+                let mut result = Vec::new();
+                loop {
+                    let event: Value =
+                        serde_json::from_slice(&socket.next().await.unwrap().unwrap().into_data())
+                            .unwrap();
+                    let done = event["type"] == "response.completed" || event["type"] == "error";
+                    result.push(event);
+                    if done {
+                        break result;
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        } else {
+            turn(&mut socket, model).await
+        };
         assert_eq!(response.last().unwrap()["response"]["model"], model);
         if model == "worker" {
             assert!(response.iter().all(|event| event["stream_id"] == "lane"));
         }
     }
-    assert_eq!(f.a.upgrades.load(Ordering::Relaxed), 1);
+    assert_eq!(f.a.upgrades.load(Ordering::Relaxed), 2);
+    assert_eq!(f.b.upgrades.load(Ordering::Relaxed), 1);
     let primary = f.a.requests.lock().unwrap();
     assert_eq!(primary.len(), 2);
     assert!(primary.iter().all(|(ws, auth, body)| *ws
@@ -629,11 +716,108 @@ async fn switches_between_websocket_providers_without_sending_worker_to_primary(
         && body["model"] == "gpt-test"));
     let worker = f.b.requests.lock().unwrap();
     assert_eq!(worker.len(), 2);
+    assert_eq!(worker[1].2["previous_response_id"], "resp_b");
     assert!(
         worker
             .iter()
             .all(|(ws, auth, body)| *ws && auth.is_none() && body["model"] == "worker")
     );
+}
+
+#[tokio::test]
+async fn missing_model_after_switch_uses_original_handshake_model() {
+    let f = fixture(StatusCode::SWITCHING_PROTOCOLS).await;
+    let (mut socket, _) = connect_async(handshake(&f, Some("gpt-test")))
+        .await
+        .unwrap();
+    assert_eq!(
+        turn(&mut socket, "worker").await.last().unwrap()["response"]["model"],
+        "worker"
+    );
+    socket
+        .send(tungstenite::Message::Text(
+            json!({"type":"response.create","input":[]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let event: Value =
+                serde_json::from_slice(&socket.next().await.unwrap().unwrap().into_data()).unwrap();
+            if event["type"] == "response.completed" {
+                break;
+            }
+            assert_ne!(event["type"], "error");
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(f.a.upgrades.load(Ordering::Relaxed), 2);
+    assert_eq!(f.b.requests.lock().unwrap().len(), 1);
+    assert_eq!(f.a.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn model_less_return_to_fallback_does_not_reuse_switched_model_hint() {
+    let f = fixture(StatusCode::SWITCHING_PROTOCOLS).await;
+    let (mut socket, _) = connect_async(handshake(&f, None)).await.unwrap();
+    turn(&mut socket, "worker").await;
+    socket
+        .send(tungstenite::Message::Text(
+            json!({"type":"response.create","input":[]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let event: Value =
+                serde_json::from_slice(&socket.next().await.unwrap().unwrap().into_data()).unwrap();
+            if event["type"] == "response.completed" {
+                break;
+            }
+            assert_ne!(event["type"], "error");
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(f.a.upgrades.load(Ordering::Relaxed), 2);
+    assert_eq!(*f.a.hints.lock().unwrap(), [None, None]);
+    assert_eq!(f.a.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn opaque_json_without_model_stays_on_current_provider() {
+    let f = fixture(StatusCode::SWITCHING_PROTOCOLS).await;
+    let (mut socket, _) = connect_async(handshake(&f, Some("gpt-test")))
+        .await
+        .unwrap();
+    turn(&mut socket, "worker").await;
+    let control = json!({"type":"session.custom_control","payload":{"value":42}});
+    socket
+        .send(tungstenite::Message::Text(control.to_string().into()))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let event: Value =
+                serde_json::from_slice(&socket.next().await.unwrap().unwrap().into_data()).unwrap();
+            if event["type"] == "response.completed" {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(f.a.upgrades.load(Ordering::Relaxed), 1);
+    assert_eq!(f.b.upgrades.load(Ordering::Relaxed), 1);
+    assert!(f.a.requests.lock().unwrap().is_empty());
+    let worker = f.b.requests.lock().unwrap();
+    assert_eq!(worker.len(), 2);
+    assert_eq!(worker[1].2, control);
 }
 
 #[tokio::test]
@@ -790,11 +974,592 @@ async fn switching_websocket_provider_rejects_previous_response_id_and_accepts_f
         serde_json::from_slice(&socket.next().await.unwrap().unwrap().into_data()).unwrap();
     assert_eq!(event["error"]["code"], "previous_response_not_found");
     assert!(f.b.requests.lock().unwrap().is_empty());
+    assert_eq!(f.b.upgrades.load(Ordering::Relaxed), 0);
+    assert_eq!(f.a.live.as_ref().unwrap().count.load(Ordering::SeqCst), 1);
     assert_eq!(
         turn(&mut socket, "worker").await.last().unwrap()["response"]["model"],
         "worker"
     );
     assert!(f.b.requests.lock().unwrap()[0].0);
+}
+
+#[tokio::test]
+async fn pipelined_local_error_survives_following_provider_switch() {
+    let f = fixture(StatusCode::SWITCHING_PROTOCOLS).await;
+    let (mut socket, _) = connect_async(handshake(&f, Some("gpt-test")))
+        .await
+        .unwrap();
+    for body in [
+        json!({"type":"response.create","model":"worker","previous_response_id":"stale","stream_id":"stale","input":[]}),
+        json!({"type":"response.create","model":"worker","stream_id":"replay","input":[]}),
+    ] {
+        socket
+            .send(tungstenite::Message::Text(body.to_string().into()))
+            .await
+            .unwrap();
+    }
+    let (error, completed) = timeout(Duration::from_secs(3), async {
+        let mut error = None;
+        let mut completed = None;
+        while error.is_none() || completed.is_none() {
+            let event: Value =
+                serde_json::from_slice(&socket.next().await.unwrap().unwrap().into_data()).unwrap();
+            match event["type"].as_str() {
+                Some("error") => error = Some(event),
+                Some("response.completed") => completed = Some(event),
+                _ => {}
+            }
+        }
+        (error.unwrap(), completed.unwrap())
+    })
+    .await
+    .unwrap();
+    assert_eq!(error["error"]["code"], "previous_response_not_found");
+    assert_eq!(error["stream_id"], "stale");
+    assert_eq!(completed["stream_id"], "replay");
+    assert_eq!(completed["response"]["model"], "worker");
+    assert_eq!(f.b.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn local_summary_finishes_during_switched_handshake() {
+    let summary_started = Arc::new(tokio::sync::Notify::new());
+    let summary_release = Arc::new(tokio::sync::Notify::new());
+    let switch_started = Arc::new(tokio::sync::Notify::new());
+    let switch_release = Arc::new(tokio::sync::Notify::new());
+    let primary = serve(Router::new().fallback({
+        let summary_started = Arc::clone(&summary_started);
+        let summary_release = Arc::clone(&summary_release);
+        move |request: Request| {
+            let summary_started = Arc::clone(&summary_started);
+            let summary_release = Arc::clone(&summary_release);
+            async move {
+                if request.headers().contains_key("upgrade") {
+                    let (mut parts, _) = request.into_parts();
+                    return WebSocketUpgrade::from_request_parts(&mut parts, &()).await.unwrap().on_upgrade(|mut socket| async move {
+                        while let Some(Ok(message)) = socket.recv().await {
+                            if let Message::Close(frame) = message {
+                                let _ = socket.send(Message::Close(frame)).await;
+                                break;
+                            }
+                        }
+                    });
+                }
+                let body: Value = serde_json::from_slice(&to_bytes(request.into_body(), usize::MAX).await.unwrap()).unwrap();
+                if body["input"].as_array().is_some_and(|items| items.iter().any(|item| item["type"] == "__model_router_capability_check__")) {
+                    return (StatusCode::BAD_REQUEST, axum::Json(json!({"error":{"message":"Unsupported Responses API input item type: 'compaction_trigger'"}}))).into_response();
+                }
+                summary_started.notify_one();
+                summary_release.notified().await;
+                axum::Json(json!({"id":"upstream-summary","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"remembered state"}]}]})).into_response()
+            }
+        }
+    })).await;
+    let worker = serve(Router::new().fallback({
+        let switch_started = Arc::clone(&switch_started);
+        let switch_release = Arc::clone(&switch_release);
+        move |ws: WebSocketUpgrade| {
+            let switch_started = Arc::clone(&switch_started);
+            let switch_release = Arc::clone(&switch_release);
+            async move {
+                switch_started.notify_one();
+                switch_release.notified().await;
+                ws.on_upgrade(|mut socket| async move {
+                    if let Some(Ok(Message::Text(text))) = socket.recv().await {
+                        let body: Value = serde_json::from_str(&text).unwrap();
+                        let response =
+                            json!({"type":"response.completed","stream_id":body["stream_id"]});
+                        let _ = socket
+                            .send(Message::Text(response.to_string().into()))
+                            .await;
+                    }
+                })
+            }
+        }
+    }))
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let config = parse_config(&json!({
+        "clients":{"codex":{"provider":"primary"},"openai":{"provider":"primary"},"anthropic":{"provider":"primary"}},
+        "providers":{
+            "primary":{"base_url":primary.url,"auth":"none","models":{"primary":{}}},
+            "worker":{"base_url":worker.url,"auth":"none","models":{"worker":{}}}
+        },
+        "routes":[{"action":"model"}]
+    }).to_string(), root.path()).unwrap();
+    let gateway = serve(router(config).unwrap()).await;
+    let mut request = format!("{}/responses", gateway.url.replace("http:", "ws:"))
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("originator", "codex_cli_rs".parse().unwrap());
+    request
+        .headers_mut()
+        .insert("x-codex-routing-hint", "model=primary".parse().unwrap());
+    let (mut socket, _) = connect_async(request).await.unwrap();
+    socket.send(tungstenite::Message::Text(json!({"type":"response.create","model":"primary","stream_id":"summary","input":[{"type":"message","role":"user","content":"history"},{"type":"compaction_trigger"}]}).to_string().into())).await.unwrap();
+    timeout(Duration::from_secs(2), summary_started.notified())
+        .await
+        .expect("summary did not start");
+    socket
+        .send(tungstenite::Message::Text(
+            json!({"type":"response.create","model":"worker","stream_id":"switched","input":[]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), switch_started.notified())
+        .await
+        .expect("switched handshake did not start");
+    summary_release.notify_one();
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let event: Value =
+                serde_json::from_slice(&socket.next().await.unwrap().unwrap().into_data()).unwrap();
+            assert_ne!(event["type"], "error", "{event}");
+            if event["type"] == "response.completed" {
+                assert_eq!(event["stream_id"], "summary");
+                break;
+            }
+        }
+    })
+    .await
+    .expect("summary was lost or blocked during switched handshake");
+    switch_release.notify_one();
+    let event: Value = serde_json::from_slice(
+        &timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_data(),
+    )
+    .unwrap();
+    assert_eq!(event["type"], "response.completed");
+    assert_eq!(event["stream_id"], "switched");
+}
+
+#[tokio::test]
+async fn requests_buffered_during_switch_are_delivered_once_in_order() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let upgrades = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let primary = serve(Router::new().fallback(|ws: WebSocketUpgrade| async move {
+        ws.on_upgrade(|mut socket| async move {
+            while let Some(Ok(message)) = socket.recv().await {
+                if let Message::Close(frame) = message {
+                    let _ = socket.send(Message::Close(frame)).await;
+                    break;
+                }
+            }
+        })
+    }))
+    .await;
+    let worker = serve(Router::new().fallback({
+        let started = Arc::clone(&started);
+        let release = Arc::clone(&release);
+        let upgrades = Arc::clone(&upgrades);
+        let requests = Arc::clone(&requests);
+        move |ws: WebSocketUpgrade| {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            let upgrades = Arc::clone(&upgrades);
+            let requests = Arc::clone(&requests);
+            async move {
+                upgrades.fetch_add(1, Ordering::SeqCst);
+                started.notify_one();
+                release.notified().await;
+                ws.on_upgrade(move |mut socket| async move {
+                    while let Some(Ok(Message::Text(text))) = socket.recv().await {
+                        let body: Value = serde_json::from_str(&text).unwrap();
+                        requests.lock().unwrap().push(body.clone());
+                        let response =
+                            json!({"type":"response.completed","stream_id":body["stream_id"]});
+                        if socket
+                            .send(Message::Text(response.to_string().into()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                })
+            }
+        }
+    }))
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let config = parse_config(&json!({
+        "clients":{"codex":{"provider":"primary"},"openai":{"provider":"primary"},"anthropic":{"provider":"primary"}},
+        "providers":{
+            "primary":{"base_url":primary.url,"auth":"none","models":{"primary":{}}},
+            "worker":{"base_url":worker.url,"auth":"none","models":{"worker":{}}}
+        },
+        "routes":[{"action":"model"}]
+    }).to_string(), root.path()).unwrap();
+    let gateway = serve(router(config).unwrap()).await;
+    let mut request = format!("{}/responses", gateway.url.replace("http:", "ws:"))
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("originator", "codex_cli_rs".parse().unwrap());
+    request
+        .headers_mut()
+        .insert("x-codex-routing-hint", "model=primary".parse().unwrap());
+    let (mut socket, _) = connect_async(request).await.unwrap();
+    socket
+        .send(tungstenite::Message::Text(
+            json!({"type":"response.create","model":"worker","stream_id":"first","input":[]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("switched handshake did not start");
+    for id in ["second", "third"] {
+        socket
+            .send(tungstenite::Message::Text(
+                json!({"type":"response.create","model":"worker","stream_id":id,"input":[]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+    }
+    release.notify_one();
+    let received = timeout(Duration::from_secs(2), async {
+        let mut ids = Vec::new();
+        while ids.len() < 3 {
+            let event: Value =
+                serde_json::from_slice(&socket.next().await.unwrap().unwrap().into_data()).unwrap();
+            if event["type"] == "response.completed" {
+                ids.push(event["stream_id"].as_str().unwrap().to_owned());
+            } else {
+                assert_ne!(event["type"], "error");
+            }
+        }
+        ids
+    })
+    .await
+    .unwrap();
+    assert_eq!(received, ["first", "second", "third"]);
+    assert_eq!(upgrades.load(Ordering::SeqCst), 1);
+    let bodies = requests.lock().unwrap();
+    assert_eq!(bodies.len(), 3);
+    assert_eq!(
+        bodies
+            .iter()
+            .map(|body| body["stream_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["first", "second", "third"]
+    );
+}
+
+#[tokio::test]
+async fn provider_switch_cancels_blocked_old_writes_and_preserves_later_requests() {
+    let old_started = Arc::new(tokio::sync::Notify::new());
+    let release_old = Arc::new(tokio::sync::Notify::new());
+    let worker_started = Arc::new(tokio::sync::Notify::new());
+    let release_worker = Arc::new(tokio::sync::Notify::new());
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let primary = serve(Router::new().fallback({
+        let old_started = Arc::clone(&old_started);
+        let release_old = Arc::clone(&release_old);
+        move |ws: WebSocketUpgrade| {
+            let old_started = Arc::clone(&old_started);
+            let release_old = Arc::clone(&release_old);
+            async move {
+                ws.max_message_size(32 * 1024 * 1024)
+                    .max_frame_size(32 * 1024 * 1024)
+                    .on_upgrade(move |mut socket| async move {
+                        old_started.notify_one();
+                        // Do not read while the relay sends large old-provider frames.
+                        release_old.notified().await;
+                        while socket.recv().await.is_some() {}
+                    })
+            }
+        }
+    }))
+    .await;
+    let worker = serve(Router::new().fallback({
+        let worker_started = Arc::clone(&worker_started);
+        let release_worker = Arc::clone(&release_worker);
+        let requests = Arc::clone(&requests);
+        move |ws: WebSocketUpgrade| {
+            let worker_started = Arc::clone(&worker_started);
+            let release_worker = Arc::clone(&release_worker);
+            let requests = Arc::clone(&requests);
+            async move {
+                worker_started.notify_one();
+                release_worker.notified().await;
+                ws.on_upgrade(move |mut socket| async move {
+                    while let Some(Ok(Message::Text(text))) = socket.recv().await {
+                        let request: Value = serde_json::from_str(&text).unwrap();
+                        let stream_id = request["stream_id"].clone();
+                        requests.lock().unwrap().push(stream_id.clone());
+                        socket
+                            .send(Message::Text(
+                                json!({"type":"response.completed","stream_id":stream_id})
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                })
+            }
+        }
+    }))
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let config = parse_config(
+        &json!({
+            "providers":{
+                "primary":{"base_url":primary.url,"auth":"none","models":{"primary":{}}},
+                "worker":{"base_url":worker.url,"auth":"none","models":{"worker":{}}}
+            },
+            "routes":[{"action":"model"}]
+        })
+        .to_string(),
+        root.path(),
+    )
+    .unwrap();
+    let gateway = serve(router(config).unwrap()).await;
+    let mut request = format!("{}/responses", gateway.url.replace("http:", "ws:"))
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("originator", "codex_cli_rs".parse().unwrap());
+    request
+        .headers_mut()
+        .insert("x-codex-routing-hint", "model=primary".parse().unwrap());
+    let (mut socket, _) = connect_async(request).await.unwrap();
+    timeout(Duration::from_secs(2), old_started.notified())
+        .await
+        .unwrap();
+
+    let size = 16 * 1024 * 1024;
+    timeout(Duration::from_secs(10), async {
+        for byte in [1, 2] {
+            socket
+                .send(tungstenite::Message::Binary(vec![byte; size].into()))
+                .await
+                .unwrap();
+        }
+        socket
+            .send(tungstenite::Message::Text(
+                json!({"type":"response.create","model":"worker","stream_id":"first","input":[]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(3), worker_started.notified())
+            .await
+            .expect("provider switch waited for the old upstream to read");
+
+        // This request arrives while the replacement handshake is still pending.
+        socket
+            .send(tungstenite::Message::Text(
+                json!({"type":"response.create","model":"worker","stream_id":"second","input":[]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        release_worker.notify_one();
+
+        let mut completed = Vec::new();
+        while completed.len() < 2 {
+            let event: Value =
+                serde_json::from_slice(&socket.next().await.unwrap().unwrap().into_data()).unwrap();
+            if event["type"] == "response.completed" {
+                completed.push(event["stream_id"].as_str().unwrap().to_owned());
+            }
+        }
+        assert_eq!(completed, ["first", "second"]);
+        assert_eq!(*requests.lock().unwrap(), [json!("first"), json!("second")]);
+    })
+    .await
+    .expect("provider switch did not cancel blocked old writes");
+
+    // The old reader remains gated until the replacement has served both requests.
+    release_old.notify_one();
+}
+
+#[tokio::test]
+async fn downstream_close_cancels_blocked_initial_and_switched_upstream_writes() {
+    for switched in [false, true] {
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let primary = serve(Router::new().fallback(|ws: WebSocketUpgrade| async move {
+            ws.on_upgrade(|mut socket| async move {
+                while let Some(Ok(message)) = socket.recv().await {
+                    if message == Message::Close(None) {
+                        break;
+                    }
+                }
+            })
+        }))
+        .await;
+        let worker = serve(Router::new().fallback({
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            move |ws: WebSocketUpgrade| {
+                let started = Arc::clone(&started);
+                let release = Arc::clone(&release);
+                async move {
+                    ws.on_upgrade(move |mut socket| async move {
+                        started.notify_one();
+                        // Retain the connection without reading until the client has closed.
+                        release.notified().await;
+                        let _ = socket.recv().await;
+                    })
+                }
+            }
+        }))
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let config = parse_config(
+            &json!({
+                "clients":{"codex":{"provider":"primary"}},
+                "providers":{
+                    "primary":{"base_url":primary.url,"auth":"none","models":{"primary":{}}},
+                    "worker":{"base_url":worker.url,"auth":"none","models":{"worker":{}}}
+                },
+                "routes":[{"action":"model"}]
+            })
+            .to_string(),
+            root.path(),
+        )
+        .unwrap();
+        let gateway = serve(router(config).unwrap()).await;
+        let mut request = format!("{}/responses", gateway.url.replace("http:", "ws:"))
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("originator", "codex_cli_rs".parse().unwrap());
+        request.headers_mut().insert(
+            "x-codex-routing-hint",
+            if switched {
+                "model=primary"
+            } else {
+                "model=worker"
+            }
+            .parse()
+            .unwrap(),
+        );
+        let (mut socket, _) = connect_async(request).await.unwrap();
+        timeout(Duration::from_secs(3), socket.send(tungstenite::Message::Text(
+            json!({"type":"response.create","model":"worker","input":[],"padding":"x".repeat(16 * 1024 * 1024)})
+                .to_string().into(),
+        ))).await.unwrap().unwrap();
+        timeout(Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
+        socket
+            .send(tungstenite::Message::Close(None))
+            .await
+            .unwrap();
+        let closed = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("client Close was blocked by upstream write");
+        assert!(matches!(closed, Some(Ok(tungstenite::Message::Close(_)))));
+        release.notify_one();
+    }
+}
+
+#[tokio::test]
+async fn downstream_close_cancels_pending_switched_handshake() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let requests = Arc::new(AtomicUsize::new(0));
+    let primary = serve(Router::new().fallback(|ws: WebSocketUpgrade| async move {
+        ws.on_upgrade(|mut socket| async move {
+            while let Some(Ok(message)) = socket.recv().await {
+                if matches!(message, Message::Close(_)) {
+                    break;
+                }
+            }
+        })
+    }))
+    .await;
+    let worker = serve(Router::new().fallback({
+        let started = Arc::clone(&started);
+        let release = Arc::clone(&release);
+        let requests = Arc::clone(&requests);
+        move |ws: WebSocketUpgrade| {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            let requests = Arc::clone(&requests);
+            async move {
+                started.notify_one();
+                release.notified().await;
+                ws.on_upgrade(move |mut socket| async move {
+                    if matches!(socket.recv().await, Some(Ok(Message::Text(_)))) {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                    }
+                })
+            }
+        }
+    }))
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let config = parse_config(&json!({
+        "clients":{"codex":{"provider":"primary"},"openai":{"provider":"primary"},"anthropic":{"provider":"primary"}},
+        "providers":{
+            "primary":{"base_url":primary.url,"auth":"none","models":{"primary":{}}},
+            "worker":{"base_url":worker.url,"auth":"none","models":{"worker":{}}}
+        },
+        "routes":[{"action":"model"}]
+    }).to_string(), root.path()).unwrap();
+    let gateway = serve(router(config).unwrap()).await;
+    let mut request = format!("{}/responses", gateway.url.replace("http:", "ws:"))
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("originator", "codex_cli_rs".parse().unwrap());
+    request
+        .headers_mut()
+        .insert("x-codex-routing-hint", "model=primary".parse().unwrap());
+    let (mut socket, _) = connect_async(request).await.unwrap();
+    socket
+        .send(tungstenite::Message::Text(
+            json!({"type":"response.create","model":"worker","input":[]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("switched handshake did not start");
+    socket
+        .send(tungstenite::Message::Close(None))
+        .await
+        .unwrap();
+    let closed = timeout(Duration::from_secs(2), socket.next())
+        .await
+        .expect("downstream close was blocked by handshake");
+    assert!(
+        closed.is_none()
+            || matches!(
+                closed,
+                Some(Ok(tungstenite::Message::Close(_))) | Some(Err(_))
+            )
+    );
+    release.notify_one();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
