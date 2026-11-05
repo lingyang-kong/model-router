@@ -22,7 +22,7 @@ use crate::{
     adapters::{CatalogFormat, ClientKind},
     capabilities::{self, Discovery},
     compression::{accepts_gzip, decode_body, encode_body},
-    config::{Provider, header_has_token},
+    config::{ModelReference, Provider, header_has_token, remove_body_headers},
     error::{Error, Result},
     router::{RouterState, stream_response},
 };
@@ -37,6 +37,17 @@ pub(crate) struct ModelEntry {
     /// Unlisted IDs remain routable, including retired or unavailable models.
     pub listed: bool,
 }
+
+impl ModelEntry {
+    fn reference(&self, id: &str) -> Option<&ModelReference> {
+        self.provider
+            .models
+            .get(id)
+            .and_then(|settings| settings.extends.as_ref())
+            .or(self.provider.defaults.extends.as_ref())
+    }
+}
+
 pub(crate) type ModelRegistry = IndexMap<String, ModelEntry>;
 
 pub(crate) struct CatalogState {
@@ -269,17 +280,8 @@ impl RouterState {
         if let Some(incoming) = incoming {
             parts.headers = incoming.headers.clone();
         }
-        for name in [
-            "content-encoding",
-            "content-type",
-            "content-md5",
-            "digest",
-            "content-digest",
-            "repr-digest",
-            "trailer",
-        ] {
-            parts.headers.remove(name);
-        }
+        remove_body_headers(&mut parts.headers);
+        parts.headers.remove("content-type");
         parts.headers.remove("if-none-match");
         parts.headers.remove("if-modified-since");
         let (client, mut request) = self.prepare_request(
@@ -412,13 +414,7 @@ impl RouterState {
             }
         }
         for (id, entry) in &mut staged {
-            let reference = entry
-                .provider
-                .models
-                .get(id)
-                .and_then(|settings| settings.extends.as_ref())
-                .or(entry.provider.defaults.extends.as_ref());
-            if let Some(reference) = reference {
+            if let Some(reference) = entry.reference(id) {
                 let provider = self.config.provider(&reference.provider)?;
                 // Keep dependent IDs routable, but do not advertise incomplete
                 // inherited metadata to Codex or its subagent listing.
@@ -443,13 +439,10 @@ impl RouterState {
                 let mut capabilities = snapshot.discovery.for_model(id);
                 capabilities.merge(capabilities::parse(&entry.metadata).for_model(id));
                 capabilities.merge(snapshot.provider.capabilities.clone());
-                let settings = entry.provider.models.get(id);
-                let reference = settings
-                    .and_then(|settings| settings.extends.as_ref())
-                    .or(entry.provider.defaults.extends.as_ref());
                 // Generic catalogs can describe the available model directly,
                 // even when its optional inheritance source is unavailable.
-                let base = reference
+                let base = entry
+                    .reference(id)
                     .filter(|_| entry.listed)
                     .map(|reference| {
                         let provider = self.config.provider(&reference.provider)?;
@@ -602,17 +595,8 @@ impl RouterState {
             document["has_more"] = Value::Bool(false);
         }
         *output.models(&mut document)? = models;
-        for name in [
-            "content-encoding",
-            "content-length",
-            "etag",
-            "last-modified",
-            "content-md5",
-            "digest",
-            "content-digest",
-            "repr-digest",
-            "trailer",
-        ] {
+        remove_body_headers(&mut headers);
+        for name in ["content-length", "etag", "last-modified"] {
             headers.remove(name);
         }
         headers.insert("content-type", "application/json".parse().unwrap());

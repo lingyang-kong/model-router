@@ -1,7 +1,10 @@
 use axum::http::HeaderMap;
 use serde_json::Value;
 
-use super::{catalog::CatalogLayout, client::ModelHint};
+use super::{
+    catalog::{CatalogLayout, rename_field},
+    client::ModelHint,
+};
 use crate::capabilities::Capabilities;
 use crate::error::{Error, Result};
 use serde_json::Map;
@@ -20,14 +23,6 @@ pub(super) fn matches_originator(originator: &str) -> bool {
     originator.to_ascii_lowercase().contains("codex")
 }
 
-fn rename_field(fields: &mut Map<String, Value>, from: &str, to: &str) {
-    if from != to
-        && let Some(value) = fields.remove(from)
-    {
-        fields.insert(to.to_owned(), value);
-    }
-}
-
 fn rename_reasoning_levels(value: Option<&mut Value>, from: &str, to: &str) {
     if let Some(Value::Array(levels)) = value {
         for level in levels {
@@ -38,42 +33,16 @@ fn rename_reasoning_levels(value: Option<&mut Value>, from: &str, to: &str) {
     }
 }
 
-pub(super) fn settings(fields: &Map<String, Value>) -> Map<String, Value> {
-    let mut fields = fields.clone();
-    for (shared, wire) in [
-        ("name", "display_name"),
-        ("description", "description"),
-        ("reasoning_level", "default_reasoning_level"),
-        ("reasoning_levels", "supported_reasoning_levels"),
-    ] {
-        rename_field(&mut fields, shared, wire);
-    }
+pub(super) fn postprocess_settings(fields: &mut Map<String, Value>) {
     rename_reasoning_levels(
         fields.get_mut("supported_reasoning_levels"),
         "level",
         "effort",
     );
-    fields
 }
 
-pub(super) fn shared_metadata(model: &Value) -> Map<String, Value> {
-    let fields = [
-        ("name", "display_name"),
-        ("description", "description"),
-        ("reasoning_level", "default_reasoning_level"),
-        ("reasoning_levels", "supported_reasoning_levels"),
-    ];
-    let mut result: Map<String, Value> = fields
-        .iter()
-        .filter_map(|&(shared, wire)| {
-            model
-                .get(wire)
-                .or_else(|| model.get(shared))
-                .map(|value| (shared.to_owned(), value.clone()))
-        })
-        .collect();
-    rename_reasoning_levels(result.get_mut("reasoning_levels"), "effort", "level");
-    result
+pub(super) fn postprocess_shared_metadata(fields: &mut Map<String, Value>) {
+    rename_reasoning_levels(fields.get_mut("reasoning_levels"), "effort", "level");
 }
 
 pub(super) fn apply_context_window(

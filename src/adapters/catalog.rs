@@ -22,7 +22,12 @@ impl CatalogFormat {
     /// Wire names for shared settings; values are owned by the provider or user.
     fn metadata_fields(self) -> &'static [(&'static str, &'static str)] {
         match self {
-            Self::Codex => &[],
+            Self::Codex => &[
+                ("name", "display_name"),
+                ("description", "description"),
+                ("reasoning_level", "default_reasoning_level"),
+                ("reasoning_levels", "supported_reasoning_levels"),
+            ],
             Self::Openai | Self::Anthropic => &[
                 ("name", "display_name"),
                 ("description", "description"),
@@ -33,21 +38,19 @@ impl CatalogFormat {
     }
 
     pub fn settings(self, fields: &Map<String, Value>) -> Map<String, Value> {
-        if self == Self::Codex {
-            return codex::settings(fields);
-        }
         let mut fields = fields.clone();
         for &(shared, wire) in self.metadata_fields() {
             rename_field(&mut fields, shared, wire);
+        }
+        if self == Self::Codex {
+            codex::postprocess_settings(&mut fields);
         }
         fields
     }
 
     pub fn shared_metadata(self, model: &Value) -> Map<String, Value> {
-        if self == Self::Codex {
-            return codex::shared_metadata(model);
-        }
-        self.metadata_fields()
+        let mut fields: Map<String, Value> = self
+            .metadata_fields()
             .iter()
             .filter_map(|&(shared, wire)| {
                 model
@@ -55,7 +58,11 @@ impl CatalogFormat {
                     .or_else(|| model.get(shared))
                     .map(|value| (shared.to_owned(), value.clone()))
             })
-            .collect()
+            .collect();
+        if self == Self::Codex {
+            codex::postprocess_shared_metadata(&mut fields);
+        }
+        fields
     }
 
     pub fn context_window(self, model: &Value) -> Option<&Value> {
@@ -200,7 +207,7 @@ impl CatalogFormat {
     }
 }
 
-fn rename_field(fields: &mut Map<String, Value>, from: &str, to: &str) {
+pub(super) fn rename_field(fields: &mut Map<String, Value>, from: &str, to: &str) {
     if from != to
         && let Some(value) = fields.remove(from)
     {
