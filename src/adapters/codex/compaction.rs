@@ -274,27 +274,19 @@ pub(super) fn prepare(bytes: &[u8], mode: Mode, effective_model: Option<&str>) -
     }
     let items: Vec<Box<RawValue>> =
         serde_json::from_str(input_raw.get()).map_err(Error::bad_request)?;
-    let trigger_positions: Vec<usize> = items
-        .iter()
-        .enumerate()
-        .filter_map(|(index, item)| {
-            item_meta(item)
-                .ok()
-                .filter(|meta| meta.kind.as_deref() == Some("compaction_trigger"))
-                .map(|_| index)
-        })
-        .collect();
+    let mut trigger_positions = Vec::new();
+    let mut checkpoints = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let Some(meta) = item_meta(item).ok() else {
+            continue;
+        };
+        match meta.kind.as_deref() {
+            Some("compaction_trigger") => trigger_positions.push(index),
+            Some("compaction") => checkpoints.push((index, meta.encrypted_content)),
+            _ => {}
+        }
+    }
     let trigger = !trigger_positions.is_empty();
-    let checkpoints: Vec<(usize, Option<String>)> = items
-        .iter()
-        .enumerate()
-        .filter_map(|(index, item)| {
-            item_meta(item)
-                .ok()
-                .filter(|meta| meta.kind.as_deref() == Some("compaction"))
-                .map(|meta| (index, meta.encrypted_content))
-        })
-        .collect();
     let has_synthetic_checkpoint = checkpoints
         .iter()
         .any(|(_, value)| value.as_deref().is_some_and(|v| v.starts_with(MARKER)));
@@ -320,16 +312,13 @@ pub(super) fn prepare(bytes: &[u8], mode: Mode, effective_model: Option<&str>) -
             native_trigger: false,
         });
     }
+    let mut checkpoints = checkpoints.iter().peekable();
     let mut hydrated = Vec::with_capacity(items.len());
     for (index, item) in items.iter().enumerate() {
-        if checkpoints.iter().any(|(i, _)| *i == index) {
-            let value = checkpoints
-                .iter()
-                .find(|(i, _)| *i == index)
-                .and_then(|(_, value)| value.as_deref());
-            match value.and_then(|v| v.strip_prefix(MARKER)) {
+        if let Some((_, value)) = checkpoints.next_if(|(i, _)| *i == index) {
+            match value.as_deref().and_then(|v| v.strip_prefix(MARKER)) {
                 Some(summary) => hydrated.push(hydrated_message(summary)?),
-                None if mode == Mode::Native => hydrated.push(clone_raw(item)?),
+                None if mode == Mode::Native => hydrated.push(item.clone()),
                 None => {
                     return Err(Error::bad_request(
                         "Unsupported opaque Codex compaction checkpoint",
@@ -353,7 +342,7 @@ pub(super) fn prepare(bytes: &[u8], mode: Mode, effective_model: Option<&str>) -
                 "Synthetic compaction cannot process opaque encrypted reasoning items",
             ));
         } else {
-            hydrated.push(clone_raw(item)?);
+            hydrated.push(item.clone());
         }
     }
     if mode == Mode::Native {
@@ -391,18 +380,9 @@ pub(super) fn prepare(bytes: &[u8], mode: Mode, effective_model: Option<&str>) -
         .collect();
     let request = SummaryRequest {
         model,
-        instructions: fields
-            .get("instructions")
-            .map(|v| clone_raw(v))
-            .transpose()?,
-        reasoning: fields
-            .get("reasoning")
-            .map(|value| clone_raw(value))
-            .transpose()?,
-        max_output_tokens: fields
-            .get("max_output_tokens")
-            .map(|value| clone_raw(value))
-            .transpose()?,
+        instructions: fields.get("instructions").cloned(),
+        reasoning: fields.get("reasoning").cloned(),
+        max_output_tokens: fields.get("max_output_tokens").cloned(),
         history,
         stream: fields
             .get("stream")
@@ -422,7 +402,7 @@ pub(super) fn needs_full_history(bytes: &[u8], mode: Mode) -> Result<bool> {
     if !may_contain(bytes, b"previous_response_id") {
         return Ok(false);
     }
-    let fields: std::collections::HashMap<String, Box<RawValue>> =
+    let fields: std::collections::HashMap<String, &RawValue> =
         serde_json::from_slice(bytes).map_err(Error::bad_request)?;
     let Some(previous) = fields.get("previous_response_id") else {
         return Ok(false);
@@ -443,8 +423,7 @@ pub(super) fn needs_full_history(bytes: &[u8], mode: Mode) -> Result<bool> {
     if !input.get().trim_start().starts_with('[') {
         return Ok(false);
     }
-    let items: Vec<Box<RawValue>> =
-        serde_json::from_str(input.get()).map_err(Error::bad_request)?;
+    let items: Vec<&RawValue> = serde_json::from_str(input.get()).map_err(Error::bad_request)?;
     Ok(items
         .last()
         .and_then(|item| item_meta(item).ok())
@@ -456,10 +435,9 @@ fn rebuild(
     items: &[Box<RawValue>],
     strip_previous_response_id: bool,
 ) -> Result<Vec<u8>> {
-    let input = serde_json::to_string(items).map_err(Error::bad_request)?;
     fields.insert(
         "input".into(),
-        RawValue::from_string(input).map_err(Error::bad_request)?,
+        serde_json::value::to_raw_value(items).map_err(Error::bad_request)?,
     );
     if strip_previous_response_id {
         fields.remove("previous_response_id");
@@ -468,7 +446,7 @@ fn rebuild(
 }
 
 fn may_contain(bytes: &[u8], token: &[u8]) -> bool {
-    memchr::memchr(b'\\', bytes).is_some() || memchr::memmem::find(bytes, token).is_some()
+    crate::body::has_json_unicode_escape(bytes) || memchr::memmem::find(bytes, token).is_some()
 }
 
 fn hydrated_message(summary: &str) -> Result<Box<RawValue>> {
@@ -476,12 +454,8 @@ fn hydrated_message(summary: &str) -> Result<Box<RawValue>> {
     serde_json::value::to_raw_value(&message).map_err(Error::bad_request)
 }
 
-fn clone_raw(raw: &RawValue) -> Result<Box<RawValue>> {
-    RawValue::from_string(raw.get().to_owned()).map_err(Error::bad_request)
-}
-
 fn item_meta(raw: &RawValue) -> serde_json::Result<ItemMeta> {
-    let fields: std::collections::HashMap<String, Box<RawValue>> = serde_json::from_str(raw.get())?;
+    let fields: std::collections::HashMap<String, &RawValue> = serde_json::from_str(raw.get())?;
     let string = |name: &str| {
         fields.get(name).map_or(Ok(None), |value| {
             if value.get() == "null" {
@@ -501,7 +475,7 @@ fn item_meta(raw: &RawValue) -> serde_json::Result<ItemMeta> {
             && ["summary", "content"].iter().any(|key| {
                 fields
                     .get(*key)
-                    .and_then(|value| serde_json::from_str::<Vec<Box<RawValue>>>(value.get()).ok())
+                    .and_then(|value| serde_json::from_str::<Vec<&RawValue>>(value.get()).ok())
                     .is_some_and(|parts| {
                         parts.iter().any(|part| {
                             #[derive(Deserialize)]
@@ -631,6 +605,37 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_hydration_preserves_opaque_raw_history_and_fields() {
+        let deep = format!("{}0{}", "[".repeat(1000), "]".repeat(1000));
+        let opaque = format!(r#"{{ "text": "\u96ea\n", "data": {deep} }}"#);
+        let item = format!(r#"{{ "type": "message", "role": "user", "content": {opaque} }}"#);
+        let bytes = format!(
+            r#"{{"instructions":{opaque},"input":[{{"type":"compaction","encrypted_content":"model-router:compaction:v1:summary"}},{item}]}}"#
+        );
+        let native = prepare(bytes.as_bytes(), Mode::Native, None)
+            .unwrap()
+            .rewritten
+            .unwrap();
+        let fields: std::collections::HashMap<String, Box<RawValue>> =
+            serde_json::from_slice(&native).unwrap();
+        let items: Vec<Box<RawValue>> = serde_json::from_str(fields["input"].get()).unwrap();
+        assert_eq!(items[1].get(), item);
+        assert_eq!(fields["instructions"].get(), opaque);
+
+        let bytes = format!(
+            r#"{{"instructions":{opaque},"reasoning":{opaque},"max_output_tokens":512,"input":[{item},{{"type":"compaction_trigger"}}]}}"#
+        );
+        let summary = prepare(bytes.as_bytes(), Mode::Text, None)
+            .unwrap()
+            .summary
+            .unwrap();
+        assert_eq!(summary.instructions.unwrap().get(), opaque);
+        assert_eq!(summary.reasoning.unwrap().get(), opaque);
+        assert_eq!(summary.max_output_tokens.unwrap().get(), "512");
+        assert_eq!(summary.history[0].get(), item);
+    }
+
+    #[test]
     fn synthetic_compaction_hydrates_repeated_checkpoints_and_switches_to_native() {
         let first = request(&format!(
             r#"{{"type":"message","role":"user","content":"work"}},{TRIGGER}"#
@@ -673,6 +678,41 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_checkpoints_preserve_order_and_opaque_content() {
+        let input = serde_json::json!([
+            {"type":"compaction","encrypted_content":"model-router:compaction:v1:first"},
+            {"type":"message","role":"user","content":"between"},
+            {"type":"compaction","encrypted_content":"opaque"},
+            {"type":"compaction","encrypted_content":null},
+            {"type":"compaction"},
+            {"type":"compaction","encrypted_content":"model-router:compaction:v1:second"},
+            {"type":"message","role":"user","content":"after"}
+        ]);
+        let bytes = serde_json::json!({"input":input}).to_string();
+        let rewritten = prepare(bytes.as_bytes(), Mode::Native, None)
+            .unwrap()
+            .rewritten
+            .unwrap();
+        let output: Value = serde_json::from_slice(&rewritten).unwrap();
+        assert_eq!(output["input"].as_array().unwrap().len(), 7);
+        for index in [1, 2, 3, 4, 6] {
+            assert_eq!(output["input"][index], input[index]);
+        }
+        for (index, summary) in [(0, "first"), (5, "second")] {
+            assert!(
+                output["input"][index]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .ends_with(summary)
+            );
+        }
+        for index in [2, 3, 4] {
+            let bytes = serde_json::json!({"input":[input[0], input[index], input[5]]}).to_string();
+            assert!(prepare(bytes.as_bytes(), Mode::Text, None).is_err());
+        }
+    }
+
+    #[test]
     fn summary_drops_additional_tool_declarations_and_rejects_opaque_reasoning() {
         let declaration = r#"{"type":"additional_tools","tools":[{"name":"x"}]}"#;
         let native_bytes = request(&format!("{declaration},{TRIGGER}"));
@@ -708,6 +748,19 @@ mod tests {
         let body: Value = serde_json::from_slice(&summary.body().unwrap()).unwrap();
         assert_eq!(body["input"][0]["encrypted_content"], "provider-owned");
         assert_eq!(body["input"][0]["summary"][0]["text"], "The result is 45");
+    }
+
+    #[test]
+    fn ordinary_json_escapes_skip_compaction_inspection() {
+        let bytes = br#"{"input":[{"type":"message","content":"\n\r\t\b\f\"\\\/"}]}"#;
+        serde_json::from_slice::<Value>(bytes).unwrap();
+        assert!(!may_contain(bytes, b"compaction"));
+        assert!(!may_contain(bytes, b"previous_response_id"));
+        let prepared = prepare(bytes, Mode::Native, None).unwrap();
+        assert!(prepared.rewritten.is_none());
+        assert!(prepared.summary.is_none());
+        assert!(!prepared.native_trigger);
+        assert!(!needs_full_history(bytes, Mode::Native).unwrap());
     }
 
     #[test]
@@ -747,6 +800,15 @@ mod tests {
         let trigger = serde_json::json!({"previous_response_id":"upstream-id","input":[{"type":"compaction_trigger"}]}).to_string();
         assert!(needs_full_history(trigger.as_bytes(), Mode::Text).unwrap());
         assert!(!needs_full_history(trigger.as_bytes(), Mode::Native).unwrap());
+    }
+
+    #[test]
+    fn replay_inspection_preserves_opaque_history_depth() {
+        let deep = format!("{}0{}", "[".repeat(1000), "]".repeat(1000));
+        let input = format!(
+            r#"{{"previous_response_id":"upstream","input":[{{"type":"message","content":{deep}}},{TRIGGER}]}}"#
+        );
+        assert!(needs_full_history(input.as_bytes(), Mode::Text).unwrap());
     }
 
     #[test]
