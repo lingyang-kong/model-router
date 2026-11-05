@@ -1,15 +1,15 @@
-use std::{collections::BTreeSet, io, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use axum::http::{HeaderMap, Method, StatusCode, request::Parts};
-use futures_util::{TryStreamExt, future::join_all};
-use tokio_util::io::StreamReader;
+use futures_util::future::join_all;
 use url::Url;
 
 use crate::{
     adapters::CatalogFormat,
+    body::response_reader,
     capabilities::{self, Discovery},
     compression::decode_body,
-    config::Provider,
+    config::{Provider, remove_body_headers, remove_websocket_headers},
     router::RouterState,
 };
 
@@ -48,14 +48,7 @@ impl RouterState {
         let item_type = item.get("type")?.as_str()?.to_owned();
         let url = provider.upstream_url(&parts.uri).ok()?;
         let mut headers = discovery_headers(provider, &parts.headers, &url)?;
-        for header in [
-            "sec-websocket-key",
-            "sec-websocket-version",
-            "sec-websocket-protocol",
-            "sec-websocket-extensions",
-        ] {
-            headers.remove(header);
-        }
+        remove_websocket_headers(&mut headers);
         let mut body = serde_json::json!({
             "input": [item, {"type":"__model_router_capability_check__"}],
             "max_output_tokens": 1,
@@ -110,7 +103,7 @@ impl RouterState {
             if !seen.insert(url.clone()) {
                 continue;
             }
-            if is_tools_url(url) {
+            if capabilities::is_tools_path(url.path()) {
                 tools.push(url.clone());
             } else {
                 info.push(url.clone());
@@ -193,17 +186,12 @@ fn discovery_headers(provider: &Provider, incoming: &HeaderMap, url: &Url) -> Op
     } else {
         HeaderMap::new()
     };
+    remove_body_headers(&mut headers);
     for name in [
         "idempotency-key",
         "if-none-match",
         "if-modified-since",
-        "content-encoding",
         "content-type",
-        "content-md5",
-        "digest",
-        "content-digest",
-        "repr-digest",
-        "trailer",
     ] {
         headers.remove(name);
     }
@@ -212,16 +200,10 @@ fn discovery_headers(provider: &Provider, incoming: &HeaderMap, url: &Url) -> Op
 
 async fn read_document(response: reqwest::Response) -> Option<serde_json::Value> {
     let headers = response.headers().clone();
-    let body: reqwest::Body = response.into();
-    let body = axum::body::Body::new(body);
-    let reader = StreamReader::new(body.into_data_stream().map_err(io::Error::other));
-    let bytes = decode_body(reader, &headers).await.ok()?;
+    let bytes = decode_body(response_reader(response), &headers)
+        .await
+        .ok()?;
     serde_json::from_slice(&bytes).ok()
-}
-
-fn is_tools_url(url: &Url) -> bool {
-    let path = url.path().trim_end_matches('/');
-    path.ends_with("/tools") || path.ends_with("/tools/list")
 }
 
 fn add_tool_paths(source: &Url, paths: &[String], tools: &mut Vec<Url>, seen: &mut BTreeSet<Url>) {

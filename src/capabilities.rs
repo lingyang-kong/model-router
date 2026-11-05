@@ -104,125 +104,121 @@ pub(crate) fn parse(document: &Value) -> Discovery {
     parse_models(document, &mut found);
     found.tools_paths = declared_tool_paths(document);
 
-    // Agreeing detail enums establish whether `original` is accepted.
-    let mut image_constraints = Vec::new();
-    if let Some(paths) = root.get("paths").and_then(Value::as_object) {
-        for (path, item) in paths {
-            if !path.ends_with("/responses") {
-                continue;
-            }
-            if !item.get("post").is_some_and(Value::is_object) {
-                continue;
-            }
-            let Some(schema) = item.pointer("/post/requestBody/content/application~1json/schema")
-            else {
-                image_constraints.push(None);
-                continue;
-            };
-            let mut constraints = Vec::new();
-            image_original_from_schema(
-                schema,
-                document,
-                &mut BTreeSet::new(),
-                &mut constraints,
-                0,
-                false,
-            );
-            if constraints.is_empty() {
-                constraints.push(None);
-            }
-            image_constraints.extend(constraints);
-        }
-    }
-    if found.capabilities.image_detail_original.is_none()
-        && let Some(Some(supported)) = image_constraints.first().copied()
-        && image_constraints
-            .iter()
-            .all(|constraint| *constraint == Some(supported))
-    {
-        found.capabilities.image_detail_original = Some(supported);
-    }
-
     // Only use a deduction when all relevant Responses request schemas agree.
+    let mut image_constraints = Vec::new();
     let mut tier_constraints = Vec::new();
     let mut tier_id_constraints = Vec::new();
     let mut search_constraints = Vec::new();
     let mut summary_constraints = Vec::new();
     let mut verbosity_constraints = Vec::new();
-    if let Some(paths) = root.get("paths").and_then(Value::as_object) {
-        for (path, item) in paths {
-            if !path.ends_with("/responses") {
-                continue;
+    for schema in response_schemas(root) {
+        let Some(schema) = schema else {
+            for constraints in [
+                &mut image_constraints,
+                &mut tier_constraints,
+                &mut search_constraints,
+            ] {
+                constraints.push(None);
             }
-            if !item.get("post").is_some_and(Value::is_object) {
-                continue;
-            }
-            let Some(schema) = item.pointer("/post/requestBody/content/application~1json/schema")
-            else {
-                tier_constraints.push(None);
-                tier_id_constraints.push(None);
-                search_constraints.push(None);
-                summary_constraints.push(None);
-                verbosity_constraints.push(None);
-                continue;
-            };
-            let ids = service_tier_ids_from_schema(schema, document);
-            tier_constraints.push(ids.as_ref().map(|ids| {
-                ids.iter()
-                    .any(|id| !matches!(id.as_str(), "auto" | "default"))
-            }));
-            tier_id_constraints.push(ids);
-            search_constraints.push(web_search_from_schema(schema, document));
-            summary_constraints.push(summary_facts_from_schema(schema, document));
-            verbosity_constraints.push(verbosity_facts_from_schema(schema, document));
+            tier_id_constraints.push(None);
+            summary_constraints.push(None);
+            verbosity_constraints.push(None);
+            continue;
+        };
+        let mut constraints = Vec::new();
+        image_original_from_schema(
+            schema,
+            document,
+            &mut BTreeSet::new(),
+            &mut constraints,
+            0,
+            false,
+        );
+        if constraints.is_empty() {
+            constraints.push(None);
         }
+        image_constraints.extend(constraints);
+
+        let ids = service_tier_ids_from_schema(schema, document);
+        tier_constraints.push(ids.as_ref().map(|ids| {
+            ids.iter()
+                .any(|id| !matches!(id.as_str(), "auto" | "default"))
+        }));
+        tier_id_constraints.push(ids);
+        search_constraints.push(web_search_from_schema(schema, document));
+        summary_constraints.push(summary_facts_from_schema(schema, document));
+        verbosity_constraints.push(verbosity_facts_from_schema(schema, document));
     }
-    if tier_id_constraints_agree(&tier_id_constraints) {
-        found.capabilities.service_tier_ids = tier_id_constraints[0].clone();
+
+    // Agreeing detail enums establish whether `original` is accepted.
+    if found.capabilities.image_detail_original.is_none()
+        && let Some(supported) = constraints_agree(&image_constraints)
+    {
+        found.capabilities.image_detail_original = Some(*supported);
+    }
+
+    if let Some(ids) = tier_id_constraints_agree(&tier_id_constraints) {
+        found.capabilities.service_tier_ids = Some(ids.clone());
     }
     if found.capabilities.service_tiers.is_none()
-        && !tier_constraints.is_empty()
-        && constraints_agree(&tier_constraints)
+        && let Some(supported) = constraints_agree(&tier_constraints)
     {
-        found.capabilities.service_tiers = tier_constraints[0];
+        found.capabilities.service_tiers = Some(*supported);
     }
     if found.capabilities.web_search.is_none()
-        && !search_constraints.is_empty()
-        && constraints_agree(&search_constraints)
+        && let Some(supported) = constraints_agree(&search_constraints)
     {
-        found.capabilities.web_search = search_constraints[0];
+        found.capabilities.web_search = Some(*supported);
     }
-    if !summary_constraints.is_empty() && constraints_agree(&summary_constraints) {
-        let facts = summary_constraints[0].as_ref().unwrap();
+    if let Some(facts) = constraints_agree(&summary_constraints) {
         found.capabilities.reasoning_summary =
             found.capabilities.reasoning_summary.or(facts.summary);
         found.capabilities.reasoning_summary_levels = facts.summary_levels.clone();
         found.capabilities.reasoning_summary_default = facts.summary_default.clone();
     }
-    if !verbosity_constraints.is_empty() && constraints_agree(&verbosity_constraints) {
-        let facts = verbosity_constraints[0].as_ref().unwrap();
+    if let Some(facts) = constraints_agree(&verbosity_constraints) {
         found.capabilities.verbosity_levels = facts.0.clone();
         found.capabilities.verbosity_default = facts.1.clone();
     }
     found
 }
 
-fn constraints_agree<T: PartialEq>(constraints: &[Option<T>]) -> bool {
-    constraints
-        .first()
-        .is_some_and(|first| first.is_some() && constraints.iter().all(|value| value == first))
+fn response_schemas<'a>(
+    root: &'a serde_json::Map<String, Value>,
+) -> impl Iterator<Item = Option<&'a Value>> + 'a {
+    root.get("paths")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|paths| paths.iter())
+        .filter(|(path, item)| {
+            path.ends_with("/responses") && item.get("post").is_some_and(Value::is_object)
+        })
+        .map(|(_, item)| item.pointer("/post/requestBody/content/application~1json/schema"))
 }
 
-fn tier_id_constraints_agree(constraints: &[Option<Vec<String>>]) -> bool {
+fn constraints_agree<T: PartialEq>(constraints: &[Option<T>]) -> Option<&T> {
     let Some(Some(first)) = constraints.first() else {
-        return false;
+        return None;
     };
-    let first: BTreeSet<_> = first.iter().collect();
-    constraints.iter().all(|constraint| {
-        constraint
-            .as_ref()
-            .is_some_and(|ids| ids.iter().collect::<BTreeSet<_>>() == first)
-    })
+    constraints
+        .iter()
+        .all(|value| value.as_ref() == Some(first))
+        .then_some(first)
+}
+
+fn tier_id_constraints_agree(constraints: &[Option<Vec<String>>]) -> Option<&Vec<String>> {
+    let Some(Some(first_ids)) = constraints.first() else {
+        return None;
+    };
+    let first: BTreeSet<_> = first_ids.iter().collect();
+    constraints
+        .iter()
+        .all(|constraint| {
+            constraint
+                .as_ref()
+                .is_some_and(|ids| ids.iter().collect::<BTreeSet<_>>() == first)
+        })
+        .then_some(first_ids)
 }
 
 fn service_tier_ids_from_schema(schema: &Value, document: &Value) -> Option<Vec<String>> {
@@ -410,36 +406,14 @@ fn resolve_simple_schema<'a>(
     visited: &mut BTreeSet<String>,
     depth: usize,
 ) -> Option<&'a Value> {
-    if depth > 32
-        || ["anyOf", "oneOf", "allOf", "not"]
-            .iter()
-            .any(|key| schema.get(key).is_some())
-    {
-        return None;
-    }
-    let Some(reference) = schema.get("$ref").and_then(Value::as_str) else {
-        return Some(schema);
-    };
-    if schema
-        .as_object()?
-        .keys()
-        .any(|key| key != "$ref" && !schema_annotation(key))
-    {
-        return None;
-    }
-    if !visited.insert(reference.to_owned()) {
-        return None;
-    }
-    let target = reference.strip_prefix("#/components/schemas/")?;
-    resolve_simple_schema(
-        document.pointer(&format!("/components/schemas/{target}"))?,
-        document,
-        visited,
-        depth + 1,
-    )
+    let schema = resolve_reference(schema, document, visited, depth)?;
+    ["anyOf", "oneOf", "allOf", "not"]
+        .iter()
+        .all(|key| schema.get(key).is_none())
+        .then_some(schema)
 }
 
-fn closed_enum(schema: &Value, document: &Value) -> Option<Vec<Value>> {
+fn closed_enum<'a>(schema: &'a Value, document: &'a Value) -> Option<&'a [Value]> {
     let mut visited = BTreeSet::new();
     let schema = resolve_simple_schema(schema, document, &mut visited, 0)?;
     if schema
@@ -449,7 +423,10 @@ fn closed_enum(schema: &Value, document: &Value) -> Option<Vec<Value>> {
     {
         return None;
     }
-    schema.get("enum").and_then(Value::as_array).cloned()
+    schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
 }
 
 fn schema_annotation(key: &str) -> bool {
@@ -516,16 +493,7 @@ fn parse_model_info(document: &Value, found: &mut Discovery) {
     .into_iter()
     .flatten()
     {
-        let Some(id) = model_id(info) else {
-            continue;
-        };
-        let mut caps = read_flags(info);
-        if let Some(flag) = info.get("has_image_understanding").and_then(Value::as_bool) {
-            caps.images = Some(flag);
-        }
-        if !caps.is_empty() {
-            found.models.entry(id.to_owned()).or_default().merge(caps);
-        }
+        merge_model(info, found);
     }
 }
 
@@ -536,20 +504,24 @@ fn parse_models(document: &Value, found: &mut Discovery) {
         .filter_map(Value::as_array)
     {
         for model in models {
-            let Some(id) = model_id(model) else {
-                continue;
-            };
-            let mut caps = read_flags(model);
-            if let Some(flag) = model
-                .get("has_image_understanding")
-                .and_then(Value::as_bool)
-            {
-                caps.images = Some(flag);
-            }
-            if !caps.is_empty() {
-                found.models.entry(id.to_owned()).or_default().merge(caps);
-            }
+            merge_model(model, found);
         }
+    }
+}
+
+fn merge_model(model: &Value, found: &mut Discovery) {
+    let Some(id) = model_id(model) else {
+        return;
+    };
+    let mut caps = read_flags(model);
+    if let Some(flag) = model
+        .get("has_image_understanding")
+        .and_then(Value::as_bool)
+    {
+        caps.images = Some(flag);
+    }
+    if !caps.is_empty() {
+        found.models.entry(id.to_owned()).or_default().merge(caps);
     }
 }
 
@@ -567,22 +539,24 @@ fn parse_tool_inventory(document: &Value, caps: &mut Capabilities) {
     }
 }
 
+pub(crate) fn is_tools_path(path: &str) -> bool {
+    let normalized = path.trim_end_matches('/');
+    normalized.ends_with("/tools") || normalized.ends_with("/tools/list")
+}
+
 fn declared_tool_paths(document: &Value) -> Vec<String> {
     document
         .get("paths")
         .and_then(Value::as_object)
         .into_iter()
         .flatten()
-        .filter_map(|(path, methods)| {
-            let normalized = path.trim_end_matches('/');
-            let looks_like_tools =
-                normalized.ends_with("/tools") || normalized.ends_with("/tools/list");
-            (looks_like_tools
+        .filter(|(path, methods)| {
+            is_tools_path(path)
                 && path.starts_with('/')
                 && !path.contains('{')
-                && methods.get("get").is_some_and(Value::is_object))
-            .then(|| path.clone())
+                && methods.get("get").is_some_and(Value::is_object)
         })
+        .map(|(path, _)| path.clone())
         .collect()
 }
 

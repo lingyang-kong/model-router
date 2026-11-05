@@ -1,24 +1,22 @@
-use std::{borrow::Cow, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     body::Body,
     http::{Method, request::Parts},
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use futures_util::FutureExt;
-use http_body_util::BodyExt;
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 
 use crate::{
-    body::{buffered_body, request_model},
-    compression::decode_body,
-    config::Provider,
+    body::{BufferedRequest, request_model},
+    config::{Provider, remove_body_headers},
     error::{Error, Result},
     router::RouterState,
 };
 
-use super::{compaction, compaction_transport, multiagent, response};
+use super::{compaction, compaction_transport, multiagent, response, websocket};
 use crate::adapters::websocket::{WebSocketAction, WebSocketContext};
 
 enum RequestPlan {
@@ -33,23 +31,12 @@ pub(crate) async fn forward(
     body: Body,
     origin: Option<&Arc<Provider>>,
 ) -> Result<Response> {
-    let collected = body.collect().await.map_err(Error::bad_request)?;
-    let trailers = collected.trailers().cloned();
-    let original = collected.to_bytes();
-    let decoded = if parts.headers.contains_key("content-encoding") {
-        Cow::Owned(
-            decode_body(std::io::Cursor::new(&original), &parts.headers)
-                .await
-                .map_err(Error::bad_request)?,
-        )
-    } else {
-        Cow::Borrowed(original.as_ref())
-    };
-    let model = request_model(&decoded)?;
+    let buffered = BufferedRequest::collect(body, &parts.headers).await?;
+    let decoded = buffered.decoded();
+    let model = request_model(decoded)?;
     let provider = state.resolve_provider(model.as_deref(), origin).await?;
     provider.validate_credential_scope(origin)?;
-    let plan =
-        prepare_request(state, &provider, origin, &parts, &decoded, model.as_deref()).await?;
+    let plan = prepare_request(state, &provider, origin, &parts, decoded, model.as_deref()).await?;
     let rewritten = match plan {
         RequestPlan::Replay => {
             return Err(Error::bad_request(
@@ -78,21 +65,12 @@ pub(crate) async fn forward(
     };
     let body = if let Some(bytes) = rewritten {
         // Changed bytes invalidate their original encoding, length, and integrity metadata.
-        for header in [
-            "content-encoding",
-            "content-length",
-            "content-md5",
-            "digest",
-            "content-digest",
-            "repr-digest",
-            "trailer",
-            "te",
-        ] {
-            parts.headers.remove(header);
-        }
+        remove_body_headers(&mut parts.headers);
+        parts.headers.remove("content-length");
+        parts.headers.remove("te");
         reqwest::Body::from(bytes)
     } else {
-        buffered_body(original, trailers)
+        buffered.into_body()
     };
     let (client, request) = state.prepare_request(&provider, origin, &parts, body)?;
     let upstream = client.execute(request).await.map_err(Error::bad_gateway)?;
@@ -136,31 +114,13 @@ pub(in crate::adapters) async fn websocket_request(
     .await
     {
         Ok(prepared) => prepared,
-        Err(error) => {
-            return WebSocketAction::Respond(
-                async move {
-                    let event = compaction_transport::failure_event(
-                        error.into_response(),
-                        stream_id.as_ref(),
-                    )
-                    .await;
-                    vec![Message::Text(event.to_string().into())]
-                }
-                .boxed(),
-            );
-        }
+        Err(error) => return websocket::failure(error, stream_id),
     };
     let summary = match prepared {
         RequestPlan::Replay => {
-            let mut event = serde_json::json!({"type":"error","status":400,"error":{
-                "code":"previous_response_not_found",
-                "message":"Synthetic compaction requires full input; retry without previous_response_id"
-            }});
-            if let Some(stream_id) = stream_id {
-                event["stream_id"] = stream_id;
-            }
-            return WebSocketAction::Respond(
-                async move { vec![Message::Text(event.to_string().into())] }.boxed(),
+            return websocket::previous_response_not_found(
+                "Synthetic compaction requires full input; retry without previous_response_id",
+                stream_id,
             );
         }
         RequestPlan::Forward(rewritten) => {

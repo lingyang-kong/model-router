@@ -14,7 +14,7 @@ use crate::{
     adapters::{CatalogFormat, Client, ClientKind},
     body::{inspect_body, stream_body},
     catalog::{CatalogState, ModelRegistry, load_manual_models},
-    config::{Provider, RouteAction, header_has_token, sanitize_headers},
+    config::{Provider, RouteAction, header_has_token, is_loopback_url, sanitize_headers},
     error::{Error, Result},
     websocket,
 };
@@ -28,13 +28,7 @@ pub(crate) struct RouterState {
 
 impl RouterState {
     pub(crate) fn discovery_client(&self, url: &url::Url) -> &reqwest::Client {
-        let local = match url.host() {
-            Some(url::Host::Domain("localhost")) => true,
-            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-            _ => false,
-        };
-        if local {
+        if is_loopback_url(url) {
             &self.loopback_client
         } else {
             &self.client

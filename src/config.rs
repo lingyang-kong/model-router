@@ -235,12 +235,7 @@ impl Config {
                     "Provider base URLs must not contain queries; clients supply query parameters"
                 );
             }
-            provider.is_loopback = match provider.base_url.host() {
-                Some(Host::Domain("localhost")) => true,
-                Some(Host::Ipv4(ip)) => ip.is_loopback(),
-                Some(Host::Ipv6(ip)) => ip.is_loopback(),
-                _ => false,
-            };
+            provider.is_loopback = is_loopback_url(&provider.base_url);
             if let AuthMode::Bearer { env_key } = &provider.auth
                 && env_key.is_empty()
             {
@@ -417,6 +412,40 @@ fn required_env_var(variable: &str) -> Result<String> {
         .ok()
         .filter(|value| !value.is_empty())
         .ok_or_else(|| Error::service_unavailable("Provider credentials are not configured"))
+}
+
+pub(crate) fn is_loopback_url(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Domain("localhost")) => true,
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    }
+}
+
+/// Remove encoding, integrity, and trailer metadata; callers handle body framing.
+pub(crate) fn remove_body_headers(headers: &mut HeaderMap) {
+    for name in [
+        "content-encoding",
+        "content-md5",
+        "digest",
+        "content-digest",
+        "repr-digest",
+        "trailer",
+    ] {
+        headers.remove(name);
+    }
+}
+
+pub(crate) fn remove_websocket_headers(headers: &mut HeaderMap) {
+    for name in [
+        "sec-websocket-key",
+        "sec-websocket-version",
+        "sec-websocket-protocol",
+        "sec-websocket-extensions",
+    ] {
+        headers.remove(name);
+    }
 }
 
 pub(crate) fn header_has_token(headers: &HeaderMap, name: &str, token: &str) -> bool {

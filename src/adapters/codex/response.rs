@@ -7,11 +7,10 @@ use axum::{
 };
 use futures_util::{Stream, StreamExt};
 use http_body_util::BodyExt;
-use tokio::io::AsyncRead;
-use tokio_util::io::{ReaderStream, StreamReader};
+use tokio_util::io::ReaderStream;
 
 use crate::{
-    compression::decode_reader,
+    compression::{decode_body, decode_reader},
     error::{Error, Result},
 };
 
@@ -54,14 +53,9 @@ async fn restore_json(
     original: Bytes,
     trailers: Option<HeaderMap>,
 ) -> Result<Response> {
-    let decoded =
-        decode_reader(io::Cursor::new(original.as_ref()), &headers).map_err(Error::bad_gateway)?;
-    let mut decoded = decoded;
-    let mut bytes = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut decoded, &mut bytes)
+    let bytes = decode_body(io::Cursor::new(original.as_ref()), &headers)
         .await
         .map_err(Error::bad_gateway)?;
-    drop(decoded);
     if let Ok(Some(output)) = super::multiagent::restore_bytes(&bytes) {
         return Ok(response_from_parts(
             status,
@@ -96,24 +90,15 @@ fn response_from_parts(
 }
 
 pub(super) fn clean_rewritten_headers(headers: &mut HeaderMap) {
-    for name in [
-        "content-encoding",
-        "content-length",
-        "content-md5",
-        "digest",
-        "content-digest",
-        "repr-digest",
-        "trailer",
-    ] {
-        headers.remove(name);
-    }
+    crate::config::remove_body_headers(headers);
+    headers.remove(header::CONTENT_LENGTH);
     crate::config::sanitize_headers(headers);
 }
 
 fn stream_sse(response: reqwest::Response) -> Result<Response> {
     let status = response.status();
     let mut headers = response.headers().clone();
-    let reader = response_reader(response);
+    let reader = crate::body::response_reader(response);
     let reader = decode_reader(reader, &headers).map_err(Error::bad_gateway)?;
     clean_rewritten_headers(&mut headers);
     let stream = transform_sse(ReaderStream::new(reader));
@@ -121,17 +106,6 @@ fn stream_sse(response: reqwest::Response) -> Result<Response> {
     *response.status_mut() = status;
     *response.headers_mut() = headers;
     Ok(response)
-}
-
-fn response_reader(response: reqwest::Response) -> impl AsyncRead + Send + Unpin + 'static {
-    let chunks = futures_util::stream::unfold(response, |mut response| async move {
-        match response.chunk().await {
-            Ok(Some(bytes)) => Some((Ok::<Bytes, io::Error>(bytes), response)),
-            Ok(None) => None,
-            Err(error) => Some((Err(io::Error::other(error)), response)),
-        }
-    });
-    StreamReader::new(Box::pin(chunks))
 }
 
 fn transform_sse<S>(input: S) -> impl Stream<Item = std::result::Result<Bytes, io::Error>> + Send
