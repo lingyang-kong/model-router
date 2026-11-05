@@ -7,10 +7,10 @@ use std::{
 };
 
 use axum::http::{HeaderMap, Method, Request, Uri};
-use futures_util::{FutureExt, Sink, SinkExt, Stream, StreamExt, future::poll_fn};
+use futures_util::{FutureExt, Sink, SinkExt, StreamExt, future::poll_fn};
 use futures_util::{
     future::BoxFuture,
-    stream::{FuturesUnordered, SplitSink, SplitStream},
+    stream::{FuturesUnordered, SplitSink},
 };
 use hyper::upgrade::Upgraded as DownstreamUpgraded;
 use hyper_util::rt::TokioIo;
@@ -80,130 +80,57 @@ pub(crate) enum WebSocketAction {
 
 type ResponseJob = BoxFuture<'static, Vec<Message>>;
 
-enum SessionEnd {
-    Downstream(Message),
-    Upstream(Message),
-    Switch(Box<WebSocketSwitch>),
-}
-
 pub(crate) async fn relay(
     downstream: TokioIo<DownstreamUpgraded>,
     upstream: reqwest::Upgraded,
     client: Client,
-    mut context: WebSocketContext,
+    context: WebSocketContext,
 ) {
     let config = WebSocketConfig::default()
         .max_message_size(None)
         .max_frame_size(None);
     let downstream = WebSocketStream::from_raw_socket(downstream, Role::Server, Some(config)).await;
     let (mut downstream_sink, mut downstream_stream) = downstream.split();
-    let mut upstream = upstream;
+    let socket = WebSocketStream::from_raw_socket(upstream, Role::Client, Some(config)).await;
+    let (sink, stream) = socket.split();
+    let mut context = Arc::new(context);
+    let mut upstream_sink = Some(sink);
+    let mut upstream_stream = Some(stream);
     let mut pending = VecDeque::new();
-    // Local responses belong to the client session, including across switches.
-    let (local_tx, mut local_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut preparation: Option<BoxFuture<'static, WebSocketAction>> = None;
+    let mut replacing: Option<WebSocketSwitch> = None;
     let mut jobs = FuturesUnordered::new();
-    let mut outgoing = VecDeque::new();
-    loop {
-        let socket = WebSocketStream::from_raw_socket(upstream, Role::Client, Some(config)).await;
-        let (mut upstream_sink, mut upstream_stream) = socket.split();
-        let end = tokio::select! {
-            result = forward_requests(
-                &mut downstream_stream, &mut upstream_sink, client, &context, &mut pending, &local_tx,
-            ) => result,
-            result = forward_responses(
-                &mut upstream_stream, &mut downstream_sink, client, &mut local_rx, &mut jobs, &mut outgoing,
-            ) => result.map(SessionEnd::Upstream),
-        };
-        let change = match end {
-            Some(SessionEnd::Downstream(close)) => {
-                finish_close(&mut downstream_sink, &mut upstream_sink, close).await;
-                return;
-            }
-            Some(SessionEnd::Upstream(close)) => {
-                finish_close(&mut upstream_sink, &mut downstream_sink, close).await;
-                return;
-            }
-            Some(SessionEnd::Switch(change)) => *change,
-            None => return,
-        };
-        let WebSocketSwitch {
-            context: next,
-            request,
-            opening,
-        } = change;
-        // Retire both halves immediately, abandoning old-provider writes,
-        // before polling the replacement handshake.
-        drop(upstream_sink);
-        drop(upstream_stream);
-        let mut replacing = opening;
-        let mut idle = futures_util::stream::pending();
-        let result = loop {
-            tokio::select! {
-                result = &mut replacing => break result,
-                _ = forward_responses(
-                    &mut idle, &mut downstream_sink, client, &mut local_rx, &mut jobs, &mut outgoing,
-                ) => return,
-                incoming = downstream_stream.next() => {
-                    match incoming {
-                        Some(Ok(Message::Ping(_))) => {}
-                        Some(Ok(Message::Close(_))) => {
-                            let _ = tokio::time::timeout(
-                                Duration::from_secs(1), downstream_sink.flush(),
-                            ).await;
-                            return;
-                        }
-                        Some(Ok(message)) => pending.push_back(message),
-                        _ => return,
-                    }
-                }
-            }
-        };
-        match result {
-            Ok(connection) => {
-                upstream = connection;
-                context = next;
-                // Preparation runs against the new connection exactly once.
-                pending.push_front(request);
-            }
-            Err(messages) => {
-                for message in messages {
-                    if downstream_sink.send(message).await.is_err() {
-                        break;
-                    }
-                }
-                return;
-            }
-        }
-    }
-}
-
-async fn forward_requests<S, D>(
-    source: &mut SplitStream<WebSocketStream<S>>,
-    destination: &mut SplitSink<WebSocketStream<D>, Message>,
-    client: Client,
-    context: &WebSocketContext,
-    pending: &mut VecDeque<Message>,
-    local_tx: &tokio::sync::mpsc::UnboundedSender<ResponseJob>,
-) -> Option<SessionEnd>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-    D: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut preparation: Option<BoxFuture<'_, WebSocketAction>> = None;
     let mut outbound = VecDeque::new();
-    let mut writing = false;
+    let mut outgoing = VecDeque::new();
+    let mut upstream_writing = false;
+    let mut downstream_writing = false;
+    let mut ending = false;
     loop {
+        if ending && outgoing.is_empty() && !downstream_writing {
+            return;
+        }
         if preparation.is_none()
+            && upstream_sink.is_some()
+            && !ending
             && let Some(message) = pending.pop_front()
         {
-            preparation = Some(client.websocket_request(message, context).boxed());
+            let context = Arc::clone(&context);
+            preparation =
+                Some(async move { client.websocket_request(message, &context).await }.boxed());
         }
         tokio::select! {
-            incoming = source.next() => {
-                let Some(Ok(message)) = incoming else { return None };
+            incoming = downstream_stream.next() => {
+                let Some(Ok(message)) = incoming else { return };
                 match message {
                     Message::Ping(_) => continue,
-                    close @ Message::Close(_) => return Some(SessionEnd::Downstream(close)),
+                    close @ Message::Close(_) => {
+                        if let Some(sink) = upstream_sink.as_mut() {
+                            finish_close(&mut downstream_sink, sink, close).await;
+                        } else {
+                            let _ = tokio::time::timeout(Duration::from_secs(1), downstream_sink.flush()).await;
+                        }
+                        return;
+                    }
                     message => pending.push_back(message),
                 }
             }
@@ -211,56 +138,58 @@ where
                 preparation = None;
                 match action {
                     WebSocketAction::Forward(message) => outbound.push_back(message),
-                    WebSocketAction::Respond(job) => local_tx.send(job).ok()?,
-                    WebSocketAction::Switch(change) => return Some(SessionEnd::Switch(change)),
-                }
-            }
-            result = poll_fn(|cx| poll_write(destination, &mut outbound, &mut writing, cx)),
-                if writing || !outbound.is_empty() => {
-                result.ok()?;
-            }
-        }
-    }
-}
-
-async fn forward_responses<S, D>(
-    source: &mut S,
-    destination: &mut SplitSink<WebSocketStream<D>, Message>,
-    client: Client,
-    local_rx: &mut tokio::sync::mpsc::UnboundedReceiver<ResponseJob>,
-    jobs: &mut FuturesUnordered<ResponseJob>,
-    outgoing: &mut VecDeque<Message>,
-) -> Option<Message>
-where
-    S: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
-    D: AsyncRead + AsyncWrite + Unpin,
-{
-    loop {
-        // Unlike send(), feed() has no await after accepting the frame. Keep it
-        // queued until then, so a provider switch cannot lose a partial send.
-        while let Some(message) = outgoing.front() {
-            destination.feed(message.clone()).await.ok()?;
-            outgoing.pop_front();
-        }
-        destination.flush().await.ok()?;
-        tokio::select! {
-            incoming = source.next() => {
-                let message = match incoming {
-                    Some(Ok(message)) if !message.is_close() => message,
-                    closed => return closed.and_then(Result::ok),
-                };
-                match message {
-                    Message::Ping(_) => continue,
-                    message => {
-                        outgoing.push_back(client.adapt_websocket_response(message));
+                    WebSocketAction::Respond(job) => jobs.push(job),
+                    WebSocketAction::Switch(change) => {
+                        // A provider change abandons any writes accepted by the
+                        // old sink. Retiring both halves first cancels the old
+                        // inference without flushing those frames on the way out.
+                        outbound.clear();
+                        upstream_writing = false;
+                        drop(upstream_sink.take().unwrap());
+                        drop(upstream_stream.take().unwrap());
+                        replacing = Some(*change);
                     }
                 }
             }
-            job = local_rx.recv() => match job {
-                Some(job) => jobs.push(job),
-                None => return None,
-            },
-            Some(messages) = jobs.next(), if !jobs.is_empty() => outgoing.extend(messages),
+            result = poll_fn(|cx| poll_write(upstream_sink.as_mut().unwrap(), &mut outbound, &mut upstream_writing, cx)),
+                if upstream_sink.is_some() && (upstream_writing || !outbound.is_empty()) => {
+                if result.is_err() { return; }
+            }
+            incoming = async { upstream_stream.as_mut().unwrap().next().await },
+                if upstream_stream.is_some() && outgoing.is_empty() && !downstream_writing => {
+                match incoming {
+                    Some(Ok(close @ Message::Close(_))) => {
+                        finish_close(upstream_sink.as_mut().unwrap(), &mut downstream_sink, close).await;
+                        return;
+                    }
+                    Some(Ok(Message::Ping(_))) => {}
+                    Some(Ok(message)) => outgoing.push_back(client.adapt_websocket_response(message)),
+                    _ => return,
+                }
+            }
+            result = async { replacing.as_mut().unwrap().opening.as_mut().await }, if replacing.is_some() => {
+                let change = replacing.take().unwrap();
+                match result {
+                    Ok(connection) => {
+                        let socket = WebSocketStream::from_raw_socket(connection, Role::Client, Some(config)).await;
+                        let (sink, stream) = socket.split();
+                        upstream_sink = Some(sink);
+                        upstream_stream = Some(stream);
+                        context = Arc::new(change.context);
+                        // Preparation runs against the new connection exactly once.
+                        pending.push_front(change.request);
+                    }
+                    Err(messages) => {
+                        outgoing.extend(messages);
+                        ending = true;
+                    }
+                }
+            }
+            Some(messages) = jobs.next(), if !jobs.is_empty() && !ending && outgoing.is_empty() && !downstream_writing => outgoing.extend(messages),
+            result = poll_fn(|cx| poll_write(&mut downstream_sink, &mut outgoing, &mut downstream_writing, cx)),
+                if downstream_writing || !outgoing.is_empty() => {
+                if result.is_err() { return; }
+            }
         }
     }
 }
@@ -317,7 +246,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn replacing_upstream_preserves_partly_sent_local_responses() {
+    async fn queued_writes_resume_after_cancellation_without_duplicates() {
         let (io, peer_io) = tokio::io::duplex(64);
         let socket = WebSocketStream::from_raw_socket(
             io,
@@ -327,42 +256,39 @@ mod tests {
         .await;
         let (mut sink, _) = socket.split();
         let mut peer = WebSocketStream::from_raw_socket(peer_io, Role::Client, None).await;
-        let mut upstream = futures_util::stream::pending();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut jobs = FuturesUnordered::new();
         let expected = [
             Message::Text("x".repeat(8192).into()),
             Message::Text("tail".into()),
             Message::Text("queued".into()),
         ];
         let mut outgoing = VecDeque::from(expected.clone());
-        {
-            let forwarding = forward_responses(
-                &mut upstream,
+        let mut started = false;
+        assert!(
+            futures_util::poll!(poll_fn(|cx| poll_write(
                 &mut sink,
-                Client::Codex,
-                &mut rx,
-                &mut jobs,
                 &mut outgoing,
-            );
-            tokio::pin!(forwarding);
-            assert!(futures_util::poll!(forwarding).is_pending());
-        }
-        // Frames remain both in the socket's write buffers and in our queue.
-        assert_eq!(outgoing.len(), 1);
+                &mut started,
+                cx
+            )))
+            .is_pending()
+        );
+        assert!(started);
+        assert_eq!(outgoing.len(), 2);
         tokio::time::timeout(Duration::from_secs(1), async {
-            tokio::select! {
-                _ = forward_responses(
-                    &mut upstream, &mut sink, Client::Codex, &mut rx, &mut jobs, &mut outgoing,
-                ) => panic!("response forwarding ended"),
-                _ = async {
+            tokio::join!(
+                async {
+                    while started || !outgoing.is_empty() {
+                        poll_fn(|cx| poll_write(&mut sink, &mut outgoing, &mut started, cx))
+                            .await
+                            .unwrap();
+                    }
+                },
+                async {
                     for message in expected {
                         assert_eq!(peer.next().await.unwrap().unwrap(), message);
                     }
-                    tx.send(async { vec![Message::Text("next".into())] }.boxed()).unwrap();
-                    assert_eq!(peer.next().await.unwrap().unwrap(), Message::Text("next".into()));
-                } => {}
-            }
+                }
+            );
         })
         .await
         .unwrap();
