@@ -15,6 +15,7 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use model_router::router;
 use serde_json::{Value, json};
+use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 use tokio_tungstenite::{
     connect_async,
@@ -1259,6 +1260,185 @@ async fn requests_buffered_during_switch_are_delivered_once_in_order() {
             .collect::<Vec<_>>(),
         ["first", "second", "third"]
     );
+}
+
+#[tokio::test]
+async fn partly_written_response_survives_provider_switch() {
+    let send_response = Arc::new(tokio::sync::Notify::new());
+    let switched = Arc::new(tokio::sync::Notify::new());
+    let primary = serve(Router::new().fallback({
+        let send_response = Arc::clone(&send_response);
+        move |ws: WebSocketUpgrade| {
+            let send_response = Arc::clone(&send_response);
+            async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    send_response.notified().await;
+                    let _ = socket
+                        .send(Message::Binary(vec![7; 16 * 1024 * 1024].into()))
+                        .await;
+                    let _ = socket.recv().await;
+                })
+            }
+        }
+    }))
+    .await;
+    let worker = serve(Router::new().fallback({
+        let switched = Arc::clone(&switched);
+        move |ws: WebSocketUpgrade| {
+            let switched = Arc::clone(&switched);
+            async move {
+                switched.notify_one();
+                ws.on_upgrade(move |mut socket| async move {
+                    if socket.recv().await.is_some() {
+                        let _ = socket
+                            .send(Message::Text(r#"{"type":"response.completed"}"#.into()))
+                            .await;
+                        let _ = socket.recv().await;
+                    }
+                })
+            }
+        }
+    }))
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let config = parse_config(
+        &json!({
+            "providers":{
+                "primary":{"base_url":primary.url,"auth":"none","models":{"primary":{}}},
+                "worker":{"base_url":worker.url,"auth":"none","models":{"worker":{}}}
+            },
+            "routes":[{"action":"model"}]
+        })
+        .to_string(),
+        root.path(),
+    )
+    .unwrap();
+    let gateway = serve(router(config).unwrap()).await;
+    let mut request = format!("{}/responses", gateway.url.replace("http:", "ws:"))
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("originator", "codex_cli_rs".parse().unwrap());
+    request
+        .headers_mut()
+        .insert("x-codex-routing-hint", "model=primary".parse().unwrap());
+    let (mut socket, _) = connect_async(request).await.unwrap();
+    send_response.notify_one();
+    timeout(Duration::from_secs(10), async {
+        // Read only the start of the large frame so the downstream write stalls.
+        let mut header = [0; 10];
+        socket.get_mut().read_exact(&mut header).await.unwrap();
+        assert_eq!(&header[..2], &[0x82, 127]);
+        let size = u64::from_be_bytes(header[2..].try_into().unwrap()) as usize;
+        assert_eq!(size, 16 * 1024 * 1024);
+        let mut payload = [0; 1024];
+        socket.get_mut().read_exact(&mut payload).await.unwrap();
+        assert!(payload.iter().all(|byte| *byte == 7));
+        socket
+            .send(tungstenite::Message::Text(
+                json!({"type":"response.create","model":"worker","input":[]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        switched.notified().await;
+        for _ in 1..size / payload.len() {
+            socket.get_mut().read_exact(&mut payload).await.unwrap();
+            assert!(payload.iter().all(|byte| *byte == 7));
+        }
+        let response: Value =
+            serde_json::from_slice(&socket.next().await.unwrap().unwrap().into_data()).unwrap();
+        assert_eq!(response["type"], "response.completed");
+    })
+    .await
+    .expect("partly written response was lost during the switch");
+}
+
+#[tokio::test]
+async fn blocked_upstream_write_allows_local_reply_and_preserves_request_order() {
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (received, mut frames) = tokio::sync::mpsc::unbounded_channel();
+    let primary = serve(Router::new().fallback({
+        let started = Arc::clone(&started);
+        let release = Arc::clone(&release);
+        move |ws: WebSocketUpgrade| {
+            let started = Arc::clone(&started);
+            let release = Arc::clone(&release);
+            let received = received.clone();
+            async move {
+                ws.max_message_size(32 * 1024 * 1024)
+                    .max_frame_size(32 * 1024 * 1024)
+                    .on_upgrade(move |mut socket| async move {
+                        started.notify_one();
+                        release.notified().await;
+                        while let Some(Ok(frame)) = socket.recv().await {
+                            if received.send(frame).is_err() {
+                                break;
+                            }
+                        }
+                    })
+            }
+        }
+    }))
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let config = parse_config(
+        &json!({
+            "providers":{"primary":{"base_url":primary.url,"auth":"none","models":{"primary":{}}}},
+            "routes":[{"action":"model"}]
+        })
+        .to_string(),
+        root.path(),
+    )
+    .unwrap();
+    let gateway = serve(router(config).unwrap()).await;
+    let mut request = format!("{}/responses", gateway.url.replace("http:", "ws:"))
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("originator", "codex_cli_rs".parse().unwrap());
+    request
+        .headers_mut()
+        .insert("x-codex-routing-hint", "model=primary".parse().unwrap());
+    let (mut socket, _) = connect_async(request).await.unwrap();
+    timeout(Duration::from_secs(2), started.notified())
+        .await
+        .unwrap();
+    let size = 16 * 1024 * 1024;
+    timeout(Duration::from_secs(10), async {
+        for byte in [1, 2] {
+            socket
+                .send(tungstenite::Message::Binary(vec![byte; size].into()))
+                .await
+                .unwrap();
+        }
+        socket
+            .send(tungstenite::Message::Text(
+                json!({"model":"missing","stream_id":"local"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let event: Value =
+            serde_json::from_slice(&socket.next().await.unwrap().unwrap().into_data()).unwrap();
+        assert_eq!(event["type"], "error");
+        assert_eq!(event["stream_id"], "local");
+        release.notify_one();
+        for byte in [1, 2] {
+            let Message::Binary(frame) = frames.recv().await.unwrap() else {
+                panic!("expected binary frame");
+            };
+            assert_eq!(frame.len(), size);
+            assert!(frame.iter().all(|value| *value == byte));
+        }
+    })
+    .await
+    .expect("local reply or ordered upstream frames stalled");
 }
 
 #[tokio::test]
