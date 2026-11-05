@@ -34,18 +34,56 @@ pub(crate) async fn inspect_body(
     body: Body,
     headers: &HeaderMap,
 ) -> RouterResult<(Option<String>, reqwest::Body)> {
-    let collected = body.collect().await.map_err(Error::bad_request)?;
-    let trailers = collected.trailers().cloned();
-    let bytes = collected.to_bytes();
-    let model = if headers.contains_key("content-encoding") {
-        let decoded = decode_body(std::io::Cursor::new(&bytes), headers)
-            .await
-            .map_err(Error::bad_request)?;
-        request_model(&decoded)?
-    } else {
-        request_model(&bytes)?
-    };
-    Ok((model, buffered_body(bytes, trailers)))
+    let body = BufferedRequest::collect(body, headers).await?;
+    let model = request_model(body.decoded())?;
+    Ok((model, body.into_body()))
+}
+
+/// Keep the original payload and trailers while exposing decoded inspection bytes.
+pub(crate) struct BufferedRequest {
+    original: Bytes,
+    trailers: Option<HeaderMap>,
+    decoded: Option<Vec<u8>>,
+}
+
+impl BufferedRequest {
+    pub(crate) async fn collect(body: Body, headers: &HeaderMap) -> RouterResult<Self> {
+        let collected = body.collect().await.map_err(Error::bad_request)?;
+        let trailers = collected.trailers().cloned();
+        let original = collected.to_bytes();
+        let decoded = if headers.contains_key("content-encoding") {
+            Some(
+                decode_body(std::io::Cursor::new(&original), headers)
+                    .await
+                    .map_err(Error::bad_request)?,
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            original,
+            trailers,
+            decoded,
+        })
+    }
+
+    pub(crate) fn decoded(&self) -> &[u8] {
+        self.decoded.as_deref().unwrap_or(&self.original)
+    }
+
+    pub(crate) fn into_body(self) -> reqwest::Body {
+        buffered_body(self.original, self.trailers)
+    }
+}
+
+pub(crate) fn response_reader(
+    response: reqwest::Response,
+) -> impl tokio::io::AsyncRead + Send + Unpin + 'static {
+    let body: reqwest::Body = response.into();
+    tokio_util::io::StreamReader::new(futures_util::TryStreamExt::map_err(
+        Body::new(body).into_data_stream(),
+        std::io::Error::other,
+    ))
 }
 
 pub(crate) fn buffered_body(bytes: Bytes, trailers: Option<HeaderMap>) -> reqwest::Body {

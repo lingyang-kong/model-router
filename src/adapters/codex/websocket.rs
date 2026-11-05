@@ -56,14 +56,9 @@ pub(in crate::adapters) async fn route(
         return transport::websocket_request(text, context, model, selector.stream_id).await;
     }
     if selector.previous_response_id.is_some() {
-        let mut event = serde_json::json!({"type":"error","status":400,"error":{
-            "code":"previous_response_not_found", "message":"Provider connection changed; retry with full input"
-        }});
-        if let Some(stream_id) = selector.stream_id {
-            event["stream_id"] = stream_id;
-        }
-        return WebSocketAction::Respond(
-            async move { vec![Message::Text(event.to_string().into())] }.boxed(),
+        return previous_response_not_found(
+            "Provider connection changed; retry with full input",
+            selector.stream_id,
         );
     }
     let mut routed = context.clone();
@@ -89,7 +84,7 @@ pub(in crate::adapters) async fn route(
     }))
 }
 
-fn failure(error: Error, stream_id: Option<Value>) -> WebSocketAction {
+pub(super) fn failure(error: Error, stream_id: Option<Value>) -> WebSocketAction {
     WebSocketAction::Respond(
         async move {
             vec![Message::Text(
@@ -101,6 +96,19 @@ fn failure(error: Error, stream_id: Option<Value>) -> WebSocketAction {
         }
         .boxed(),
     )
+}
+
+pub(super) fn previous_response_not_found(
+    message: &'static str,
+    stream_id: Option<Value>,
+) -> WebSocketAction {
+    let mut event = serde_json::json!({"type":"error","status":400,"error":{
+        "code":"previous_response_not_found", "message":message
+    }});
+    if let Some(stream_id) = stream_id {
+        event["stream_id"] = stream_id;
+    }
+    WebSocketAction::Respond(async move { vec![Message::Text(event.to_string().into())] }.boxed())
 }
 
 async fn open(

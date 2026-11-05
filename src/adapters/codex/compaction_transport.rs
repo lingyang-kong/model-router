@@ -26,14 +26,7 @@ pub(super) async fn summarize(
 ) -> Result<Value, Box<Response>> {
     parts.method = Method::POST;
     clean_rewritten_headers(&mut parts.headers);
-    for header in [
-        "sec-websocket-key",
-        "sec-websocket-version",
-        "sec-websocket-protocol",
-        "sec-websocket-extensions",
-    ] {
-        parts.headers.remove(header);
-    }
+    crate::config::remove_websocket_headers(&mut parts.headers);
     parts
         .headers
         .insert("content-type", "application/json".parse().unwrap());
@@ -67,9 +60,7 @@ pub(super) async fn summarize(
             .map_err(|error| Error::bad_gateway(error).into_response())?;
         let status = response.status();
         let headers = response.headers().clone();
-        let body: reqwest::Body = response.into();
-        let reader =
-            StreamReader::new(Body::new(body).into_data_stream().map_err(io::Error::other));
+        let reader = crate::body::response_reader(response);
         let bytes = decode_body(reader, &headers)
             .await
             .map_err(|error| Error::bad_gateway(error).into_response())?;
