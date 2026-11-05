@@ -1,3 +1,4 @@
+use crate::body::has_json_unicode_escape;
 use serde_json::value::RawValue;
 use std::collections::BTreeMap;
 struct NamespacePair {
@@ -13,13 +14,13 @@ const ENCRYPTED_CONTENT: &str = "encrypted_content";
 const SPAWN_AGENT: &str = "spawn_agent";
 
 pub(crate) fn request_may_need_adaptation(bytes: &[u8]) -> bool {
-    memchr::memchr(b'\\', bytes).is_some()
+    has_json_unicode_escape(bytes)
         || contains(bytes, COLLABORATION.client.as_bytes())
         || contains(bytes, COLLABORATION.upstream.as_bytes())
         || contains(bytes, AGENT_MESSAGE.as_bytes())
 }
 pub(crate) fn response_may_need_adaptation(bytes: &[u8]) -> bool {
-    memchr::memchr(b'\\', bytes).is_some() || contains(bytes, COLLABORATION.upstream.as_bytes())
+    has_json_unicode_escape(bytes) || contains(bytes, COLLABORATION.upstream.as_bytes())
 }
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     memchr::memmem::find(haystack, needle).is_some()
@@ -27,17 +28,22 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 
 // Open only the protocol envelopes we edit. Raw values keep arbitrary schema
 // and payload depth out of recursive deserialization, serialization, and drop.
+// Borrow raw values for inspection; own them in editing paths.
 fn parse_object(raw: &RawValue) -> serde_json::Result<Option<BTreeMap<String, Box<RawValue>>>> {
     parse_object_bytes(raw.get().as_bytes())
 }
 
-fn parse_object_bytes(bytes: &[u8]) -> serde_json::Result<Option<BTreeMap<String, Box<RawValue>>>> {
+fn parse_object_bytes<'a, R: serde::Deserialize<'a>>(
+    bytes: &'a [u8],
+) -> serde_json::Result<Option<BTreeMap<String, R>>> {
     if bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
         return Ok(None);
     }
     serde_json::from_slice(bytes).map(Some)
 }
-fn parse_array(raw: &RawValue) -> serde_json::Result<Option<Vec<Box<RawValue>>>> {
+fn parse_array<'a, R: serde::Deserialize<'a>>(
+    raw: &'a RawValue,
+) -> serde_json::Result<Option<Vec<R>>> {
     if !raw.get().starts_with('[') {
         return Ok(None);
     }
@@ -56,22 +62,27 @@ fn encode_json<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Result<Bo
     serde_json::value::to_raw_value(value)
 }
 
-pub(super) fn has_agent_message(bytes: &[u8]) -> serde_json::Result<bool> {
-    if !contains(bytes, AGENT_MESSAGE.as_bytes()) && !bytes.contains(&b'\\') {
+pub(super) fn has_convertible_agent_message(bytes: &[u8]) -> serde_json::Result<bool> {
+    if !contains(bytes, AGENT_MESSAGE.as_bytes()) && !has_json_unicode_escape(bytes) {
         return Ok(false);
     }
-    let Some(object) = parse_object_bytes(bytes)? else {
+    let Some(object) = parse_object_bytes::<&RawValue>(bytes)? else {
         return Ok(false);
     };
     let Some(input) = object.get("input") else {
         return Ok(false);
     };
-    let Some(items) = parse_array(input)? else {
+    let Some(items) = parse_array::<&RawValue>(input)? else {
         return Ok(false);
     };
-    for item in &items {
-        if let Some(item) = parse_object(item)?
-            && string(item.get("type")).as_deref() == Some(AGENT_MESSAGE)
+    for item in items {
+        if let Some(item) = parse_object_bytes::<&RawValue>(item.get().as_bytes())?
+            && item
+                .get("type")
+                .and_then(|value| serde_json::from_str::<String>(value.get()).ok())
+                .as_deref()
+                == Some(AGENT_MESSAGE)
+            && !has_encrypted_content(item.get("content").copied())?
         {
             return Ok(true);
         }
@@ -84,7 +95,7 @@ pub(super) fn prepare_bytes(
     text_agent_messages: bool,
     listing: &str,
 ) -> serde_json::Result<Option<Vec<u8>>> {
-    let Some(mut object) = parse_object_bytes(bytes)? else {
+    let Some(mut object) = parse_object_bytes::<Box<RawValue>>(bytes)? else {
         return Ok(None);
     };
     let mut changed = false;
@@ -215,6 +226,9 @@ fn prepare_input(
 ) -> serde_json::Result<(Vec<Box<RawValue>>, bool)> {
     let mut changed = false;
     for entry in &mut items {
+        if !request_may_need_adaptation(entry.get().as_bytes()) {
+            continue;
+        }
         let Some(mut item) = parse_object(entry)? else {
             continue;
         };
@@ -249,16 +263,8 @@ fn rewrite_agent(
     object: &mut BTreeMap<String, Box<RawValue>>,
     text_messages: bool,
 ) -> serde_json::Result<bool> {
-    if let Some(content) = object.get("content")
-        && let Some(parts) = parse_array(content)?
-    {
-        for part in parts {
-            if let Some(part) = parse_object(&part)?
-                && string(part.get("type")).as_deref() == Some(ENCRYPTED_CONTENT)
-            {
-                return Ok(false);
-            }
-        }
+    if has_encrypted_content(object.get("content").map(Box::as_ref))? {
+        return Ok(false);
     }
     let mut changed = false;
     if text_messages {
@@ -279,6 +285,24 @@ fn rewrite_agent(
         }
     }
     Ok(changed)
+}
+fn has_encrypted_content(content: Option<&RawValue>) -> serde_json::Result<bool> {
+    if let Some(content) = content
+        && let Some(parts) = parse_array::<&RawValue>(content)?
+    {
+        for part in parts {
+            if let Some(part) = parse_object_bytes::<&RawValue>(part.get().as_bytes())?
+                && part
+                    .get("type")
+                    .and_then(|value| serde_json::from_str::<String>(value.get()).ok())
+                    .as_deref()
+                    == Some(ENCRYPTED_CONTENT)
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 fn rewrite_identity(object: &mut BTreeMap<String, Box<RawValue>>, from: &str, to: &str) -> bool {
     let mut changed = false;
@@ -374,7 +398,7 @@ fn restore_output(
     let Some(output) = object.get(key) else {
         return Ok(false);
     };
-    let Some(mut items) = parse_array(output)? else {
+    let Some(mut items) = parse_array::<Box<RawValue>>(output)? else {
         return Ok(false);
     };
     let mut changed = false;
@@ -401,6 +425,26 @@ mod tests {
         let input = br#"{"input":[{"type":"agent_message","author":"worker","recipient":"parent","content":[{"type":"input_text","text":"context"},{"type":"encrypted_content","encrypted_content":"opaque-ciphertext"}]}]}"#;
         for convert in [false, true] {
             assert!(prepare_bytes(input, convert, "").unwrap().is_none());
+        }
+        assert!(!has_convertible_agent_message(input).unwrap());
+    }
+    #[test]
+    fn probe_eligibility_preserves_encrypted_and_mixed_message_semantics() {
+        let encrypted = r#"{"type":"agent_message","content":[{"type":"input_text","text":"visible"},{"type":"encrypted\u005fcontent","encrypted_content":"opaque"}]}"#;
+        let plain = r#"{"type":"agent_message","content":[{"type":"input_text","text":"plain"}]}"#;
+        for (items, expected) in [
+            (encrypted.to_owned(), false),
+            (format!("{encrypted},{plain}"), true),
+            (format!("{plain},{encrypted}"), true),
+            (r#"{"type":"agent_message","content":null}"#.into(), true),
+            (r#"{"type":"agent_message","content":{}}"#.into(), true),
+            (r#"{"type":"agent_message"}"#.into(), true),
+        ] {
+            let request = format!(r#"{{"input":[{items}]}}"#);
+            assert_eq!(
+                has_convertible_agent_message(request.as_bytes()).unwrap(),
+                expected
+            );
         }
     }
     #[test]
@@ -524,8 +568,71 @@ mod tests {
         assert!(restored.contains(&deep));
     }
     #[test]
+    fn agent_message_inspection_preserves_object_and_type_semantics() {
+        for (input, expected) in [
+            (
+                r#"{"in\u0070ut":[{"t\u0079pe":"ag\u0065nt_message"}]}"#,
+                true,
+            ),
+            (
+                r#"{"input":[0,null,"agent_message",{"type":5},{"type":"agent_message"}]}"#,
+                true,
+            ),
+            (
+                r#"{"input":[{"type":"agent_message","type":"message"}]}"#,
+                false,
+            ),
+            (
+                r#"{"input":[{"type":"message","type":"agent_message"}]}"#,
+                true,
+            ),
+            (r#"{"input":[{"type":"agent_message"}],"input":[]}"#, false),
+            (r#"{"input":[],"input":[{"type":"agent_message"}]}"#, true),
+            (r#"{"input":{"type":"agent_message"}}"#, false),
+            (
+                r#"{"input":[{"type":"message","content":[{"type":"agent_message"}]}]}"#,
+                false,
+            ),
+        ] {
+            assert_eq!(
+                has_convertible_agent_message(input.as_bytes()).unwrap(),
+                expected,
+                "{input}"
+            );
+        }
+        assert!(
+            has_convertible_agent_message(br#"{"input":[{"type":"agent_message"}],"unfinished":"#)
+                .is_err()
+        );
+
+        let deep = format!("{}0{}", "[".repeat(1000), "]".repeat(1000));
+        let input = format!(
+            r#"{{"input":[{{"type":"message","content":{deep}}},{{"type":"agent_message"}}]}}"#
+        );
+        assert!(has_convertible_agent_message(input.as_bytes()).unwrap());
+    }
+
+    #[test]
+    fn ordinary_json_escapes_skip_adaptation_but_unicode_names_are_recognized() {
+        let ordinary = br#"{"input":[{"type":"message","content":"\n\r\t\b\f\"\\\/"}]}"#;
+        serde_json::from_slice::<serde_json::Value>(ordinary).unwrap();
+        assert!(!request_may_need_adaptation(ordinary));
+        assert!(!response_may_need_adaptation(ordinary));
+        assert!(!has_convertible_agent_message(ordinary).unwrap());
+        assert!(restore_bytes(ordinary).unwrap().is_none());
+
+        let escaped = br#"{"input":[{"type":"ag\u0065nt_message","content":[] }]}"#;
+        assert!(request_may_need_adaptation(escaped));
+        assert!(has_convertible_agent_message(escaped).unwrap());
+        let prepared = prepare_bytes(escaped, true, "").unwrap().unwrap();
+        let prepared: serde_json::Value = serde_json::from_slice(&prepared).unwrap();
+        assert_eq!(prepared["input"][0]["type"], "message");
+    }
+
+    #[test]
     fn escaped_relevant_name_is_seen() {
-        let input=br#"{"input":[{"type":"function_call","name":"collaboration\u005f\u005fx"}],"text":"a\\nb"}"#;
+        let input=br#"{"input":[{"type":"function_call","name":"collab\u006fration\u005f\u005fx"}],"text":"a\\nb"}"#;
+        assert!(request_may_need_adaptation(input));
         let out = prepare_bytes(input, false, "").unwrap().unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["input"][0]["name"], "collaboration_compat__x");

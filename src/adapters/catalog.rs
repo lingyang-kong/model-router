@@ -127,7 +127,9 @@ impl CatalogFormat {
                     if source == self {
                         crate::catalog::overlay(
                             &mut result,
-                            model.as_object().expect("validated model object"),
+                            std::borrow::Cow::Borrowed(
+                                model.as_object().expect("validated model object"),
+                            ),
                         );
                     } else {
                         for (key, value) in self.settings(&local_shared) {

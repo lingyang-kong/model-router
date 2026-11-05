@@ -473,9 +473,9 @@ async fn codex_multiagent_requests_are_rewritten_and_responses_restored() {
         parent_wire[2].body["input"][0]["content"][0],
         native["input"][0]["content"][0]
     );
-    assert_eq!(parent_probes.lock().unwrap().len(), 1);
+    assert_eq!(parent_probes.lock().unwrap().len(), 0);
 
-    // Probe behavior is request-time and applies to each actual agent_message request.
+    // Probe behavior is request-time and applies to convertible agent messages.
     let unmarked = json!({"model":"worker-model","input":[{"type":"agent_message","author":"worker-1","content":[{"type":"input_text","text":"native"}]}]});
     client
         .post(format!("{}/responses", gateway.url))

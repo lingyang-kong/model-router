@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, hash_map::RandomState},
     hash::{BuildHasher, Hash, Hasher},
     io,
@@ -52,9 +53,9 @@ pub(crate) type ModelRegistry = IndexMap<String, ModelEntry>;
 
 pub(crate) struct CatalogState {
     pub models: ModelRegistry,
-    listings: BTreeMap<(ClientKind, Option<usize>, u64), String>,
+    listings: BTreeMap<(ClientKind, Option<usize>, u64), Arc<str>>,
     credentials: RandomState,
-    file_listing: Option<String>,
+    file_listing: Option<Arc<str>>,
 }
 
 impl CatalogState {
@@ -107,16 +108,16 @@ impl CatalogState {
         )
     }
 
-    pub fn listing(&self, headers: &HeaderMap, origin: Option<&Arc<Provider>>) -> &str {
+    pub fn listing(&self, headers: &HeaderMap, origin: Option<&Arc<Provider>>) -> Arc<str> {
         self.listings
             .get(&self.scope(headers, origin))
             .or(self.file_listing.as_ref())
-            .map(String::as_str)
+            .cloned()
             .unwrap_or_default()
     }
 }
 
-fn model_listing(models: &ModelRegistry) -> String {
+fn model_listing(models: &ModelRegistry) -> Arc<str> {
     let mut listing = String::from(
         "Available model overrides (optional; inherited parent model is preferred):\n",
     );
@@ -145,19 +146,30 @@ fn model_listing(models: &ModelRegistry) -> String {
         listing.push('\n');
     }
     listing.push('\n');
-    listing
+    listing.into()
 }
 
 /// Object fields combine recursively; arrays and scalar values replace the old value.
-pub(crate) fn overlay(target: &mut Value, fields: &Map<String, Value>) {
-    for (key, value) in fields {
-        if let Some(existing) = target.get_mut(key)
-            && existing.is_object()
-            && let Value::Object(fields) = value
-        {
-            overlay(existing, fields);
-        } else {
-            target[key] = value.clone();
+pub(crate) fn overlay(target: &mut Value, fields: Cow<'_, Map<String, Value>>) {
+    let mut merge = |key: &str, value: Cow<'_, Value>| match (target.get_mut(key), value) {
+        (Some(existing @ Value::Object(_)), Cow::Borrowed(Value::Object(fields))) => {
+            overlay(existing, Cow::Borrowed(fields));
+        }
+        (Some(existing @ Value::Object(_)), Cow::Owned(Value::Object(fields))) => {
+            overlay(existing, Cow::Owned(fields));
+        }
+        (_, value) => target[key] = value.into_owned(),
+    };
+    match fields {
+        Cow::Borrowed(fields) => {
+            for (key, value) in fields {
+                merge(key, Cow::Borrowed(value));
+            }
+        }
+        Cow::Owned(fields) => {
+            for (key, value) in fields {
+                merge(&key, Cow::Owned(value));
+            }
         }
     }
 }
@@ -167,10 +179,13 @@ fn resolve_metadata(provider: &Provider, model: &Value, format: CatalogFormat) -
     let mut resolved = Value::Object(format.settings(&provider.defaults.metadata));
     overlay(
         &mut resolved,
-        &format.settings(model.as_object().expect("model ID requires an object")),
+        Cow::Owned(format.settings(model.as_object().expect("model ID requires an object"))),
     );
     if let Some(overrides) = provider.models.get(id) {
-        overlay(&mut resolved, &format.settings(&overrides.metadata));
+        overlay(
+            &mut resolved,
+            Cow::Owned(format.settings(&overrides.metadata)),
+        );
     }
     if format.model_id(&resolved)? != id {
         return Err(Error::bad_gateway(
@@ -559,13 +574,14 @@ impl RouterState {
             .into_iter()
             .flatten()
             .collect();
+        let listing = model_listing(&staged);
         // Validate successful sources together before publishing the partial refresh.
         let mut catalog = self.catalog.write().await;
         for (id, entry) in &staged {
             validate_ownership(&self.config, &catalog.models, id, &entry.provider)?;
         }
         let scope = catalog.scope(&incoming_headers, origin);
-        catalog.listings.insert(scope, model_listing(&staged));
+        catalog.listings.insert(scope, listing);
         catalog.models.extend(staged);
         drop(catalog);
         // FuturesOrdered preserves provider-name order. File sources supply rows
