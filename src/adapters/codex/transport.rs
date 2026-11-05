@@ -8,7 +8,7 @@ use axum::{
 use futures_util::FutureExt;
 use http_body_util::BodyExt;
 use serde_json::Value;
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 
 use crate::{
     body::{buffered_body, request_model},
@@ -114,20 +114,11 @@ pub(in crate::adapters) fn adapt_websocket_response(message: Message) -> Message
 }
 
 pub(in crate::adapters) async fn websocket_request(
-    message: Message,
+    text: Utf8Bytes,
     context: &WebSocketContext,
+    model: Option<&str>,
+    stream_id: Option<Value>,
 ) -> WebSocketAction {
-    let Message::Text(text) = message else {
-        return WebSocketAction::Forward(message);
-    };
-    #[derive(serde::Deserialize, Default)]
-    struct Metadata {
-        stream_id: Option<Value>,
-        model: Option<String>,
-    }
-    let Ok(metadata) = serde_json::from_str::<Metadata>(&text) else {
-        return WebSocketAction::Forward(Message::Text(text));
-    };
     let mut request = axum::http::Request::builder()
         .uri(context.uri.clone())
         .body(())
@@ -140,7 +131,7 @@ pub(in crate::adapters) async fn websocket_request(
         context.origin.as_ref(),
         &parts,
         text.as_bytes(),
-        metadata.model.as_deref().or(context.model.as_deref()),
+        model,
     )
     .await
     {
@@ -150,7 +141,7 @@ pub(in crate::adapters) async fn websocket_request(
                 async move {
                     let event = compaction_transport::failure_event(
                         error.into_response(),
-                        metadata.stream_id.as_ref(),
+                        stream_id.as_ref(),
                     )
                     .await;
                     vec![Message::Text(event.to_string().into())]
@@ -165,7 +156,7 @@ pub(in crate::adapters) async fn websocket_request(
                 "code":"previous_response_not_found",
                 "message":"Synthetic compaction requires full input; retry without previous_response_id"
             }});
-            if let Some(stream_id) = metadata.stream_id {
+            if let Some(stream_id) = stream_id {
                 event["stream_id"] = stream_id;
             }
             return WebSocketAction::Respond(
@@ -195,11 +186,10 @@ pub(in crate::adapters) async fn websocket_request(
             )
             .await
             {
-                Ok(response) => compaction::events(&response, metadata.stream_id.as_ref()),
-                Err(response) => vec![
-                    compaction_transport::failure_event(*response, metadata.stream_id.as_ref())
-                        .await,
-                ],
+                Ok(response) => compaction::events(&response, stream_id.as_ref()),
+                Err(response) => {
+                    vec![compaction_transport::failure_event(*response, stream_id.as_ref()).await]
+                }
             };
             events
                 .into_iter()
