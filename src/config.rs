@@ -12,11 +12,15 @@ use serde::{Deserialize, Deserializer, de::Error as _};
 use serde_json::{Map, Value};
 use url::{Host, Url};
 
+use crate::protocol::{header, token};
 use crate::{
     adapters::{CatalogFormat, ClientKind},
     capabilities::Capabilities,
     error::{Error, Result},
 };
+
+const CONFIG_PATH_ENV: &str = "MODEL_ROUTER_CONFIG";
+const CONFIG_TOML_ENV: &str = "MODEL_ROUTER_CONFIG_TOML";
 
 #[derive(Deserialize)]
 #[serde(tag = "auth", rename_all = "lowercase", deny_unknown_fields)]
@@ -201,7 +205,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        let (text, root) = match env::var_os("MODEL_ROUTER_CONFIG") {
+        let (text, root) = match env::var_os(CONFIG_PATH_ENV) {
             Some(path) => {
                 let path = env::current_dir()?.join(path);
                 let text =
@@ -209,7 +213,7 @@ impl Config {
                 (text, path.parent().unwrap().to_owned())
             }
             None => (
-                env::var("MODEL_ROUTER_CONFIG_TOML")
+                env::var(CONFIG_TOML_ENV)
                     .context("Set MODEL_ROUTER_CONFIG or MODEL_ROUTER_CONFIG_TOML")?,
                 env::current_dir()?,
             ),
@@ -357,26 +361,18 @@ impl Provider {
         let mut headers = incoming.clone();
         sanitize_headers(&mut headers);
         // Request bodies choose their framing, including when trailers are present.
-        headers.remove("content-length");
-        if header_has_token(incoming, "te", "trailers") {
-            headers.insert("te", HeaderValue::from_static("trailers"));
-            headers.insert("connection", HeaderValue::from_static("TE"));
+        headers.remove(header::CONTENT_LENGTH);
+        if header_has_token(incoming, header::TE, token::TRAILERS) {
+            headers.insert(header::TE, HeaderValue::from_static(token::TRAILERS));
+            headers.insert(header::CONNECTION, HeaderValue::from_static("TE"));
         }
         if !matches!(self.auth, AuthMode::Passthrough {}) {
             let removed: Vec<_> = headers
                 .keys()
                 .filter(|name| {
-                    let name = name.as_str();
-                    matches!(
-                        name,
-                        "authorization"
-                            | "cookie"
-                            | "openai-organization"
-                            | "openai-project"
-                            | "x-api-key"
-                            | "api-key"
-                    ) || name.starts_with("chatgpt-")
-                        || name.starts_with("x-openai-")
+                    header::CREDENTIALS.contains(*name)
+                        || name.as_str().starts_with("chatgpt-")
+                        || name.as_str().starts_with("x-openai-")
                 })
                 .cloned()
                 .collect();
@@ -387,7 +383,7 @@ impl Provider {
         if let AuthMode::Bearer { env_key } = &self.auth {
             let key = required_env_var(env_key)?;
             headers.insert(
-                "authorization",
+                header::AUTHORIZATION,
                 HeaderValue::try_from(format!("Bearer {key}"))
                     .map_err(|_| Error::service_unavailable("Invalid provider API credentials"))?,
             );
@@ -425,30 +421,21 @@ pub(crate) fn is_loopback_url(url: &Url) -> bool {
 
 /// Remove encoding, integrity, and trailer metadata; callers handle body framing.
 pub(crate) fn remove_body_headers(headers: &mut HeaderMap) {
-    for name in [
-        "content-encoding",
-        "content-md5",
-        "digest",
-        "content-digest",
-        "repr-digest",
-        "trailer",
-    ] {
+    for name in [header::CONTENT_ENCODING]
+        .into_iter()
+        .chain(header::BODY_INTEGRITY)
+    {
         headers.remove(name);
     }
 }
 
 pub(crate) fn remove_websocket_headers(headers: &mut HeaderMap) {
-    for name in [
-        "sec-websocket-key",
-        "sec-websocket-version",
-        "sec-websocket-protocol",
-        "sec-websocket-extensions",
-    ] {
+    for name in header::WEBSOCKET_HANDSHAKE {
         headers.remove(name);
     }
 }
 
-pub(crate) fn header_has_token(headers: &HeaderMap, name: &str, token: &str) -> bool {
+pub(crate) fn header_has_token(headers: &HeaderMap, name: HeaderName, token: &str) -> bool {
     headers
         .get_all(name)
         .iter()
@@ -458,7 +445,11 @@ pub(crate) fn header_has_token(headers: &HeaderMap, name: &str, token: &str) -> 
 }
 
 pub(crate) fn sanitize_headers(headers: &mut HeaderMap) {
-    let connections: Vec<_> = headers.get_all("connection").iter().cloned().collect();
+    let connections: Vec<_> = headers
+        .get_all(header::CONNECTION)
+        .iter()
+        .cloned()
+        .collect();
     for connection in connections.iter().filter_map(|value| value.to_str().ok()) {
         for name in connection.split(',').map(str::trim) {
             if let Ok(name) = HeaderName::try_from(name) {
@@ -466,17 +457,7 @@ pub(crate) fn sanitize_headers(headers: &mut HeaderMap) {
             }
         }
     }
-    for name in [
-        "host",
-        "connection",
-        "keep-alive",
-        "transfer-encoding",
-        "upgrade",
-        "te",
-        "proxy-authorization",
-        "proxy-authenticate",
-        "proxy-connection",
-    ] {
+    for name in header::HOP_BY_HOP {
         headers.remove(name);
     }
 }

@@ -3,6 +3,7 @@ use serde::Deserialize;
 
 use super::{catalog::CatalogFormat, codex, websocket};
 use crate::error::{Error, Result};
+use crate::protocol::header;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -16,7 +17,7 @@ impl ClientKind {
     pub fn from_headers(headers: &HeaderMap) -> Self {
         match (
             Client::from_headers(headers),
-            headers.contains_key("anthropic-version"),
+            headers.contains_key(header::ANTHROPIC_VERSION),
         ) {
             (Some(Client::Codex), _) => Self::Codex,
             (None, true) => Self::Anthropic,
@@ -40,7 +41,7 @@ pub(crate) enum Client {
 
 impl Client {
     pub fn from_headers(headers: &HeaderMap) -> Option<Self> {
-        let originator = headers.get("originator")?.to_str().ok()?;
+        let originator = headers.get(header::ORIGINATOR)?.to_str().ok()?;
         codex::matches_originator(originator).then_some(Self::Codex)
     }
 

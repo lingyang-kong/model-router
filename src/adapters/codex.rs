@@ -1,4 +1,4 @@
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderName};
 use serde_json::Value;
 
 use super::{
@@ -7,6 +7,7 @@ use super::{
 };
 use crate::capabilities::Capabilities;
 use crate::error::{Error, Result};
+use crate::protocol::{field, pointer, value};
 use serde_json::Map;
 
 mod compaction;
@@ -18,6 +19,37 @@ mod websocket;
 
 pub(super) use transport::{adapt_websocket_response, forward};
 pub(super) use websocket::route as websocket_request;
+
+mod event {
+    pub const CREATE: &str = "response.create";
+    pub const CREATED: &str = "response.created";
+    pub const COMPLETED: &str = "response.completed";
+    pub const IN_PROGRESS: &str = "response.in_progress";
+    pub const FAILED: &str = "response.failed";
+    pub const INCOMPLETE: &str = "response.incomplete";
+    pub const OUTPUT_ITEM_ADDED: &str = "response.output_item.added";
+    pub const OUTPUT_ITEM_DONE: &str = "response.output_item.done";
+}
+
+mod collaboration_tool {
+    pub const SPAWN_AGENT: &str = "spawn_agent";
+    pub const SEND_MESSAGE: &str = "send_message";
+    pub const FOLLOWUP_TASK: &str = "followup_task";
+}
+
+mod error_code {
+    pub const CONTEXT_LENGTH_EXCEEDED: &str = "context_length_exceeded";
+    pub const MAX_CONTEXT_LENGTH_EXCEEDED: &str = "max_context_length_exceeded";
+    pub const PREVIOUS_RESPONSE_NOT_FOUND: &str = "previous_response_not_found";
+    pub const WEBSOCKET_UPGRADE_REJECTED: &str = "websocket_upgrade_rejected";
+}
+
+const ROUTING_HINT_HEADER: HeaderName = HeaderName::from_static("x-codex-routing-hint");
+const FULL_HISTORY_REQUIRED: &str = "Synthetic compaction requires the complete input history";
+const SSE_DATA_PREFIX: &[u8] = b"data: ";
+const GPT_IDENTITY_PREFIX: &str = "GPT-";
+const REASONING_SUMMARIES: &[&str] = &[value::AUTO, "concise", "detailed", value::NONE];
+const VERBOSITIES: &[&str] = &["low", "medium", "high"];
 
 pub(super) fn matches_originator(originator: &str) -> bool {
     originator.to_ascii_lowercase().contains("codex")
@@ -35,14 +67,18 @@ fn rename_reasoning_levels(value: Option<&mut Value>, from: &str, to: &str) {
 
 pub(super) fn postprocess_settings(fields: &mut Map<String, Value>) {
     rename_reasoning_levels(
-        fields.get_mut("supported_reasoning_levels"),
-        "level",
-        "effort",
+        fields.get_mut(field::SUPPORTED_REASONING_LEVELS),
+        field::LEVEL,
+        field::EFFORT,
     );
 }
 
 pub(super) fn postprocess_shared_metadata(fields: &mut Map<String, Value>) {
-    rename_reasoning_levels(fields.get_mut("reasoning_levels"), "effort", "level");
+    rename_reasoning_levels(
+        fields.get_mut(field::REASONING_LEVELS),
+        field::EFFORT,
+        field::LEVEL,
+    );
 }
 
 pub(super) fn apply_context_window(
@@ -51,8 +87,11 @@ pub(super) fn apply_context_window(
     model: &Value,
 ) {
     if let Some(context) = source.context_window(model) {
-        result.as_object_mut().unwrap().remove("context_window");
-        result["max_context_window"] = context.clone();
+        result
+            .as_object_mut()
+            .unwrap()
+            .remove(field::CONTEXT_WINDOW);
+        result[field::MAX_CONTEXT_WINDOW] = context.clone();
     }
 }
 
@@ -62,29 +101,32 @@ pub(super) fn apply_projection_metadata(
     local_shared: &Map<String, Value>,
     target_id: &str,
 ) {
-    if has_base && !local_shared.contains_key("name") {
-        result["display_name"] = Value::String(target_id.to_owned());
+    if has_base && !local_shared.contains_key(field::NAME) {
+        result[field::DISPLAY_NAME] = Value::String(target_id.to_owned());
     }
 }
 
 pub(super) const CATALOG: CatalogLayout = CatalogLayout {
-    models: "models",
-    id: "slug",
+    models: field::MODELS,
+    id: field::SLUG,
 };
 
 /// Apply resolved capability facts to a projected Codex row.
 pub(super) fn apply_capabilities(model: &mut Value, capabilities: &Capabilities) {
     for (fact, field) in [
-        (capabilities.responses_lite, "use_responses_lite"),
-        (capabilities.tool_search, "supports_search_tool"),
+        (capabilities.responses_lite, field::USE_RESPONSES_LITE),
+        (capabilities.tool_search, field::SUPPORTS_SEARCH_TOOL),
         (
             capabilities.image_detail_original,
-            "supports_image_detail_original",
+            field::SUPPORTS_IMAGE_DETAIL_ORIGINAL,
         ),
-        (capabilities.history_notes, "supports_experimental_context"),
+        (
+            capabilities.history_notes,
+            field::SUPPORTS_EXPERIMENTAL_CONTEXT,
+        ),
         (
             capabilities.reasoning_summary,
-            "supports_reasoning_summary_parameter",
+            field::SUPPORTS_REASONING_SUMMARY_PARAMETER,
         ),
     ] {
         if let Some(value) = fact {
@@ -95,9 +137,9 @@ pub(super) fn apply_capabilities(model: &mut Value, capabilities: &Capabilities)
 
     if capabilities.service_tiers == Some(false) || capabilities.service_tier_ids.is_some() {
         for field in [
-            "additional_speed_tiers",
-            "service_tiers",
-            "default_service_tier",
+            field::ADDITIONAL_SPEED_TIERS,
+            field::SERVICE_TIERS,
+            field::DEFAULT_SERVICE_TIER,
         ] {
             model.as_object_mut().unwrap().remove(field);
         }
@@ -105,9 +147,9 @@ pub(super) fn apply_capabilities(model: &mut Value, capabilities: &Capabilities)
     if capabilities.service_tiers != Some(false)
         && let Some(ids) = &capabilities.service_tier_ids
     {
-        model["service_tiers"] = Value::Array(
+        model[field::SERVICE_TIERS] = Value::Array(
             ids.iter()
-                .filter(|id| !matches!(id.as_str(), "auto" | "default"))
+                .filter(|id| !matches!(id.as_str(), value::AUTO | value::DEFAULT))
                 .map(|id| serde_json::json!({"id": id, "name": id, "description": ""}))
                 .collect(),
         );
@@ -116,22 +158,25 @@ pub(super) fn apply_capabilities(model: &mut Value, capabilities: &Capabilities)
         model
             .as_object_mut()
             .unwrap()
-            .remove("web_search_tool_type");
+            .remove(field::WEB_SEARCH_TOOL_TYPE);
     }
     if capabilities.access_programs == Some(false) {
-        model["available_access_programs"] = serde_json::json!({"cyber": []});
+        model[field::AVAILABLE_ACCESS_PROGRAMS] = serde_json::json!({"cyber": []});
     }
 
     if let Some(images) = capabilities.images {
-        let modalities = model.get_mut("input_modalities");
+        let modalities = model.get_mut(field::INPUT_MODALITIES);
         match (images, modalities) {
             (false, Some(Value::Array(values))) => {
-                values.retain(|value| value.as_str() != Some("image"));
+                values.retain(|value| value.as_str() != Some(value::IMAGE));
             }
-            (false, None) => model["input_modalities"] = serde_json::json!(["text"]),
+            (false, None) => model[field::INPUT_MODALITIES] = serde_json::json!(["text"]),
             (true, Some(Value::Array(values))) => {
-                if !values.iter().any(|value| value.as_str() == Some("image")) {
-                    values.push(Value::String("image".into()));
+                if !values
+                    .iter()
+                    .any(|value| value.as_str() == Some(value::IMAGE))
+                {
+                    values.push(Value::String(value::IMAGE.into()));
                 }
             }
             // Codex's omission default already includes both text and image.
@@ -145,48 +190,51 @@ pub(super) fn apply_capabilities(model: &mut Value, capabilities: &Capabilities)
 
 fn apply_response_metadata(model: &mut Value, capabilities: &Capabilities) {
     if let Some(default) = &capabilities.reasoning_summary_default {
-        if matches!(default.as_str(), "auto" | "concise" | "detailed" | "none") {
-            model["default_reasoning_summary"] = Value::String(default.clone());
+        if REASONING_SUMMARIES.contains(&default.as_str()) {
+            model[field::DEFAULT_REASONING_SUMMARY] = Value::String(default.clone());
         } else {
             model
                 .as_object_mut()
                 .unwrap()
-                .remove("default_reasoning_summary");
+                .remove(field::DEFAULT_REASONING_SUMMARY);
         }
     }
     if let Some(levels) = &capabilities.reasoning_summary_levels {
         let current = model
-            .get("default_reasoning_summary")
+            .get(field::DEFAULT_REASONING_SUMMARY)
             .and_then(Value::as_str)
-            .unwrap_or("auto");
+            .unwrap_or(value::AUTO);
         if !levels.iter().any(|level| level == current) {
             if let Some(default) = levels
                 .iter()
-                .find(|level| matches!(level.as_str(), "auto" | "concise" | "detailed" | "none"))
+                .find(|level| REASONING_SUMMARIES.contains(&level.as_str()))
             {
-                model["default_reasoning_summary"] = Value::String(default.clone());
+                model[field::DEFAULT_REASONING_SUMMARY] = Value::String(default.clone());
             } else {
-                model["supports_reasoning_summary_parameter"] = Value::Bool(false);
+                model[field::SUPPORTS_REASONING_SUMMARY_PARAMETER] = Value::Bool(false);
                 model
                     .as_object_mut()
                     .unwrap()
-                    .remove("default_reasoning_summary");
+                    .remove(field::DEFAULT_REASONING_SUMMARY);
             }
         }
     }
     if let Some(levels) = &capabilities.verbosity_levels {
-        model["support_verbosity"] = Value::Bool(
+        model[field::SUPPORT_VERBOSITY] = Value::Bool(
             levels
                 .iter()
-                .any(|level| matches!(level.as_str(), "low" | "medium" | "high")),
+                .any(|level| VERBOSITIES.contains(&level.as_str())),
         );
-        remove_excluded_default(model, "default_verbosity", levels);
+        remove_excluded_default(model, field::DEFAULT_VERBOSITY, levels);
     }
     if let Some(default) = &capabilities.verbosity_default {
-        if matches!(default.as_str(), "low" | "medium" | "high") {
-            model["default_verbosity"] = Value::String(default.clone());
+        if VERBOSITIES.contains(&default.as_str()) {
+            model[field::DEFAULT_VERBOSITY] = Value::String(default.clone());
         } else {
-            model.as_object_mut().unwrap().remove("default_verbosity");
+            model
+                .as_object_mut()
+                .unwrap()
+                .remove(field::DEFAULT_VERBOSITY);
         }
     }
 }
@@ -206,27 +254,27 @@ fn prune_defaults(model: &mut Value) {
     let Some(fields) = model.as_object_mut() else {
         return;
     };
-    if fields.get("supports_reasoning_summary_parameter") == Some(&Value::Bool(true)) {
-        fields.remove("supports_reasoning_summary_parameter");
+    if fields.get(field::SUPPORTS_REASONING_SUMMARY_PARAMETER) == Some(&Value::Bool(true)) {
+        fields.remove(field::SUPPORTS_REASONING_SUMMARY_PARAMETER);
     }
     if fields
-        .get("default_reasoning_summary")
+        .get(field::DEFAULT_REASONING_SUMMARY)
         .and_then(Value::as_str)
-        == Some("auto")
+        == Some(value::AUTO)
     {
-        fields.remove("default_reasoning_summary");
+        fields.remove(field::DEFAULT_REASONING_SUMMARY);
     }
     for field in [
-        "use_responses_lite",
-        "supports_search_tool",
-        "supports_image_detail_original",
-        "supports_experimental_context",
+        field::USE_RESPONSES_LITE,
+        field::SUPPORTS_SEARCH_TOOL,
+        field::SUPPORTS_IMAGE_DETAIL_ORIGINAL,
+        field::SUPPORTS_EXPERIMENTAL_CONTEXT,
     ] {
         if fields.get(field) == Some(&Value::Bool(false)) {
             fields.remove(field);
         }
     }
-    for field in ["additional_speed_tiers", "service_tiers"] {
+    for field in [field::ADDITIONAL_SPEED_TIERS, field::SERVICE_TIERS] {
         if fields
             .get(field)
             .and_then(Value::as_array)
@@ -236,19 +284,23 @@ fn prune_defaults(model: &mut Value) {
         }
     }
     if fields
-        .get("default_service_tier")
+        .get(field::DEFAULT_SERVICE_TIER)
         .is_some_and(Value::is_null)
     {
-        fields.remove("default_service_tier");
+        fields.remove(field::DEFAULT_SERVICE_TIER);
     }
     if fields
-        .get("available_access_programs")
+        .get(field::AVAILABLE_ACCESS_PROGRAMS)
         .is_some_and(Value::is_null)
     {
-        fields.remove("available_access_programs");
+        fields.remove(field::AVAILABLE_ACCESS_PROGRAMS);
     }
-    if fields.get("web_search_tool_type").and_then(Value::as_str) == Some("text") {
-        fields.remove("web_search_tool_type");
+    if fields
+        .get(field::WEB_SEARCH_TOOL_TYPE)
+        .and_then(Value::as_str)
+        == Some(value::TEXT)
+    {
+        fields.remove(field::WEB_SEARCH_TOOL_TYPE);
     }
 }
 
@@ -257,34 +309,34 @@ pub(super) fn rewrite_inherited_instructions(
     local_native_model: Option<&Value>,
 ) {
     if local_native_model
-        .and_then(|local| local.get("base_instructions"))
+        .and_then(|local| local.get(field::BASE_INSTRUCTIONS))
         .is_none()
-        && let Some(text) = model.get("base_instructions").and_then(Value::as_str)
+        && let Some(text) = model.get(field::BASE_INSTRUCTIONS).and_then(Value::as_str)
         && let Some(rewritten) = rewrite_identity(text, model)
     {
-        model["base_instructions"] = Value::String(rewritten);
+        model[field::BASE_INSTRUCTIONS] = Value::String(rewritten);
     }
     let explicit = local_native_model
-        .and_then(|local| local.get("model_messages"))
-        .and_then(|messages| messages.get("instructions_template"))
+        .and_then(|local| local.get(field::MODEL_MESSAGES))
+        .and_then(|messages| messages.get(field::INSTRUCTIONS_TEMPLATE))
         .is_some();
     if !explicit
         && let Some(text) = model
-            .pointer("/model_messages/instructions_template")
+            .pointer(pointer::INSTRUCTIONS_TEMPLATE)
             .and_then(Value::as_str)
         && let Some(rewritten) = rewrite_identity(text, model)
     {
-        model["model_messages"]["instructions_template"] = Value::String(rewritten);
+        model[field::MODEL_MESSAGES][field::INSTRUCTIONS_TEMPLATE] = Value::String(rewritten);
     }
 }
 
 fn rewrite_identity(template: &str, model: &Value) -> Option<String> {
-    let start = template.find("GPT-")?;
+    let start = template.find(GPT_IDENTITY_PREFIX)?;
     let token = template[start..].split(char::is_whitespace).next()?;
     let name = token.trim_end_matches(|ch: char| {
         ch.is_ascii_punctuation() || matches!(ch, '’' | '”' | '»' | '…' | '—' | '–')
     });
-    if name.len() <= "GPT-".len() {
+    if name.len() <= GPT_IDENTITY_PREFIX.len() {
         return None;
     }
     let punctuation = &token[name.len()..];
@@ -298,15 +350,15 @@ fn rewrite_identity(template: &str, model: &Value) -> Option<String> {
         "{}{}, not GPT{punctuation}{suffix}",
         &template[..start],
         model
-            .get("display_name")
+            .get(field::DISPLAY_NAME)
             .and_then(Value::as_str)
-            .or_else(|| model.get("slug").and_then(Value::as_str))
-            .unwrap_or("model"),
+            .or_else(|| model.get(field::SLUG).and_then(Value::as_str))
+            .unwrap_or(value::MODEL),
     ))
 }
 
 pub(super) fn model_hint<'a>(headers: &'a HeaderMap, hint: &mut ModelHint<'a>) -> Result<()> {
-    for value in headers.get_all("x-codex-routing-hint") {
+    for value in headers.get_all(ROUTING_HINT_HEADER) {
         let value = value
             .to_str()
             .map_err(|_| Error::bad_request("Invalid Codex routing hint"))?;

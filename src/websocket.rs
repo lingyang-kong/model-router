@@ -8,6 +8,7 @@ use axum::{
 };
 use hyper_util::rt::TokioIo;
 
+use crate::protocol::{header, token};
 use crate::{
     adapters::{Client, ModelHint, websocket::WebSocketContext},
     body::stream_body,
@@ -52,7 +53,7 @@ pub(crate) async fn forward(
         let status = rejection_status(response.status());
         let mut response = stream_response(response);
         if response.status() != status {
-            response.headers_mut().remove("content-length");
+            response.headers_mut().remove(header::CONTENT_LENGTH);
         }
         *response.status_mut() = status;
         return Ok(response);
@@ -98,13 +99,17 @@ pub(crate) async fn connect(
     let (client, mut request) = state.prepare_request(provider, origin, parts, body)?;
     restore_upgrade_headers(&parts.headers, request.headers_mut());
     if adapted {
-        request.headers_mut().remove("sec-websocket-extensions");
+        request
+            .headers_mut()
+            .remove(header::SEC_WEBSOCKET_EXTENSIONS);
     }
     *request.version_mut() = Version::HTTP_11;
     let response = client.execute(request).await.map_err(Error::bad_gateway)?;
     if adapted
         && response.status() == StatusCode::SWITCHING_PROTOCOLS
-        && response.headers().contains_key("sec-websocket-extensions")
+        && response
+            .headers()
+            .contains_key(header::SEC_WEBSOCKET_EXTENSIONS)
     {
         return Err(Error::bad_gateway(
             "Upstream negotiated an unsupported WebSocket extension",
@@ -131,18 +136,18 @@ pub(crate) fn rejection_status(status: StatusCode) -> StatusCode {
 
 /// Re-establish the upgrade on each HTTP hop; negotiation headers pass through.
 fn restore_upgrade_headers(original: &HeaderMap, headers: &mut HeaderMap) {
-    if header_has_token(original, "connection", "upgrade") {
-        headers.append("connection", HeaderValue::from_static("upgrade"));
+    if header_has_token(original, header::CONNECTION, token::UPGRADE) {
+        headers.append(header::CONNECTION, HeaderValue::from_static(token::UPGRADE));
     }
-    headers.remove("upgrade");
-    for value in original.get_all("upgrade") {
-        headers.append("upgrade", value.clone());
+    headers.remove(header::UPGRADE);
+    for value in original.get_all(header::UPGRADE) {
+        headers.append(header::UPGRADE, value.clone());
     }
 }
 
 fn model_hint(headers: &HeaderMap, client: Option<Client>) -> Result<Option<&str>> {
     let mut model = ModelHint::default();
-    for value in headers.get_all("x-model") {
+    for value in headers.get_all(header::X_MODEL) {
         let value = value
             .to_str()
             .map_err(|_| Error::bad_request("Invalid WebSocket model hint"))?;

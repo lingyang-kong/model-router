@@ -23,7 +23,10 @@ use tokio_tungstenite::{
     },
 };
 
+use crate::protocol::header;
 use crate::{adapters::Client, config::Provider, error::Error, router::RouterState};
+
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 pub(crate) struct WebSocketContext {
@@ -47,7 +50,7 @@ impl WebSocketContext {
         *request.headers_mut() = self.headers.clone();
         let (mut parts, _) = request.into_parts();
         parts.headers.insert(
-            "sec-websocket-key",
+            header::SEC_WEBSOCKET_KEY,
             tokio_tungstenite::tungstenite::handshake::client::generate_key()
                 .parse()
                 .unwrap(),
@@ -127,7 +130,7 @@ pub(crate) async fn relay(
                         if let Some(sink) = upstream_sink.as_mut() {
                             finish_close(&mut downstream_sink, sink, close).await;
                         } else {
-                            let _ = tokio::time::timeout(Duration::from_secs(1), downstream_sink.flush()).await;
+                            let _ = tokio::time::timeout(CLOSE_TIMEOUT, downstream_sink.flush()).await;
                         }
                         return;
                     }
@@ -232,7 +235,7 @@ async fn finish_close<S, D>(
 {
     // Finish both hops normally, but do not retain a cancelled session forever
     // if either peer has stopped reading. This grace applies only after Close.
-    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, async {
         let _ = tokio::join!(source.flush(), destination.send(close));
         // A simultaneous peer Close can reject send() while its automatic
         // reply is still queued. Flush that reply as well.
