@@ -7,6 +7,12 @@ use serde_json::json;
 
 pub(crate) type Result<T> = std::result::Result<T, Error>;
 
+mod kind {
+    pub const INVALID_REQUEST: &str = "invalid_request_error";
+    pub const NOT_FOUND: &str = "not_found_error";
+    pub const API: &str = "api_error";
+}
+
 #[derive(Debug)]
 pub(crate) struct Error(StatusCode, String);
 
@@ -46,10 +52,10 @@ impl Error {
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let Self(status, message) = self;
-        let kind = match status.as_u16() {
-            400 => "invalid_request_error",
-            404 => "not_found_error",
-            _ => "api_error",
+        let kind = match status {
+            StatusCode::BAD_REQUEST => kind::INVALID_REQUEST,
+            StatusCode::NOT_FOUND => kind::NOT_FOUND,
+            _ => kind::API,
         };
         (
             status,

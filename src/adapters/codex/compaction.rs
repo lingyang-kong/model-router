@@ -10,7 +10,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use super::{error_code, event};
 use crate::error::{Error, Result};
+use crate::protocol::{field, item_type, pointer, role, value};
 
 const MARKER: &str = "model-router:compaction:v1:";
 const SYNTHETIC_RESPONSE_PREFIX: &str = "resp_model_router_";
@@ -86,10 +88,10 @@ impl SummaryRequest {
     pub(super) fn body(&self) -> Result<Vec<u8>> {
         let mut input: Vec<&RawValue> = self.history.iter().map(|item| item.as_ref()).collect();
         let prompt = serde_json::value::to_raw_value(&UserMessage {
-            kind: "message",
-            role: "user",
+            kind: item_type::MESSAGE,
+            role: role::USER,
             content: vec![TextContent {
-                kind: "input_text",
+                kind: item_type::INPUT_TEXT,
                 text: NATIVE_PROMPT,
             }],
         })
@@ -104,7 +106,7 @@ impl SummaryRequest {
             stream: false,
             store: false,
             tools: Vec::new(),
-            tool_choice: "none",
+            tool_choice: value::NONE,
         };
         serde_json::to_vec(&body).map_err(Error::bad_request)
     }
@@ -119,7 +121,7 @@ impl SummaryRequest {
             .history
             .iter()
             .rposition(|item| {
-                item_meta(item).ok().and_then(|meta| meta.role).as_deref() == Some("user")
+                item_meta(item).ok().and_then(|meta| meta.role).as_deref() == Some(role::USER)
             })
             .unwrap_or_else(|| self.history.len().saturating_sub(1));
         let Some(candidate) = self
@@ -127,8 +129,8 @@ impl SummaryRequest {
             .iter()
             .position(|item| {
                 item_meta(item).ok().is_none_or(|meta| {
-                    !matches!(meta.role.as_deref(), Some("system" | "developer"))
-                        && meta.kind.as_deref() != Some("instructions")
+                    !matches!(meta.role.as_deref(), Some(role::SYSTEM | role::DEVELOPER))
+                        && meta.kind.as_deref() != Some(item_type::INSTRUCTIONS)
                 })
             })
             .filter(|index| *index < last_user)
@@ -163,51 +165,51 @@ impl SummaryRequest {
 
     pub(super) fn finish(&self, response_bytes: &[u8]) -> Result<Value> {
         let response: Value = serde_json::from_slice(response_bytes).map_err(Error::bad_gateway)?;
-        if response.get("status").and_then(Value::as_str) != Some("completed")
-            || response.get("error").is_some_and(|v| !v.is_null())
+        if response.get(field::STATUS).and_then(Value::as_str) != Some(value::COMPLETED)
+            || response.get(field::ERROR).is_some_and(|v| !v.is_null())
             || response
-                .get("incomplete_details")
+                .get(field::INCOMPLETE_DETAILS)
                 .is_some_and(|v| !v.is_null())
         {
             return Err(Error::bad_gateway("Compaction summary did not complete"));
         }
         let output = response
-            .get("output")
+            .get(field::OUTPUT)
             .and_then(Value::as_array)
             .ok_or_else(|| Error::bad_gateway("Compaction response has no output"))?;
         let mut text = String::new();
         for item in output {
-            if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+            if item.get(field::TYPE).and_then(Value::as_str) == Some(item_type::REASONING) {
                 continue;
             }
-            if item.get("type").and_then(Value::as_str) != Some("message")
-                || item.get("role").and_then(Value::as_str) != Some("assistant")
+            if item.get(field::TYPE).and_then(Value::as_str) != Some(item_type::MESSAGE)
+                || item.get(field::ROLE).and_then(Value::as_str) != Some(role::ASSISTANT)
             {
                 return Err(Error::bad_gateway(
                     "Compaction response attempted a tool call",
                 ));
             }
             if item
-                .get("status")
+                .get(field::STATUS)
                 .and_then(Value::as_str)
-                .is_some_and(|status| status != "completed")
+                .is_some_and(|status| status != value::COMPLETED)
             {
                 return Err(Error::bad_gateway(
                     "Compaction summary message did not complete",
                 ));
             }
             for content in item
-                .get("content")
+                .get(field::CONTENT)
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
             {
-                match content.get("type").and_then(Value::as_str) {
-                    Some("refusal") => {
+                match content.get(field::TYPE).and_then(Value::as_str) {
+                    Some(item_type::REFUSAL) => {
                         return Err(Error::bad_gateway("Compaction summary was refused"));
                     }
-                    Some("output_text") => {
-                        if let Some(s) = content.get("text").and_then(Value::as_str) {
+                    Some(item_type::OUTPUT_TEXT) => {
+                        if let Some(s) = content.get(field::TEXT).and_then(Value::as_str) {
                             text.push_str(s);
                         }
                     }
@@ -234,22 +236,22 @@ impl SummaryRequest {
             "id": format!("{SYNTHETIC_RESPONSE_PREFIX}{suffix}"),
             "created_at": now.as_secs(),
             "object":"response", "status":"completed",
-            "output":[{"type":"compaction","id":id,"encrypted_content":format!("{MARKER}{text}")}],
-            "usage":response.get("usage").cloned().unwrap_or(Value::Null)
+            "output":[{"type":item_type::COMPACTION,"id":id,"encrypted_content":format!("{MARKER}{text}")}],
+            "usage":response.get(field::USAGE).cloned().unwrap_or(Value::Null)
         });
         if let Some(model) = response
-            .get("model")
+            .get(field::MODEL)
             .and_then(Value::as_str)
             .or(self.model.as_deref())
         {
-            compacted["model"] = Value::String(model.to_owned());
+            compacted[field::MODEL] = Value::String(model.to_owned());
         }
         Ok(compacted)
     }
 }
 
 pub(super) fn prepare(bytes: &[u8], mode: Mode, effective_model: Option<&str>) -> Result<Prepared> {
-    if !may_contain(bytes, b"compaction") {
+    if !may_contain(bytes, item_type::COMPACTION.as_bytes()) {
         return Ok(Prepared {
             rewritten: None,
             summary: None,
@@ -258,7 +260,7 @@ pub(super) fn prepare(bytes: &[u8], mode: Mode, effective_model: Option<&str>) -
     }
     let fields: std::collections::HashMap<String, Box<RawValue>> =
         serde_json::from_slice(bytes).map_err(Error::bad_request)?;
-    let Some(input_raw) = fields.get("input") else {
+    let Some(input_raw) = fields.get(field::INPUT) else {
         return Ok(Prepared {
             rewritten: None,
             summary: None,
@@ -281,8 +283,8 @@ pub(super) fn prepare(bytes: &[u8], mode: Mode, effective_model: Option<&str>) -
             continue;
         };
         match meta.kind.as_deref() {
-            Some("compaction_trigger") => trigger_positions.push(index),
-            Some("compaction") => checkpoints.push((index, meta.encrypted_content)),
+            Some(item_type::COMPACTION_TRIGGER) => trigger_positions.push(index),
+            Some(item_type::COMPACTION) => checkpoints.push((index, meta.encrypted_content)),
             _ => {}
         }
     }
@@ -329,7 +331,7 @@ pub(super) fn prepare(bytes: &[u8], mode: Mode, effective_model: Option<&str>) -
             continue;
         } else if mode == Mode::Text
             && item_meta(item).ok().is_some_and(|meta| {
-                meta.kind.as_deref() == Some("reasoning")
+                meta.kind.as_deref() == Some(item_type::REASONING)
                     && !meta.has_readable_reasoning
                     && (meta.has_encrypted_content
                         && meta
@@ -360,32 +362,31 @@ pub(super) fn prepare(bytes: &[u8], mode: Mode, effective_model: Option<&str>) -
         });
     }
     let model = fields
-        .get("model")
+        .get(field::MODEL)
         .and_then(|value| serde_json::from_str::<String>(value.get()).ok())
         .or_else(|| effective_model.map(str::to_owned));
     if fields
-        .get("previous_response_id")
-        .is_some_and(|v| v.get() != "null")
+        .get(field::PREVIOUS_RESPONSE_ID)
+        .is_some_and(|v| v.get() != value::NULL)
         && !has_synthetic_checkpoint
     {
-        return Err(Error::bad_request(
-            "Synthetic compaction requires the complete input history",
-        ));
+        return Err(Error::bad_request(super::FULL_HISTORY_REQUIRED));
     }
     let history = hydrated
         .into_iter()
         .filter(|item| {
-            item_meta(item).ok().and_then(|meta| meta.kind).as_deref() != Some("additional_tools")
+            item_meta(item).ok().and_then(|meta| meta.kind).as_deref()
+                != Some(item_type::ADDITIONAL_TOOLS)
         })
         .collect();
     let request = SummaryRequest {
         model,
-        instructions: fields.get("instructions").cloned(),
-        reasoning: fields.get("reasoning").cloned(),
-        max_output_tokens: fields.get("max_output_tokens").cloned(),
+        instructions: fields.get(field::INSTRUCTIONS).cloned(),
+        reasoning: fields.get(field::REASONING).cloned(),
+        max_output_tokens: fields.get(field::MAX_OUTPUT_TOKENS).cloned(),
         history,
         stream: fields
-            .get("stream")
+            .get(field::STREAM)
             .and_then(|v| serde_json::from_str::<bool>(v.get()).ok())
             .unwrap_or(false),
     };
@@ -399,12 +400,12 @@ pub(super) fn prepare(bytes: &[u8], mode: Mode, effective_model: Option<&str>) -
 /// Detect `previous_response_id` references that require full-history replay.
 /// Upstreams cannot resolve router IDs, and text compaction needs the input history.
 pub(super) fn needs_full_history(bytes: &[u8], mode: Mode) -> Result<bool> {
-    if !may_contain(bytes, b"previous_response_id") {
+    if !may_contain(bytes, field::PREVIOUS_RESPONSE_ID.as_bytes()) {
         return Ok(false);
     }
     let fields: std::collections::HashMap<String, &RawValue> =
         serde_json::from_slice(bytes).map_err(Error::bad_request)?;
-    let Some(previous) = fields.get("previous_response_id") else {
+    let Some(previous) = fields.get(field::PREVIOUS_RESPONSE_ID) else {
         return Ok(false);
     };
     let previous = serde_json::from_str::<String>(previous.get()).ok();
@@ -417,7 +418,7 @@ pub(super) fn needs_full_history(bytes: &[u8], mode: Mode) -> Result<bool> {
     if mode != Mode::Text || previous.is_none() {
         return Ok(false);
     }
-    let Some(input) = fields.get("input") else {
+    let Some(input) = fields.get(field::INPUT) else {
         return Ok(false);
     };
     if !input.get().trim_start().starts_with('[') {
@@ -427,7 +428,7 @@ pub(super) fn needs_full_history(bytes: &[u8], mode: Mode) -> Result<bool> {
     Ok(items
         .last()
         .and_then(|item| item_meta(item).ok())
-        .is_some_and(|meta| meta.kind.as_deref() == Some("compaction_trigger")))
+        .is_some_and(|meta| meta.kind.as_deref() == Some(item_type::COMPACTION_TRIGGER)))
 }
 
 fn rebuild(
@@ -436,11 +437,11 @@ fn rebuild(
     strip_previous_response_id: bool,
 ) -> Result<Vec<u8>> {
     fields.insert(
-        "input".into(),
+        field::INPUT.into(),
         serde_json::value::to_raw_value(items).map_err(Error::bad_request)?,
     );
     if strip_previous_response_id {
-        fields.remove("previous_response_id");
+        fields.remove(field::PREVIOUS_RESPONSE_ID);
     }
     serde_json::to_vec(&fields).map_err(Error::bad_request)
 }
@@ -450,7 +451,7 @@ fn may_contain(bytes: &[u8], token: &[u8]) -> bool {
 }
 
 fn hydrated_message(summary: &str) -> Result<Box<RawValue>> {
-    let message = serde_json::json!({"type":"message","role":"user","content":[{"type":"input_text","text":format!("{NATIVE_SUMMARY_PREFIX}\n{summary}")}]});
+    let message = serde_json::json!({"type":item_type::MESSAGE,"role":role::USER,"content":[{"type":item_type::INPUT_TEXT,"text":format!("{NATIVE_SUMMARY_PREFIX}\n{summary}")}]});
     serde_json::value::to_raw_value(&message).map_err(Error::bad_request)
 }
 
@@ -458,7 +459,7 @@ fn item_meta(raw: &RawValue) -> serde_json::Result<ItemMeta> {
     let fields: std::collections::HashMap<String, &RawValue> = serde_json::from_str(raw.get())?;
     let string = |name: &str| {
         fields.get(name).map_or(Ok(None), |value| {
-            if value.get() == "null" {
+            if value.get() == value::NULL {
                 Ok(None)
             } else {
                 serde_json::from_str::<String>(value.get()).map(Some)
@@ -466,13 +467,14 @@ fn item_meta(raw: &RawValue) -> serde_json::Result<ItemMeta> {
         })
     };
     Ok(ItemMeta {
-        kind: string("type").unwrap_or(None),
-        encrypted_content: string("encrypted_content").unwrap_or(None),
+        kind: string(field::TYPE).unwrap_or(None),
+        encrypted_content: string(field::ENCRYPTED_CONTENT).unwrap_or(None),
         has_encrypted_content: fields
-            .get("encrypted_content")
-            .is_some_and(|value| value.get() != "null"),
-        has_readable_reasoning: string("type").ok().flatten().as_deref() == Some("reasoning")
-            && ["summary", "content"].iter().any(|key| {
+            .get(field::ENCRYPTED_CONTENT)
+            .is_some_and(|value| value.get() != value::NULL),
+        has_readable_reasoning: string(field::TYPE).ok().flatten().as_deref()
+            == Some(item_type::REASONING)
+            && [field::SUMMARY, field::CONTENT].iter().any(|key| {
                 fields
                     .get(*key)
                     .and_then(|value| serde_json::from_str::<Vec<&RawValue>>(value.get()).ok())
@@ -489,27 +491,27 @@ fn item_meta(raw: &RawValue) -> serde_json::Result<ItemMeta> {
                         })
                     })
             }),
-        call_id: string("call_id").unwrap_or(None),
-        role: string("role").unwrap_or(None),
+        call_id: string(field::CALL_ID).unwrap_or(None),
+        role: string(field::ROLE).unwrap_or(None),
     })
 }
 
 pub(super) fn is_context_overflow(status: u16, body: &[u8]) -> bool {
-    if status != 400 {
+    if status != axum::http::StatusCode::BAD_REQUEST.as_u16() {
         return false;
     }
     let Ok(error) = serde_json::from_slice::<Value>(body) else {
         return false;
     };
     if matches!(
-        error.pointer("/error/code").and_then(Value::as_str),
-        Some("context_length_exceeded" | "max_context_length_exceeded")
+        error.pointer(pointer::ERROR_CODE).and_then(Value::as_str),
+        Some(error_code::CONTEXT_LENGTH_EXCEEDED | error_code::MAX_CONTEXT_LENGTH_EXCEEDED)
     ) {
         return true;
     }
     // Some Responses servers expose a numeric error code with these explicit diagnostics.
     error
-        .pointer("/error/message")
+        .pointer(pointer::ERROR_MESSAGE)
         .and_then(Value::as_str)
         .is_some_and(|message| {
             message.starts_with("Requested token count exceeds the model's maximum context length ")
@@ -519,9 +521,9 @@ pub(super) fn is_context_overflow(status: u16, body: &[u8]) -> bool {
 }
 
 pub(super) fn events(response: &Value, stream_id: Option<&Value>) -> Vec<Value> {
-    let id = response.get("id").cloned().unwrap_or(Value::Null);
+    let id = response.get(field::ID).cloned().unwrap_or(Value::Null);
     let output = response
-        .get("output")
+        .get(field::OUTPUT)
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
@@ -529,10 +531,10 @@ pub(super) fn events(response: &Value, stream_id: Option<&Value>) -> Vec<Value> 
     let mut seq = 0u64;
     let mut push = |kind: &str, mut data: Value| {
         if let Some(object) = data.as_object_mut() {
-            object.insert("type".into(), Value::String(kind.into()));
-            object.insert("sequence_number".into(), Value::from(seq));
+            object.insert(field::TYPE.into(), Value::String(kind.into()));
+            object.insert(field::SEQUENCE_NUMBER.into(), Value::from(seq));
             if let Some(stream_id) = stream_id {
-                object.insert("stream_id".into(), stream_id.clone());
+                object.insert(field::STREAM_ID.into(), stream_id.clone());
             }
         }
         seq += 1;
@@ -540,24 +542,24 @@ pub(super) fn events(response: &Value, stream_id: Option<&Value>) -> Vec<Value> 
     };
     let mut created = response.clone();
     if let Some(obj) = created.as_object_mut() {
-        obj.insert("status".into(), Value::String("in_progress".into()));
-        obj.insert("output".into(), Value::Array(Vec::new()));
+        obj.insert(
+            field::STATUS.into(),
+            Value::String(value::IN_PROGRESS.into()),
+        );
+        obj.insert(field::OUTPUT.into(), Value::Array(Vec::new()));
     }
-    push("response.created", serde_json::json!({"response":created}));
+    push(event::CREATED, serde_json::json!({"response":created}));
     for (index, item) in output.iter().enumerate() {
         push(
-            "response.output_item.added",
+            event::OUTPUT_ITEM_ADDED,
             serde_json::json!({"output_index":index,"item":item,"response_id":id}),
         );
         push(
-            "response.output_item.done",
+            event::OUTPUT_ITEM_DONE,
             serde_json::json!({"output_index":index,"item":item,"response_id":id}),
         );
     }
-    push(
-        "response.completed",
-        serde_json::json!({"response":response}),
-    );
+    push(event::COMPLETED, serde_json::json!({"response":response}));
     events
 }
 

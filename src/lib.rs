@@ -6,6 +6,7 @@ mod compression;
 mod config;
 mod discovery;
 mod error;
+mod protocol;
 mod router;
 mod websocket;
 

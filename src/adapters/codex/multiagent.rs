@@ -1,6 +1,11 @@
-use crate::body::has_json_unicode_escape;
-use serde_json::value::RawValue;
 use std::collections::BTreeMap;
+
+use serde_json::value::RawValue;
+
+use super::{collaboration_tool, event};
+use crate::body::has_json_unicode_escape;
+use crate::protocol::{field, item_type, role, value};
+
 struct NamespacePair {
     client: &'static str,
     upstream: &'static str,
@@ -9,15 +14,12 @@ const COLLABORATION: NamespacePair = NamespacePair {
     client: "collaboration",
     upstream: "collaboration_compat",
 };
-const AGENT_MESSAGE: &str = "agent_message";
-const ENCRYPTED_CONTENT: &str = "encrypted_content";
-const SPAWN_AGENT: &str = "spawn_agent";
 
 pub(crate) fn request_may_need_adaptation(bytes: &[u8]) -> bool {
     has_json_unicode_escape(bytes)
         || contains(bytes, COLLABORATION.client.as_bytes())
         || contains(bytes, COLLABORATION.upstream.as_bytes())
-        || contains(bytes, AGENT_MESSAGE.as_bytes())
+        || contains(bytes, item_type::AGENT_MESSAGE.as_bytes())
 }
 pub(crate) fn response_may_need_adaptation(bytes: &[u8]) -> bool {
     has_json_unicode_escape(bytes) || contains(bytes, COLLABORATION.upstream.as_bytes())
@@ -63,13 +65,13 @@ fn encode_json<T: serde::Serialize + ?Sized>(value: &T) -> serde_json::Result<Bo
 }
 
 pub(super) fn has_convertible_agent_message(bytes: &[u8]) -> serde_json::Result<bool> {
-    if !contains(bytes, AGENT_MESSAGE.as_bytes()) && !has_json_unicode_escape(bytes) {
+    if !contains(bytes, item_type::AGENT_MESSAGE.as_bytes()) && !has_json_unicode_escape(bytes) {
         return Ok(false);
     }
     let Some(object) = parse_object_bytes::<&RawValue>(bytes)? else {
         return Ok(false);
     };
-    let Some(input) = object.get("input") else {
+    let Some(input) = object.get(field::INPUT) else {
         return Ok(false);
     };
     let Some(items) = parse_array::<&RawValue>(input)? else {
@@ -78,11 +80,11 @@ pub(super) fn has_convertible_agent_message(bytes: &[u8]) -> serde_json::Result<
     for item in items {
         if let Some(item) = parse_object_bytes::<&RawValue>(item.get().as_bytes())?
             && item
-                .get("type")
+                .get(field::TYPE)
                 .and_then(|value| serde_json::from_str::<String>(value.get()).ok())
                 .as_deref()
-                == Some(AGENT_MESSAGE)
-            && !has_encrypted_content(item.get("content").copied())?
+                == Some(item_type::AGENT_MESSAGE)
+            && !has_encrypted_content(item.get(field::CONTENT).copied())?
         {
             return Ok(true);
         }
@@ -99,21 +101,21 @@ pub(super) fn prepare_bytes(
         return Ok(None);
     };
     let mut changed = false;
-    if let Some(tools) = object.get("tools")
+    if let Some(tools) = object.get(field::TOOLS)
         && let Some(items) = parse_array(tools)?
     {
         let (items, tools_changed) = prepare_tools(items, listing)?;
         if tools_changed {
-            object.insert("tools".into(), encode_json(&items)?);
+            object.insert(field::TOOLS.into(), encode_json(&items)?);
             changed = true;
         }
     }
-    if let Some(input) = object.get("input")
+    if let Some(input) = object.get(field::INPUT)
         && let Some(items) = parse_array(input)?
     {
         let (items, input_changed) = prepare_input(items, text_agent_messages, listing)?;
         if input_changed {
-            object.insert("input".into(), encode_json(&items)?);
+            object.insert(field::INPUT.into(), encode_json(&items)?);
             changed = true;
         }
     }
@@ -131,26 +133,26 @@ fn prepare_tools(
         let Some(mut tool) = parse_object(entry)? else {
             continue;
         };
-        if string(tool.get("type")).as_deref() != Some("namespace") {
+        if string(tool.get(field::TYPE)).as_deref() != Some(item_type::NAMESPACE) {
             continue;
         }
-        let name = string(tool.get("name"));
+        let name = string(tool.get(field::NAME));
         let collab = name.as_deref() == Some(COLLABORATION.client)
             || name.as_deref() == Some(COLLABORATION.upstream);
         let mut tool_changed = false;
         if name.as_deref() == Some(COLLABORATION.client) {
-            set_str(&mut tool, "name", COLLABORATION.upstream);
+            set_str(&mut tool, field::NAME, COLLABORATION.upstream);
             changed = true;
             tool_changed = true;
         }
         if collab
-            && let Some(nested_tools) = tool.get("tools")
+            && let Some(nested_tools) = tool.get(field::TOOLS)
             && let Some(nested_items) = parse_array(nested_tools)?
         {
             let (nested_items, nested_changed) =
                 prepare_collaboration_tools(nested_items, listing)?;
             if nested_changed {
-                tool.insert("tools".into(), encode_json(&nested_items)?);
+                tool.insert(field::TOOLS.into(), encode_json(&nested_items)?);
                 changed = true;
                 tool_changed = true;
             }
@@ -170,37 +172,41 @@ fn prepare_collaboration_tools(
         let Some(mut tool) = parse_object(entry)? else {
             continue;
         };
-        if string(tool.get("type")).as_deref() == Some("namespace") {
+        if string(tool.get(field::TYPE)).as_deref() == Some(item_type::NAMESPACE) {
             continue;
         }
-        let name = string(tool.get("name"));
+        let name = string(tool.get(field::NAME));
         let mut tool_changed = false;
         if matches!(
             name.as_deref(),
-            Some("spawn_agent" | "send_message" | "followup_task")
-        ) && let Some(parameters) = tool.get("parameters")
+            Some(
+                collaboration_tool::SPAWN_AGENT
+                    | collaboration_tool::SEND_MESSAGE
+                    | collaboration_tool::FOLLOWUP_TASK
+            )
+        ) && let Some(parameters) = tool.get(field::PARAMETERS)
             && let Some(mut parameters) = parse_object(parameters)?
         {
             let mut parameters_changed = false;
-            if let Some(properties) = parameters.get("properties")
+            if let Some(properties) = parameters.get(field::PROPERTIES)
                 && let Some(mut properties) = parse_object(properties)?
-                && let Some(message_raw) = properties.get("message")
+                && let Some(message_raw) = properties.get(field::MESSAGE)
                 && let Some(mut message) = parse_object(message_raw)?
-                && message.remove("encrypted").is_some()
+                && message.remove(field::ENCRYPTED).is_some()
             {
-                properties.insert("message".into(), encode_json(&message)?);
-                parameters.insert("properties".into(), encode_json(&properties)?);
+                properties.insert(field::MESSAGE.into(), encode_json(&message)?);
+                parameters.insert(field::PROPERTIES.into(), encode_json(&properties)?);
                 parameters_changed = true;
             }
             if parameters_changed {
-                tool.insert("parameters".into(), encode_json(&parameters)?);
+                tool.insert(field::PARAMETERS.into(), encode_json(&parameters)?);
                 changed = true;
                 tool_changed = true;
             }
         }
-        if name.as_deref() == Some(SPAWN_AGENT)
+        if name.as_deref() == Some(collaboration_tool::SPAWN_AGENT)
             && !listing.is_empty()
-            && let Some(description) = string(tool.get("description"))
+            && let Some(description) = string(tool.get(field::DESCRIPTION))
         {
             // Replace Codex's model-list prefix when the expected description marker is present.
             let description = description
@@ -208,7 +214,7 @@ fn prepare_collaboration_tools(
                 .map_or(description.as_str(), |start| &description[start..]);
             let combined = format!("{listing}{description}");
             if combined != description {
-                set_str(&mut tool, "description", &combined);
+                set_str(&mut tool, field::DESCRIPTION, &combined);
                 changed = true;
                 tool_changed = true;
             }
@@ -232,24 +238,27 @@ fn prepare_input(
         let Some(mut item) = parse_object(entry)? else {
             continue;
         };
-        let kind = string(item.get("type"));
+        let kind = string(item.get(field::TYPE));
         let mut item_changed = false;
-        if kind.as_deref() == Some("additional_tools")
-            && let Some(tools) = item.get("tools")
+        if kind.as_deref() == Some(item_type::ADDITIONAL_TOOLS)
+            && let Some(tools) = item.get(field::TOOLS)
             && let Some(tools) = parse_array(tools)?
         {
             let (tools, tools_changed) = prepare_tools(tools, listing)?;
             if tools_changed {
-                item.insert("tools".into(), encode_json(&tools)?);
+                item.insert(field::TOOLS.into(), encode_json(&tools)?);
                 changed = true;
                 item_changed = true;
             }
         }
-        if matches!(kind.as_deref(), Some("function_call" | "custom_tool_call")) {
+        if matches!(
+            kind.as_deref(),
+            Some(item_type::FUNCTION_CALL | item_type::CUSTOM_TOOL_CALL)
+        ) {
             item_changed |=
                 rewrite_identity(&mut item, COLLABORATION.client, COLLABORATION.upstream);
         }
-        if kind.as_deref() == Some(AGENT_MESSAGE) {
+        if kind.as_deref() == Some(item_type::AGENT_MESSAGE) {
             item_changed |= rewrite_agent(&mut item, text_agent_messages)?;
         }
         if item_changed {
@@ -263,23 +272,23 @@ fn rewrite_agent(
     object: &mut BTreeMap<String, Box<RawValue>>,
     text_messages: bool,
 ) -> serde_json::Result<bool> {
-    if has_encrypted_content(object.get("content").map(Box::as_ref))? {
+    if has_encrypted_content(object.get(field::CONTENT).map(Box::as_ref))? {
         return Ok(false);
     }
     let mut changed = false;
     if text_messages {
-        if string(object.get("type")).as_deref() != Some("message") {
-            set_str(object, "type", "message");
+        if string(object.get(field::TYPE)).as_deref() != Some(item_type::MESSAGE) {
+            set_str(object, field::TYPE, item_type::MESSAGE);
             changed = true;
         }
-        if string(object.get("role")).as_deref() != Some("user") {
-            set_str(object, "role", "user");
+        if string(object.get(field::ROLE)).as_deref() != Some(role::USER) {
+            set_str(object, field::ROLE, role::USER);
             changed = true;
         }
         for k in [
-            "author",
-            "recipient",
-            "internal_chat_message_metadata_passthrough",
+            field::AUTHOR,
+            field::RECIPIENT,
+            field::INTERNAL_CHAT_MESSAGE_METADATA_PASSTHROUGH,
         ] {
             changed |= object.remove(k).is_some();
         }
@@ -293,10 +302,10 @@ fn has_encrypted_content(content: Option<&RawValue>) -> serde_json::Result<bool>
         for part in parts {
             if let Some(part) = parse_object_bytes::<&RawValue>(part.get().as_bytes())?
                 && part
-                    .get("type")
+                    .get(field::TYPE)
                     .and_then(|value| serde_json::from_str::<String>(value.get()).ok())
                     .as_deref()
-                    == Some(ENCRYPTED_CONTENT)
+                    == Some(item_type::ENCRYPTED_CONTENT)
             {
                 return Ok(true);
             }
@@ -306,17 +315,17 @@ fn has_encrypted_content(content: Option<&RawValue>) -> serde_json::Result<bool>
 }
 fn rewrite_identity(object: &mut BTreeMap<String, Box<RawValue>>, from: &str, to: &str) -> bool {
     let mut changed = false;
-    if string(object.get("namespace")).as_deref() == Some(from) {
-        set_str(object, "namespace", to);
+    if string(object.get(field::NAMESPACE)).as_deref() == Some(from) {
+        set_str(object, field::NAMESPACE, to);
         changed = true;
     }
-    if let Some(name) = string(object.get("name")) {
+    if let Some(name) = string(object.get(field::NAME)) {
         if let Some(suffix) = name.strip_prefix(&format!("{from}.")) {
-            set_str(object, "name", suffix);
-            set_str(object, "namespace", to);
+            set_str(object, field::NAME, suffix);
+            set_str(object, field::NAMESPACE, to);
             changed = true;
         } else if let Some(suffix) = name.strip_prefix(&format!("{from}__")) {
-            set_str(object, "name", &format!("{to}__{suffix}"));
+            set_str(object, field::NAME, &format!("{to}__{suffix}"));
             changed = true;
         }
     }
@@ -330,33 +339,33 @@ pub(super) fn restore_bytes(bytes: &[u8]) -> serde_json::Result<Option<Vec<u8>>>
     let Some(mut object) = parse_object_bytes(bytes)? else {
         return Ok(None);
     };
-    let event_type = string(object.get("type"));
+    let event_type = string(object.get(field::TYPE));
     let mut changed = false;
     match event_type.as_deref() {
-        None if string(object.get("object")).as_deref() == Some("response") => {
-            changed |= restore_output(&mut object, "output")?;
+        None if string(object.get(field::OBJECT)).as_deref() == Some(value::RESPONSE) => {
+            changed |= restore_output(&mut object, field::OUTPUT)?;
         }
         Some(
-            "response.completed"
-            | "response.in_progress"
-            | "response.created"
-            | "response.failed"
-            | "response.incomplete",
+            event::COMPLETED
+            | event::IN_PROGRESS
+            | event::CREATED
+            | event::FAILED
+            | event::INCOMPLETE,
         ) => {
-            if let Some(response_raw) = object.get("response")
+            if let Some(response_raw) = object.get(field::RESPONSE)
                 && let Some(mut response) = parse_object(response_raw)?
-                && restore_output(&mut response, "output")?
+                && restore_output(&mut response, field::OUTPUT)?
             {
-                object.insert("response".into(), encode_json(&response)?);
+                object.insert(field::RESPONSE.into(), encode_json(&response)?);
                 changed = true;
             }
         }
-        Some("response.output_item.done" | "response.output_item.added") => {
-            if let Some(item_raw) = object.get("item")
+        Some(event::OUTPUT_ITEM_DONE | event::OUTPUT_ITEM_ADDED) => {
+            if let Some(item_raw) = object.get(field::ITEM)
                 && let Some(mut item) = parse_object(item_raw)?
                 && restore_call(&mut item)?
             {
-                object.insert("item".into(), encode_json(&item)?);
+                object.insert(field::ITEM.into(), encode_json(&item)?);
                 changed = true;
             }
         }
@@ -369,23 +378,34 @@ pub(super) fn restore_bytes(bytes: &[u8]) -> serde_json::Result<Option<Vec<u8>>>
     }
 }
 fn restore_call(item: &mut BTreeMap<String, Box<RawValue>>) -> serde_json::Result<bool> {
-    let kind = string(item.get("type"));
-    if !matches!(kind.as_deref(), Some("function_call" | "custom_tool_call"))
-        || !rewrite_identity(item, COLLABORATION.upstream, COLLABORATION.client)
+    let kind = string(item.get(field::TYPE));
+    if !matches!(
+        kind.as_deref(),
+        Some(item_type::FUNCTION_CALL | item_type::CUSTOM_TOOL_CALL)
+    ) || !rewrite_identity(item, COLLABORATION.upstream, COLLABORATION.client)
     {
         return Ok(false);
     }
-    let name = string(item.get("name"));
-    let name = name
-        .as_deref()
-        .map(|name| name.strip_prefix("collaboration__").unwrap_or(name));
-    if kind.as_deref() == Some("function_call")
-        && matches!(name, Some("spawn_agent" | "send_message" | "followup_task"))
-        && !item.contains_key("encrypted_function_args")
+    let name = string(item.get(field::NAME));
+    let name = name.as_deref().map(|name| {
+        name.strip_prefix(COLLABORATION.client)
+            .and_then(|suffix| suffix.strip_prefix("__"))
+            .unwrap_or(name)
+    });
+    if kind.as_deref() == Some(item_type::FUNCTION_CALL)
+        && matches!(
+            name,
+            Some(
+                collaboration_tool::SPAWN_AGENT
+                    | collaboration_tool::SEND_MESSAGE
+                    | collaboration_tool::FOLLOWUP_TASK
+            )
+        )
+        && !item.contains_key(field::ENCRYPTED_FUNCTION_ARGS)
     {
         // Codex treats an absent marker as encrypted, even for plaintext arguments.
         item.insert(
-            "encrypted_function_args".into(),
+            field::ENCRYPTED_FUNCTION_ARGS.into(),
             encode_json(&[] as &[String])?,
         );
     }

@@ -2,17 +2,20 @@ use std::{collections::VecDeque, io, pin::Pin};
 
 use axum::{
     body::{Body, Bytes},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, StatusCode},
     response::Response,
 };
 use futures_util::{Stream, StreamExt};
 use http_body_util::BodyExt;
 use tokio_util::io::ReaderStream;
 
+use crate::protocol::{header, media_type};
 use crate::{
     compression::{decode_body, decode_reader},
     error::{Error, Result},
 };
+
+const SSE_DATA_FIELD: &str = "data:";
 
 pub(crate) async fn restore(response: reqwest::Response) -> Result<Response> {
     if !response.status().is_success()
@@ -24,10 +27,10 @@ pub(crate) async fn restore(response: reqwest::Response) -> Result<Response> {
         return Ok(crate::router::stream_response(response));
     }
     let content_type = content_type(response.headers());
-    if content_type.starts_with("text/event-stream") {
+    if content_type.starts_with(media_type::EVENT_STREAM) {
         return stream_sse(response);
     }
-    if content_type.split(';').next().unwrap_or("").trim() != "application/json" {
+    if content_type.split(';').next().unwrap_or("").trim() != media_type::JSON {
         return Ok(crate::router::stream_response(response));
     }
     let response: axum::http::Response<reqwest::Body> = response.into();
@@ -256,7 +259,7 @@ fn transform_event(event: Bytes) -> Bytes {
         .iter()
         .filter_map(|line| {
             line.trim_end_matches('\n')
-                .strip_prefix("data:")
+                .strip_prefix(SSE_DATA_FIELD)
                 .map(|v| v.strip_prefix(' ').unwrap_or(v))
         })
         .collect();
@@ -274,9 +277,9 @@ fn transform_event(event: Bytes) -> Bytes {
     let mut replaced = false;
     for line in lines {
         let ending = if line.ends_with('\n') { "\n" } else { "" };
-        if line.starts_with("data:") {
+        if line.starts_with(SSE_DATA_FIELD) {
             if !replaced {
-                out.extend_from_slice(b"data: ");
+                out.extend_from_slice(super::SSE_DATA_PREFIX);
                 out.extend_from_slice(&rewritten);
                 out.extend_from_slice(ending.as_bytes());
                 replaced = true;

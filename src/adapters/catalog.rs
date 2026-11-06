@@ -4,6 +4,7 @@ use serde_json::{Map, Value};
 use super::codex;
 use crate::capabilities::Capabilities;
 use crate::error::{Error, Result};
+use crate::protocol::{field, value};
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -23,16 +24,16 @@ impl CatalogFormat {
     fn metadata_fields(self) -> &'static [(&'static str, &'static str)] {
         match self {
             Self::Codex => &[
-                ("name", "display_name"),
-                ("description", "description"),
-                ("reasoning_level", "default_reasoning_level"),
-                ("reasoning_levels", "supported_reasoning_levels"),
+                (field::NAME, field::DISPLAY_NAME),
+                (field::DESCRIPTION, field::DESCRIPTION),
+                (field::REASONING_LEVEL, field::DEFAULT_REASONING_LEVEL),
+                (field::REASONING_LEVELS, field::SUPPORTED_REASONING_LEVELS),
             ],
             Self::Openai | Self::Anthropic => &[
-                ("name", "display_name"),
-                ("description", "description"),
-                ("reasoning_level", "reasoning_level"),
-                ("reasoning_levels", "reasoning_levels"),
+                (field::NAME, field::DISPLAY_NAME),
+                (field::DESCRIPTION, field::DESCRIPTION),
+                (field::REASONING_LEVEL, field::REASONING_LEVEL),
+                (field::REASONING_LEVELS, field::REASONING_LEVELS),
             ],
         }
     }
@@ -67,7 +68,7 @@ impl CatalogFormat {
 
     pub fn context_window(self, model: &Value) -> Option<&Value> {
         match self {
-            Self::Openai => model.get("max_model_len"),
+            Self::Openai => model.get(field::MAX_MODEL_LEN),
             Self::Anthropic | Self::Codex => None,
         }
     }
@@ -106,15 +107,18 @@ impl CatalogFormat {
             let mut result = Value::Object(self.settings(&shared));
             match self {
                 Self::Openai => {
-                    result["object"] = Value::String("model".into());
-                    result["created"] = Value::from(0);
-                    result["owned_by"] = Value::String(provider.into());
+                    result[field::OBJECT] = Value::String(value::MODEL.into());
+                    result[field::CREATED] = Value::from(0);
+                    result[field::OWNED_BY] = Value::String(provider.into());
                 }
                 Self::Anthropic => {
-                    result["type"] = Value::String("model".into());
-                    result["created_at"] = Value::String("1970-01-01T00:00:00Z".into());
-                    if !result.get("display_name").is_some_and(Value::is_string) {
-                        result["display_name"] = Value::String(source.model_id(model)?.into());
+                    result[field::TYPE] = Value::String(value::MODEL.into());
+                    result[field::CREATED_AT] = Value::String("1970-01-01T00:00:00Z".into());
+                    if !result
+                        .get(field::DISPLAY_NAME)
+                        .is_some_and(Value::is_string)
+                    {
+                        result[field::DISPLAY_NAME] = Value::String(source.model_id(model)?.into());
                     }
                 }
                 Self::Codex => unreachable!(),
@@ -181,8 +185,8 @@ impl CatalogFormat {
         match self {
             Self::Codex => &codex::CATALOG,
             Self::Openai | Self::Anthropic => &CatalogLayout {
-                models: "data",
-                id: "id",
+                models: field::DATA,
+                id: field::ID,
             },
         }
     }

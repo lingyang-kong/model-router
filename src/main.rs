@@ -1,6 +1,9 @@
 use model_router::{Config, router};
 use tokio::net::TcpListener;
 
+const PORT_ENV: &str = "MODEL_ROUTER_PORT";
+const DEFAULT_PORT: &str = "4134";
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args_os().skip(1);
@@ -12,7 +15,7 @@ async fn main() -> anyhow::Result<()> {
                  Environment:\n\t\
                  MODEL_ROUTER_CONFIG\t\tPath to the router TOML configuration\n\t\
                  MODEL_ROUTER_CONFIG_TOML\tInline TOML when no configuration path is set\n\t\
-                 MODEL_ROUTER_PORT\t\tLocalhost port (default: 4134)"
+                 MODEL_ROUTER_PORT\t\tLocalhost port (default: {DEFAULT_PORT})"
             );
             return Ok(());
         }
@@ -23,8 +26,8 @@ async fn main() -> anyhow::Result<()> {
         _ => anyhow::bail!("Unsupported arguments; run model-router --help"),
     }
     let config = Config::from_env()?;
-    let port = std::env::var("MODEL_ROUTER_PORT")
-        .unwrap_or_else(|_| "4134".into())
+    let port = std::env::var(PORT_ENV)
+        .unwrap_or_else(|_| DEFAULT_PORT.into())
         .parse::<u16>()?;
     let app = router(config)?;
     #[cfg(unix)]

@@ -1,5 +1,6 @@
 use std::io;
 
+use crate::protocol::{encoding, header};
 use async_compression::tokio::bufread::{
     BrotliDecoder, GzipDecoder, GzipEncoder, ZlibDecoder, ZstdDecoder,
 };
@@ -11,7 +12,7 @@ use tokio_util::io::ReaderStream;
 pub(crate) fn accepts_gzip(headers: &HeaderMap) -> crate::error::Result<bool> {
     let (mut gzip, mut identity, mut wildcard): (Option<f32>, Option<f32>, Option<f32>) =
         (None, None, None);
-    for value in headers.get_all("accept-encoding") {
+    for value in headers.get_all(header::ACCEPT_ENCODING) {
         let Ok(value) = value.to_str() else { continue };
         for item in value.split(',') {
             let mut parts = item.split(';').map(str::trim);
@@ -21,8 +22,8 @@ pub(crate) fn accepts_gzip(headers: &HeaderMap) -> crate::error::Result<bool> {
                 .to_ascii_lowercase()
                 .as_str()
             {
-                "gzip" | "x-gzip" => &mut gzip,
-                "identity" => &mut identity,
+                encoding::GZIP | encoding::X_GZIP => &mut gzip,
+                encoding::IDENTITY => &mut identity,
                 "*" => &mut wildcard,
                 _ => continue,
             };
@@ -75,7 +76,7 @@ pub(crate) fn decode_reader<'a, R: AsyncRead + Send + Unpin + 'a>(
     headers: &HeaderMap,
 ) -> io::Result<Box<dyn AsyncRead + Send + Unpin + 'a>> {
     let mut reader: Box<dyn AsyncRead + Send + Unpin + 'a> = Box::new(reader);
-    for value in headers.get_all("content-encoding").iter().rev() {
+    for value in headers.get_all(header::CONTENT_ENCODING).iter().rev() {
         for encoding in value
             .to_str()
             .map_err(io::Error::other)?
@@ -83,19 +84,19 @@ pub(crate) fn decode_reader<'a, R: AsyncRead + Send + Unpin + 'a>(
             .map(str::trim)
             .filter(|encoding| !encoding.is_empty())
         {
-            if encoding.eq_ignore_ascii_case("identity") {
+            if encoding.eq_ignore_ascii_case(encoding::IDENTITY) {
                 continue;
             }
             let buffered = BufReader::new(reader);
             reader = match encoding.to_ascii_lowercase().as_str() {
-                "gzip" | "x-gzip" => {
+                encoding::GZIP | encoding::X_GZIP => {
                     let mut decoder = GzipDecoder::new(buffered);
                     decoder.multiple_members(true);
                     Box::new(decoder)
                 }
-                "deflate" => Box::new(ZlibDecoder::new(buffered)),
-                "br" => Box::new(BrotliDecoder::new(buffered)),
-                "zstd" => {
+                encoding::DEFLATE => Box::new(ZlibDecoder::new(buffered)),
+                encoding::BROTLI => Box::new(BrotliDecoder::new(buffered)),
+                encoding::ZSTD => {
                     let mut decoder = ZstdDecoder::new(buffered);
                     decoder.multiple_members(true);
                     Box::new(decoder)

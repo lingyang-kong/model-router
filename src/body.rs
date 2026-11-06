@@ -5,6 +5,7 @@ use std::{
 
 use crate::compression::decode_body;
 use crate::error::{Error, Result as RouterResult};
+use crate::protocol::header;
 use axum::{
     body::{Body, Bytes},
     http::HeaderMap,
@@ -56,7 +57,7 @@ impl BufferedRequest {
         let collected = body.collect().await.map_err(Error::bad_request)?;
         let trailers = collected.trailers().cloned();
         let original = collected.to_bytes();
-        let decoded = if headers.contains_key("content-encoding") {
+        let decoded = if headers.contains_key(header::CONTENT_ENCODING) {
             Some(
                 decode_body(std::io::Cursor::new(&original), headers)
                     .await

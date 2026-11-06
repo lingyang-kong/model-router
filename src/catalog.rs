@@ -18,6 +18,7 @@ use indexmap::IndexMap;
 use serde_json::{Map, Value};
 use tokio_util::io::StreamReader;
 
+use crate::protocol::{encoding, field, header, item_type, media_type, role};
 use crate::{
     Config,
     adapters::{CatalogFormat, ClientKind},
@@ -29,6 +30,8 @@ use crate::{
 };
 
 const CATALOG_TIMEOUT: Duration = Duration::from_secs(3);
+// Preserve the wire spelling while keeping the catalog's cache dimensions together.
+const VARY_HEADERS: [&str; 3] = ["Accept-Encoding", "Originator", "Anthropic-Version"];
 
 pub(crate) struct ModelEntry {
     pub provider: Arc<Provider>,
@@ -79,18 +82,7 @@ impl CatalogState {
         let mut names: Vec<_> = headers
             .keys()
             .filter(|name| {
-                matches!(
-                    name.as_str(),
-                    "authorization"
-                        | "cookie"
-                        | "openai-organization"
-                        | "openai-project"
-                        | "x-api-key"
-                        | "api-key"
-                        | "chatgpt-account-id"
-                        | "x-openai-organization"
-                        | "x-openai-project"
-                )
+                header::CREDENTIALS.contains(name) || header::ACCOUNT_SCOPE.contains(name)
             })
             .collect();
         names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
@@ -127,15 +119,22 @@ fn model_listing(models: &ModelRegistry) -> Arc<str> {
         }
         listing.push_str("- ");
         listing.push_str(id);
-        if let Some(description) = entry.metadata.get("description").and_then(Value::as_str) {
+        if let Some(description) = entry
+            .metadata
+            .get(field::DESCRIPTION)
+            .and_then(Value::as_str)
+        {
             listing.push_str(": ");
             listing.push_str(description);
         }
         let shared = entry.format.shared_metadata(&entry.metadata);
-        if let Some(levels) = shared.get("reasoning_levels").and_then(Value::as_array) {
+        if let Some(levels) = shared
+            .get(field::REASONING_LEVELS)
+            .and_then(Value::as_array)
+        {
             let levels: Vec<_> = levels
                 .iter()
-                .filter_map(|level| level.get("level").and_then(Value::as_str))
+                .filter_map(|level| level.get(field::LEVEL).and_then(Value::as_str))
                 .collect();
             if !levels.is_empty() {
                 listing.push_str(". Reasoning efforts: ");
@@ -296,9 +295,9 @@ impl RouterState {
             parts.headers = incoming.headers.clone();
         }
         remove_body_headers(&mut parts.headers);
-        parts.headers.remove("content-type");
-        parts.headers.remove("if-none-match");
-        parts.headers.remove("if-modified-since");
+        parts.headers.remove(header::CONTENT_TYPE);
+        parts.headers.remove(header::IF_NONE_MATCH);
+        parts.headers.remove(header::IF_MODIFIED_SINCE);
         let (client, mut request) = self.prepare_request(
             provider,
             incoming.and(origin),
@@ -491,11 +490,11 @@ impl RouterState {
                     let probe_responses_lite = capabilities.responses_lite.is_none()
                         && projected
                             .as_ref()
-                            .is_some_and(|model| model["use_responses_lite"] == true);
+                            .is_some_and(|model| model[field::USE_RESPONSES_LITE] == true);
                     let probe_tool_search = capabilities.tool_search.is_none()
                         && projected
                             .as_ref()
-                            .is_some_and(|model| model["supports_search_tool"] == true);
+                            .is_some_and(|model| model[field::SUPPORTS_SEARCH_TOOL] == true);
                     if probe_responses_lite || probe_tool_search {
                         let empty = HeaderMap::new();
                         let headers =
@@ -512,8 +511,8 @@ impl RouterState {
                                     headers,
                                     id,
                                     serde_json::json!({
-                                        "type":"additional_tools",
-                                        "role":"developer",
+                                        "type":item_type::ADDITIONAL_TOOLS,
+                                        "role":role::DEVELOPER,
                                         "tools":[],
                                     }),
                                 )
@@ -530,7 +529,7 @@ impl RouterState {
                                     headers,
                                     id,
                                     serde_json::json!({
-                                        "type":"tool_search_output",
+                                        "type":item_type::TOOL_SEARCH_OUTPUT,
                                         "call_id":"model_router_probe",
                                         "status":"completed",
                                         "execution":"client",
@@ -602,27 +601,28 @@ impl RouterState {
             None => (output.empty_catalog(), HeaderMap::new()),
         };
         if output == CatalogFormat::Anthropic {
-            document["first_id"] = models
+            document[field::FIRST_ID] = models
                 .first()
-                .map_or(Value::Null, |model| model["id"].clone());
-            document["last_id"] = models
+                .map_or(Value::Null, |model| model[field::ID].clone());
+            document[field::LAST_ID] = models
                 .last()
-                .map_or(Value::Null, |model| model["id"].clone());
-            document["has_more"] = Value::Bool(false);
+                .map_or(Value::Null, |model| model[field::ID].clone());
+            document[field::HAS_MORE] = Value::Bool(false);
         }
         *output.models(&mut document)? = models;
         remove_body_headers(&mut headers);
-        for name in ["content-length", "etag", "last-modified"] {
+        for name in [header::CONTENT_LENGTH, header::ETAG, header::LAST_MODIFIED] {
             headers.remove(name);
         }
-        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert(header::CONTENT_TYPE, media_type::JSON.parse().unwrap());
         if gzip {
-            headers.insert("content-encoding", "gzip".parse().unwrap());
+            headers.insert(header::CONTENT_ENCODING, encoding::GZIP.parse().unwrap());
         }
-        for name in ["Accept-Encoding", "Originator", "Anthropic-Version"] {
-            if !header_has_token(&headers, "vary", name) && !header_has_token(&headers, "vary", "*")
+        for name in VARY_HEADERS {
+            if !header_has_token(&headers, header::VARY, name)
+                && !header_has_token(&headers, header::VARY, "*")
             {
-                headers.append("vary", name.parse().unwrap());
+                headers.append(header::VARY, name.parse().unwrap());
             }
         }
         let bytes = serde_json::to_vec(&document).map_err(Error::bad_gateway)?;
@@ -633,7 +633,7 @@ impl RouterState {
 }
 
 fn validate_complete_catalog(document: &Value) -> Result<()> {
-    if document.get("has_more").and_then(Value::as_bool) == Some(true) {
+    if document.get(field::HAS_MORE).and_then(Value::as_bool) == Some(true) {
         return Err(Error::bad_gateway(
             "Catalog sources must return a complete list; pagination is not supported",
         ));

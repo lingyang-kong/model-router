@@ -7,7 +7,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{compaction_transport, transport};
+use super::{ROUTING_HINT_HEADER, compaction_transport, error_code, event, transport};
+use crate::protocol::{field, header};
 use crate::{
     adapters::websocket::{WebSocketAction, WebSocketContext, WebSocketSwitch},
     error::Error,
@@ -36,7 +37,7 @@ pub(in crate::adapters) async fn route(
     if selector
         .kind
         .as_deref()
-        .is_some_and(|kind| kind != "response.create")
+        .is_some_and(|kind| kind != event::CREATE)
     {
         return WebSocketAction::Forward(Message::Text(text));
     }
@@ -65,16 +66,16 @@ pub(in crate::adapters) async fn route(
     routed.provider = provider;
     if let Some(model) = model {
         if let Ok(hint) = format!("model={model}").parse() {
-            routed.headers.insert("x-codex-routing-hint", hint);
+            routed.headers.insert(ROUTING_HINT_HEADER, hint);
         }
-        if routed.headers.contains_key("x-model")
+        if routed.headers.contains_key(header::X_MODEL)
             && let Ok(hint) = model.parse()
         {
-            routed.headers.insert("x-model", hint);
+            routed.headers.insert(header::X_MODEL, hint);
         }
     } else {
-        routed.headers.remove("x-codex-routing-hint");
-        routed.headers.remove("x-model");
+        routed.headers.remove(ROUTING_HINT_HEADER);
+        routed.headers.remove(header::X_MODEL);
     }
     let opening_context = routed.clone();
     WebSocketAction::Switch(Box::new(WebSocketSwitch {
@@ -102,11 +103,11 @@ pub(super) fn previous_response_not_found(
     message: &'static str,
     stream_id: Option<Value>,
 ) -> WebSocketAction {
-    let mut event = serde_json::json!({"type":"error","status":400,"error":{
-        "code":"previous_response_not_found", "message":message
+    let mut event = serde_json::json!({"type":"error","status":StatusCode::BAD_REQUEST.as_u16(),"error":{
+        "code":error_code::PREVIOUS_RESPONSE_NOT_FOUND, "message":message
     }});
     if let Some(stream_id) = stream_id {
-        event["stream_id"] = stream_id;
+        event[field::STREAM_ID] = stream_id;
     }
     WebSocketAction::Respond(async move { vec![Message::Text(event.to_string().into())] }.boxed())
 }
@@ -130,11 +131,11 @@ async fn open(
     let status = crate::websocket::rejection_status(reply.status());
     let event = if status == StatusCode::UPGRADE_REQUIRED {
         let mut event = serde_json::json!({"type":"error","status":status.as_u16(),"error":{
-            "code":"websocket_upgrade_rejected",
+            "code":error_code::WEBSOCKET_UPGRADE_REJECTED,
             "message":format!("Upstream rejected WebSocket upgrade (HTTP {}); reconnect using a supported transport", reply.status().as_u16())
         }});
         if let Some(stream_id) = stream_id {
-            event["stream_id"] = stream_id;
+            event[field::STREAM_ID] = stream_id;
         }
         event
     } else {
