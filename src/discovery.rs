@@ -4,6 +4,7 @@ use axum::http::{HeaderMap, Method, StatusCode, request::Parts};
 use futures_util::future::join_all;
 use url::Url;
 
+use crate::protocol::{endpoint, field, header, media_type, pointer};
 use crate::{
     adapters::CatalogFormat,
     body::response_reader,
@@ -12,6 +13,8 @@ use crate::{
     config::{Provider, remove_body_headers, remove_websocket_headers},
     router::RouterState,
 };
+
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl RouterState {
     /// Probe the provider's `/responses` endpoint during catalog projection.
@@ -24,7 +27,7 @@ impl RouterState {
         item: serde_json::Value,
     ) -> Option<bool> {
         let (mut parts, _) = axum::http::Request::builder()
-            .uri("/responses")
+            .uri(endpoint::RESPONSES)
             .body(())
             .ok()?
             .into_parts();
@@ -45,7 +48,7 @@ impl RouterState {
         item: serde_json::Value,
     ) -> Option<bool> {
         provider.validate_credential_scope(origin).ok()?;
-        let item_type = item.get("type")?.as_str()?.to_owned();
+        let item_type = item.get(field::TYPE)?.as_str()?.to_owned();
         let url = provider.upstream_url(&parts.uri).ok()?;
         let mut headers = discovery_headers(provider, &parts.headers, &url)?;
         remove_websocket_headers(&mut headers);
@@ -55,14 +58,14 @@ impl RouterState {
             "store": false,
         });
         if let Some(model) = model {
-            body["model"] = serde_json::Value::String(model.to_owned());
+            body[field::MODEL] = serde_json::Value::String(model.to_owned());
         }
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(DISCOVERY_TIMEOUT, async {
             let response = self
                 .discovery_client(&url)
                 .request(Method::POST, url)
                 .headers(headers)
-                .header("content-type", "application/json")
+                .header(header::CONTENT_TYPE, media_type::JSON)
                 .body(body.to_string())
                 .send()
                 .await
@@ -75,7 +78,7 @@ impl RouterState {
             }
             let document = read_document(response).await?;
             document
-                .pointer("/error/message")?
+                .pointer(pointer::ERROR_MESSAGE)?
                 .as_str()?
                 .starts_with(&format!(
                     "Unsupported Responses API input item type: '{item_type}'"
@@ -161,7 +164,7 @@ impl RouterState {
     ) -> Option<Discovery> {
         // Explicit external sources are read anonymously; advertised links stay same-origin.
         let headers = discovery_headers(provider, incoming, url)?;
-        tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::time::timeout(DISCOVERY_TIMEOUT, async {
             let response = self
                 .discovery_client(url)
                 .get(url.clone())
@@ -188,10 +191,10 @@ fn discovery_headers(provider: &Provider, incoming: &HeaderMap, url: &Url) -> Op
     };
     remove_body_headers(&mut headers);
     for name in [
-        "idempotency-key",
-        "if-none-match",
-        "if-modified-since",
-        "content-type",
+        header::IDEMPOTENCY_KEY,
+        header::IF_NONE_MATCH,
+        header::IF_MODIFIED_SINCE,
+        header::CONTENT_TYPE,
     ] {
         headers.remove(name);
     }

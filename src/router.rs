@@ -9,6 +9,7 @@ use axum::{
 };
 use tokio::sync::RwLock;
 
+use crate::protocol::{header, token};
 use crate::{
     Config,
     adapters::{CatalogFormat, Client, ClientKind},
@@ -165,7 +166,7 @@ async fn handle_request(
             "Forward routes require a provider in the route or selected client profile",
         ));
     }
-    if header_has_token(request.headers(), "upgrade", "websocket") {
+    if header_has_token(request.headers(), header::UPGRADE, token::WEBSOCKET) {
         return websocket::forward(&state, request, action, origin, adapter).await;
     }
     forward_http(&state, request, action, origin, adapter, format).await

@@ -9,6 +9,7 @@ use futures_util::FutureExt;
 use serde_json::Value;
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 
+use crate::protocol::{header, item_type};
 use crate::{
     body::{BufferedRequest, request_model},
     config::{Provider, remove_body_headers},
@@ -39,9 +40,7 @@ pub(crate) async fn forward(
     let plan = prepare_request(state, &provider, origin, &parts, decoded, model.as_deref()).await?;
     let rewritten = match plan {
         RequestPlan::Replay => {
-            return Err(Error::bad_request(
-                "Synthetic compaction requires the complete input history",
-            ));
+            return Err(Error::bad_request(super::FULL_HISTORY_REQUIRED));
         }
         RequestPlan::Forward(rewritten) => rewritten,
         RequestPlan::Summary(summary) => {
@@ -66,8 +65,8 @@ pub(crate) async fn forward(
     let body = if let Some(bytes) = rewritten {
         // Changed bytes invalidate their original encoding, length, and integrity metadata.
         remove_body_headers(&mut parts.headers);
-        parts.headers.remove("content-length");
-        parts.headers.remove("te");
+        parts.headers.remove(header::CONTENT_LENGTH);
+        parts.headers.remove(header::TE);
         reqwest::Body::from(bytes)
     } else {
         buffered.into_body()
@@ -177,7 +176,7 @@ async fn prepare_request(
                 origin,
                 parts,
                 model,
-                serde_json::json!({"type":"compaction_trigger"}),
+                serde_json::json!({"type":item_type::COMPACTION_TRIGGER}),
             )
             .await
             == Some(false)
@@ -220,8 +219,8 @@ pub(super) async fn prepare_multiagent(
                 parts,
                 model,
                 serde_json::json!({
-                    "type":"agent_message", "author":"/root", "recipient":"/root/worker",
-                    "content":[{"type":"input_text","text":"probe"}]
+                    "type":item_type::AGENT_MESSAGE, "author":"/root", "recipient":"/root/worker",
+                    "content":[{"type":item_type::INPUT_TEXT,"text":"probe"}]
                 }),
             )
             .await

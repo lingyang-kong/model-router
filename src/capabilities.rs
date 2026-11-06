@@ -1,7 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::protocol::{endpoint, field, item_type, value};
 use serde::Deserialize;
 use serde_json::Value;
+
+const MAX_SCHEMA_DEPTH: usize = 32;
+const RESPONSES_REQUEST_SCHEMA: &str = "/post/requestBody/content/application~1json/schema";
+const SCHEMA_REFERENCE_PREFIX: &str = "#/components/schemas/";
+const SCHEMA_POINTER_PREFIX: &str = "/components/schemas/";
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub(crate) struct Capabilities {
@@ -142,7 +148,7 @@ pub(crate) fn parse(document: &Value) -> Discovery {
         let ids = service_tier_ids_from_schema(schema, document);
         tier_constraints.push(ids.as_ref().map(|ids| {
             ids.iter()
-                .any(|id| !matches!(id.as_str(), "auto" | "default"))
+                .any(|id| !matches!(id.as_str(), value::AUTO | value::DEFAULT))
         }));
         tier_id_constraints.push(ids);
         search_constraints.push(web_search_from_schema(schema, document));
@@ -186,14 +192,15 @@ pub(crate) fn parse(document: &Value) -> Discovery {
 fn response_schemas<'a>(
     root: &'a serde_json::Map<String, Value>,
 ) -> impl Iterator<Item = Option<&'a Value>> + 'a {
-    root.get("paths")
+    root.get(field::PATHS)
         .and_then(Value::as_object)
         .into_iter()
         .flat_map(|paths| paths.iter())
         .filter(|(path, item)| {
-            path.ends_with("/responses") && item.get("post").is_some_and(Value::is_object)
+            path.ends_with(endpoint::RESPONSES)
+                && item.get(field::POST).is_some_and(Value::is_object)
         })
-        .map(|(_, item)| item.pointer("/post/requestBody/content/application~1json/schema"))
+        .map(|(_, item)| item.pointer(RESPONSES_REQUEST_SCHEMA))
 }
 
 fn constraints_agree<T: PartialEq>(constraints: &[Option<T>]) -> Option<&T> {
@@ -224,8 +231,8 @@ fn tier_id_constraints_agree(constraints: &[Option<Vec<String>>]) -> Option<&Vec
 fn service_tier_ids_from_schema(schema: &Value, document: &Value) -> Option<Vec<String>> {
     let mut visited = BTreeSet::new();
     let schema = resolve_simple_schema(schema, document, &mut visited, 0)?;
-    let props = schema.get("properties").and_then(Value::as_object);
-    if let Some(tier) = props.and_then(|props| props.get("service_tier")) {
+    let props = schema.get(field::PROPERTIES).and_then(Value::as_object);
+    if let Some(tier) = props.and_then(|props| props.get(field::SERVICE_TIER)) {
         let values = closed_enum(tier, document)?;
         return values
             .iter()
@@ -238,20 +245,23 @@ fn service_tier_ids_from_schema(schema: &Value, document: &Value) -> Option<Vec<
 fn web_search_from_schema(schema: &Value, document: &Value) -> Option<bool> {
     let mut visited = BTreeSet::new();
     let schema = resolve_simple_schema(schema, document, &mut visited, 0)?;
-    let tools = schema.get("properties")?.as_object()?.get("tools")?;
+    let tools = schema
+        .get(field::PROPERTIES)?
+        .as_object()?
+        .get(field::TOOLS)?;
     let mut visited = BTreeSet::new();
     let tools = resolve_simple_schema(tools, document, &mut visited, 0)?;
-    if tools.get("prefixItems").is_some() {
+    if tools.get(field::PREFIX_ITEMS).is_some() {
         return None;
     }
     let mut visited = BTreeSet::new();
-    let item = resolve_simple_schema(tools.get("items")?, document, &mut visited, 0)?;
-    let types = item.get("properties")?.as_object()?.get("type")?;
+    let item = resolve_simple_schema(tools.get(field::ITEMS)?, document, &mut visited, 0)?;
+    let types = item.get(field::PROPERTIES)?.as_object()?.get(field::TYPE)?;
     let values = closed_enum(types, document)?;
     Some(values.iter().any(|value| {
         value
             .as_str()
-            .is_some_and(|kind| kind == "web_search" || kind.starts_with("web_search_"))
+            .is_some_and(|kind| kind == item_type::WEB_SEARCH || kind.starts_with("web_search_"))
     }))
 }
 
@@ -266,15 +276,15 @@ type VerbosityFacts = (Option<Vec<String>>, Option<String>);
 fn field_schema<'a>(schema: &'a Value, document: &'a Value, name: &str) -> Option<&'a Value> {
     let mut visited = BTreeSet::new();
     let schema = resolve_simple_schema(schema, document, &mut visited, 0)?;
-    schema.get("properties")?.as_object()?.get(name)
+    schema.get(field::PROPERTIES)?.as_object()?.get(name)
 }
 
 fn summary_facts_from_schema(schema: &Value, document: &Value) -> Option<SummaryFacts> {
-    let reasoning = field_schema(schema, document, "reasoning")?;
+    let reasoning = field_schema(schema, document, field::REASONING)?;
     let mut visited = BTreeSet::new();
     let reasoning = resolve_nullable_schema(reasoning, document, &mut visited, 0)?;
-    let properties = reasoning.get("properties")?.as_object()?;
-    let summary_schema = properties.get("summary");
+    let properties = reasoning.get(field::PROPERTIES)?.as_object()?;
+    let summary_schema = properties.get(field::SUMMARY);
     let summary_levels = summary_schema.and_then(|s| closed_string_enum(s, document));
     let summary = summary_levels
         .as_ref()
@@ -286,7 +296,7 @@ fn summary_facts_from_schema(schema: &Value, document: &Value) -> Option<Summary
             }
             let mut visited = BTreeSet::new();
             let schema = resolve_nullable_schema(schema, document, &mut visited, 0)?;
-            (schema.get("type").and_then(Value::as_str) == Some("string")).then_some(true)
+            (schema.get(field::TYPE).and_then(Value::as_str) == Some(value::STRING)).then_some(true)
         });
     let summary_default = summary_schema.and_then(|s| schema_default_string(s, document));
     Some(SummaryFacts {
@@ -297,10 +307,13 @@ fn summary_facts_from_schema(schema: &Value, document: &Value) -> Option<Summary
 }
 
 fn verbosity_facts_from_schema(schema: &Value, document: &Value) -> Option<VerbosityFacts> {
-    let text = field_schema(schema, document, "text")?;
+    let text = field_schema(schema, document, field::TEXT)?;
     let mut visited = BTreeSet::new();
     let text = resolve_nullable_schema(text, document, &mut visited, 0)?;
-    let verbosity = text.get("properties")?.as_object()?.get("verbosity")?;
+    let verbosity = text
+        .get(field::PROPERTIES)?
+        .as_object()?
+        .get(field::VERBOSITY)?;
     Some((
         closed_string_enum(verbosity, document),
         schema_default_string(verbosity, document),
@@ -313,17 +326,17 @@ fn resolve_nullable_schema<'a>(
     visited: &mut BTreeSet<String>,
     depth: usize,
 ) -> Option<&'a Value> {
-    if depth > 32 {
+    if depth > MAX_SCHEMA_DEPTH {
         return None;
     }
     let schema = resolve_reference(schema, document, visited, depth)?;
-    let Some(branches) = schema.get("anyOf").and_then(Value::as_array) else {
+    let Some(branches) = schema.get(field::ANY_OF).and_then(Value::as_array) else {
         return resolve_simple_schema(schema, document, visited, depth);
     };
     if schema
         .as_object()?
         .keys()
-        .any(|key| key != "anyOf" && !schema_annotation(key))
+        .any(|key| key != field::ANY_OF && !schema_annotation(key))
     {
         return None;
     }
@@ -331,7 +344,7 @@ fn resolve_nullable_schema<'a>(
     let mut saw_null = false;
     for branch in branches {
         let resolved = resolve_reference(branch, document, visited, depth + 1)?;
-        if resolved.get("type").and_then(Value::as_str) == Some("null") {
+        if resolved.get(field::TYPE).and_then(Value::as_str) == Some(value::NULL) {
             if saw_null {
                 return None;
             }
@@ -353,23 +366,23 @@ fn resolve_reference<'a>(
     visited: &mut BTreeSet<String>,
     depth: usize,
 ) -> Option<&'a Value> {
-    if depth > 32 {
+    if depth > MAX_SCHEMA_DEPTH {
         return None;
     }
-    let Some(reference) = schema.get("$ref").and_then(Value::as_str) else {
+    let Some(reference) = schema.get(field::REF).and_then(Value::as_str) else {
         return Some(schema);
     };
     if schema
         .as_object()?
         .keys()
-        .any(|key| key != "$ref" && !schema_annotation(key))
+        .any(|key| key != field::REF && !schema_annotation(key))
         || !visited.insert(reference.to_owned())
     {
         return None;
     }
-    let target = reference.strip_prefix("#/components/schemas/")?;
+    let target = reference.strip_prefix(SCHEMA_REFERENCE_PREFIX)?;
     resolve_reference(
-        document.pointer(&format!("/components/schemas/{target}"))?,
+        document.pointer(&format!("{SCHEMA_POINTER_PREFIX}{target}"))?,
         document,
         visited,
         depth + 1,
@@ -386,18 +399,18 @@ fn closed_string_enum(schema: &Value, document: &Value) -> Option<Vec<String>> {
 }
 
 fn schema_default_string(schema: &Value, document: &Value) -> Option<String> {
-    let wrapper_default = schema.get("default").and_then(Value::as_str);
+    let wrapper_default = schema.get(field::DEFAULT).and_then(Value::as_str);
     let mut visited = BTreeSet::new();
     let schema = resolve_nullable_schema(schema, document, &mut visited, 0)?;
     if let Some(value) = wrapper_default {
         return Some(value.to_owned());
     }
-    if let Some(value) = schema.get("default").and_then(Value::as_str) {
+    if let Some(value) = schema.get(field::DEFAULT).and_then(Value::as_str) {
         return Some(value.to_owned());
     }
     let mut visited = BTreeSet::new();
     let schema = resolve_simple_schema(schema, document, &mut visited, 0)?;
-    schema.get("default")?.as_str().map(str::to_owned)
+    schema.get(field::DEFAULT)?.as_str().map(str::to_owned)
 }
 
 fn resolve_simple_schema<'a>(
@@ -407,7 +420,7 @@ fn resolve_simple_schema<'a>(
     depth: usize,
 ) -> Option<&'a Value> {
     let schema = resolve_reference(schema, document, visited, depth)?;
-    ["anyOf", "oneOf", "allOf", "not"]
+    [field::ANY_OF, field::ONE_OF, field::ALL_OF, field::NOT]
         .iter()
         .all(|key| schema.get(key).is_none())
         .then_some(schema)
@@ -419,12 +432,12 @@ fn closed_enum<'a>(schema: &'a Value, document: &'a Value) -> Option<&'a [Value]
     if schema
         .as_object()?
         .keys()
-        .any(|key| !matches!(key.as_str(), "enum" | "type") && !schema_annotation(key))
+        .any(|key| !matches!(key.as_str(), field::ENUM | field::TYPE) && !schema_annotation(key))
     {
         return None;
     }
     schema
-        .get("enum")
+        .get(field::ENUM)
         .and_then(Value::as_array)
         .map(Vec::as_slice)
 }
@@ -432,63 +445,68 @@ fn closed_enum<'a>(schema: &'a Value, document: &'a Value) -> Option<&'a [Value]
 fn schema_annotation(key: &str) -> bool {
     matches!(
         key,
-        "title"
-            | "description"
-            | "default"
-            | "examples"
-            | "example"
-            | "deprecated"
-            | "readOnly"
-            | "writeOnly"
+        field::TITLE
+            | field::DESCRIPTION
+            | field::DEFAULT
+            | field::EXAMPLES
+            | field::EXAMPLE
+            | field::DEPRECATED
+            | field::READ_ONLY
+            | field::WRITE_ONLY
     )
 }
 
 fn read_flags(value: &Value) -> Capabilities {
     let mut result = Capabilities::default();
     let object = value.as_object();
-    let nested = value.get("capabilities").and_then(Value::as_object);
+    let nested = value.get(field::CAPABILITIES).and_then(Value::as_object);
     let get = |name: &str| {
         nested
             .and_then(|m| m.get(name))
             .or_else(|| object.and_then(|m| m.get(name)))
     };
-    result.responses_lite = get("responses_lite")
+    result.responses_lite = get(field::RESPONSES_LITE)
         .and_then(Value::as_bool)
-        .or_else(|| get("supports_responses_lite").and_then(Value::as_bool));
+        .or_else(|| get(field::SUPPORTS_RESPONSES_LITE).and_then(Value::as_bool));
     result.responses_lite = result
         .responses_lite
-        .or_else(|| get("use_responses_lite").and_then(Value::as_bool));
-    result.tool_search = get("tool_search")
+        .or_else(|| get(field::USE_RESPONSES_LITE).and_then(Value::as_bool));
+    result.tool_search = get(field::TOOL_SEARCH)
         .and_then(Value::as_bool)
-        .or_else(|| get("supports_search_tool").and_then(Value::as_bool));
-    result.tool_inventory = get("tool_inventory")
+        .or_else(|| get(field::SUPPORTS_SEARCH_TOOL).and_then(Value::as_bool));
+    result.tool_inventory = get(field::TOOL_INVENTORY)
         .and_then(Value::as_bool)
-        .or_else(|| get("supports_tool_inventory").and_then(Value::as_bool));
-    result.image_detail_original = get("image_detail_original")
+        .or_else(|| get(field::SUPPORTS_TOOL_INVENTORY).and_then(Value::as_bool));
+    result.image_detail_original = get(field::IMAGE_DETAIL_ORIGINAL)
         .and_then(Value::as_bool)
-        .or_else(|| get("supports_image_detail_original").and_then(Value::as_bool));
-    result.images = get("images").and_then(Value::as_bool);
-    result.service_tiers = get("service_tiers").and_then(Value::as_bool);
-    result.web_search = get("web_search").and_then(Value::as_bool);
-    result.access_programs = get("access_programs").and_then(Value::as_bool);
-    result.history_notes = get("history_notes").and_then(Value::as_bool);
-    result.reasoning_summary = get("reasoning_summary")
+        .or_else(|| get(field::SUPPORTS_IMAGE_DETAIL_ORIGINAL).and_then(Value::as_bool));
+    result.images = get(field::IMAGES).and_then(Value::as_bool);
+    result.service_tiers = get(field::SERVICE_TIERS).and_then(Value::as_bool);
+    result.web_search = get(field::WEB_SEARCH).and_then(Value::as_bool);
+    result.access_programs = get(field::ACCESS_PROGRAMS).and_then(Value::as_bool);
+    result.history_notes = get(field::HISTORY_NOTES).and_then(Value::as_bool);
+    result.reasoning_summary = get(field::REASONING_SUMMARY)
         .and_then(Value::as_bool)
-        .or_else(|| get("supports_reasoning_summary_parameter").and_then(Value::as_bool));
+        .or_else(|| get(field::SUPPORTS_REASONING_SUMMARY_PARAMETER).and_then(Value::as_bool));
     result
 }
 
 fn model_id(model: &Value) -> Option<&str> {
-    ["id", "slug", "served_model_name", "model_path"]
-        .iter()
-        .find_map(|key| model.get(key).and_then(Value::as_str))
+    [
+        field::ID,
+        field::SLUG,
+        field::SERVED_MODEL_NAME,
+        field::MODEL_PATH,
+    ]
+    .iter()
+    .find_map(|key| model.get(key).and_then(Value::as_str))
 }
 
 fn parse_model_info(document: &Value, found: &mut Discovery) {
     for info in [
         Some(document),
-        document.get("model_info"),
-        document.get("data"),
+        document.get(field::MODEL_INFO),
+        document.get(field::DATA),
     ]
     .into_iter()
     .flatten()
@@ -498,7 +516,7 @@ fn parse_model_info(document: &Value, found: &mut Discovery) {
 }
 
 fn parse_models(document: &Value, found: &mut Discovery) {
-    for models in [document.get("data"), document.get("models")]
+    for models in [document.get(field::DATA), document.get(field::MODELS)]
         .into_iter()
         .flatten()
         .filter_map(Value::as_array)
@@ -515,7 +533,7 @@ fn merge_model(model: &Value, found: &mut Discovery) {
     };
     let mut caps = read_flags(model);
     if let Some(flag) = model
-        .get("has_image_understanding")
+        .get(field::HAS_IMAGE_UNDERSTANDING)
         .and_then(Value::as_bool)
     {
         caps.images = Some(flag);
@@ -528,12 +546,12 @@ fn merge_model(model: &Value, found: &mut Discovery) {
 fn parse_tool_inventory(document: &Value, caps: &mut Capabilities) {
     let inventory = document
         .as_array()
-        .or_else(|| document.get("tools").and_then(Value::as_array));
+        .or_else(|| document.get(field::TOOLS).and_then(Value::as_array));
     let Some(items) = inventory else { return };
     caps.tool_inventory = Some(true);
     if items
         .iter()
-        .any(|item| item.get("type").and_then(Value::as_str) == Some("tool_search"))
+        .any(|item| item.get(field::TYPE).and_then(Value::as_str) == Some(item_type::TOOL_SEARCH))
     {
         caps.tool_search = Some(true);
     }
@@ -541,12 +559,12 @@ fn parse_tool_inventory(document: &Value, caps: &mut Capabilities) {
 
 pub(crate) fn is_tools_path(path: &str) -> bool {
     let normalized = path.trim_end_matches('/');
-    normalized.ends_with("/tools") || normalized.ends_with("/tools/list")
+    normalized.ends_with(endpoint::TOOLS) || normalized.ends_with(endpoint::TOOLS_LIST)
 }
 
 fn declared_tool_paths(document: &Value) -> Vec<String> {
     document
-        .get("paths")
+        .get(field::PATHS)
         .and_then(Value::as_object)
         .into_iter()
         .flatten()
@@ -554,7 +572,7 @@ fn declared_tool_paths(document: &Value) -> Vec<String> {
             is_tools_path(path)
                 && path.starts_with('/')
                 && !path.contains('{')
-                && methods.get("get").is_some_and(Value::is_object)
+                && methods.get(field::GET).is_some_and(Value::is_object)
         })
         .map(|(path, _)| path.clone())
         .collect()
@@ -568,20 +586,20 @@ fn image_original_from_schema(
     depth: usize,
     variant: bool,
 ) {
-    if depth > 32 {
+    if depth > MAX_SCHEMA_DEPTH {
         constraints.push(None);
         return;
     }
-    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+    if let Some(reference) = schema.get(field::REF).and_then(Value::as_str) {
         if !visited.insert(reference.to_owned()) {
             constraints.push(None);
             return;
         }
-        let Some(target) = reference.strip_prefix("#/components/schemas/") else {
+        let Some(target) = reference.strip_prefix(SCHEMA_REFERENCE_PREFIX) else {
             constraints.push(None);
             return;
         };
-        let Some(schema) = document.pointer(&format!("/components/schemas/{target}")) else {
+        let Some(schema) = document.pointer(&format!("{SCHEMA_POINTER_PREFIX}{target}")) else {
             constraints.push(None);
             return;
         };
@@ -589,39 +607,46 @@ fn image_original_from_schema(
         visited.remove(reference);
         return;
     }
-    let props = schema.get("properties").and_then(Value::as_object);
+    let props = schema.get(field::PROPERTIES).and_then(Value::as_object);
     let initial_constraints = constraints.len();
     // An unconstrained branch may describe an image whose detail support is unknown.
     if variant
         && props.is_none()
-        && ["anyOf", "oneOf", "allOf", "items", "const", "enum"]
-            .iter()
-            .all(|key| schema.get(key).is_none())
-        && !matches!(schema.get("type").and_then(Value::as_str), Some(kind) if kind != "object")
+        && [
+            field::ANY_OF,
+            field::ONE_OF,
+            field::ALL_OF,
+            field::ITEMS,
+            field::CONST,
+            field::ENUM,
+        ]
+        .iter()
+        .all(|key| schema.get(key).is_none())
+        && !matches!(schema.get(field::TYPE).and_then(Value::as_str), Some(kind) if kind != value::OBJECT)
         && schema != &Value::Bool(false)
     {
         constraints.push(None);
     }
     let is_input_image = props
-        .and_then(|p| p.get("type"))
-        .and_then(|t| t.get("const"))
+        .and_then(|p| p.get(field::TYPE))
+        .and_then(|t| t.get(field::CONST))
         .and_then(Value::as_str)
-        == Some("input_image");
+        == Some(item_type::INPUT_IMAGE);
     if is_input_image {
         let fact = props
-            .and_then(|p| p.get("detail"))
+            .and_then(|p| p.get(field::DETAIL))
             .and_then(|detail| find_closed_enum(detail, document, &mut visited.clone(), depth + 1))
             .map(|values| values.iter().any(|v| v.as_str() == Some("original")));
         constraints.push(fact);
     }
-    for key in ["anyOf", "oneOf", "allOf"] {
+    for key in [field::ANY_OF, field::ONE_OF, field::ALL_OF] {
         if let Some(items) = schema.get(key).and_then(Value::as_array) {
             for item in items {
                 image_original_from_schema(item, document, visited, constraints, depth + 1, true);
             }
         }
     }
-    if let Some(item_schema) = schema.get("items") {
+    if let Some(item_schema) = schema.get(field::ITEMS) {
         image_original_from_schema(item_schema, document, visited, constraints, depth + 1, true);
     }
     if let Some(props) = props {
@@ -631,10 +656,10 @@ fn image_original_from_schema(
         // Untagged objects with no known image descendant do not establish that
         // every image variant was described. Explicit non-image tags can be skipped.
         let non_image_tag = props
-            .get("type")
-            .and_then(|tag| tag.get("const"))
+            .get(field::TYPE)
+            .and_then(|tag| tag.get(field::CONST))
             .and_then(Value::as_str)
-            .is_some_and(|tag| tag != "input_image");
+            .is_some_and(|tag| tag != item_type::INPUT_IMAGE);
         if variant && constraints.len() == initial_constraints && !non_image_tag {
             constraints.push(None);
         }
@@ -647,19 +672,19 @@ fn find_closed_enum(
     visited: &mut BTreeSet<String>,
     depth: usize,
 ) -> Option<Vec<Value>> {
-    if depth > 32 {
+    if depth > MAX_SCHEMA_DEPTH {
         return None;
     }
-    if let Some(values) = schema.get("enum").and_then(Value::as_array) {
+    if let Some(values) = schema.get(field::ENUM).and_then(Value::as_array) {
         return Some(values.clone());
     }
-    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+    if let Some(reference) = schema.get(field::REF).and_then(Value::as_str) {
         if !visited.insert(reference.to_owned()) {
             return None;
         }
-        let target = reference.strip_prefix("#/components/schemas/")?;
+        let target = reference.strip_prefix(SCHEMA_REFERENCE_PREFIX)?;
         let result = find_closed_enum(
-            document.pointer(&format!("/components/schemas/{target}"))?,
+            document.pointer(&format!("{SCHEMA_POINTER_PREFIX}{target}"))?,
             document,
             visited,
             depth + 1,
@@ -667,11 +692,11 @@ fn find_closed_enum(
         visited.remove(reference);
         return result;
     }
-    for key in ["anyOf", "oneOf"] {
+    for key in [field::ANY_OF, field::ONE_OF] {
         if let Some(items) = schema.get(key).and_then(Value::as_array) {
             let mut values = Vec::new();
             for item in items {
-                if item.get("type").and_then(Value::as_str) == Some("null") {
+                if item.get(field::TYPE).and_then(Value::as_str) == Some(value::NULL) {
                     continue;
                 }
                 values.extend(find_closed_enum(item, document, visited, depth + 1)?);

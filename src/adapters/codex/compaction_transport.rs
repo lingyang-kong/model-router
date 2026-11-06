@@ -15,7 +15,10 @@ use super::{
     response::clean_rewritten_headers,
     transport::prepare_multiagent,
 };
+use crate::protocol::{field, header, media_type};
 use crate::{compression::decode_body, config::Provider, error::Error, router::RouterState};
+
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
 pub(super) async fn summarize(
     state: Arc<RouterState>,
@@ -29,10 +32,10 @@ pub(super) async fn summarize(
     crate::config::remove_websocket_headers(&mut parts.headers);
     parts
         .headers
-        .insert("content-type", "application/json".parse().unwrap());
+        .insert(header::CONTENT_TYPE, media_type::JSON.parse().unwrap());
     parts
         .headers
-        .insert("accept", "application/json".parse().unwrap());
+        .insert(header::ACCEPT, media_type::JSON.parse().unwrap());
     loop {
         let body = summary.body().map_err(IntoResponse::into_response)?;
         let model = crate::body::request_model(&body).map_err(IntoResponse::into_response)?;
@@ -53,7 +56,7 @@ pub(super) async fn summarize(
             .map_err(IntoResponse::into_response)?;
         // Internal summaries and trimmed retries have distinct payloads. Strip
         // caller and provider-configured keys after all headers are applied.
-        request.headers_mut().remove("idempotency-key");
+        request.headers_mut().remove(header::IDEMPOTENCY_KEY);
         let response = client
             .execute(request)
             .await
@@ -91,7 +94,7 @@ pub(super) fn sse(
     let stream = futures_util::stream::unfold(
         (
             Some(work.boxed()),
-            tokio::time::interval(Duration::from_secs(15)),
+            tokio::time::interval(HEARTBEAT_INTERVAL),
         ),
         |(mut work, mut heartbeat)| async move {
             let pending = work.as_mut()?;
@@ -109,8 +112,8 @@ pub(super) fn sse(
         },
     );
     Response::builder()
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
+        .header(header::CONTENT_TYPE, media_type::EVENT_STREAM)
+        .header(header::CACHE_CONTROL, "no-cache")
         .body(Body::from_stream(stream))
         .unwrap()
 }
@@ -118,7 +121,7 @@ pub(super) fn sse(
 fn encode_sse(events: Vec<Value>) -> Bytes {
     let mut bytes = Vec::new();
     for event in events {
-        bytes.extend_from_slice(b"data: ");
+        bytes.extend_from_slice(super::SSE_DATA_PREFIX);
         serde_json::to_writer(&mut bytes, &event).expect("JSON event serializes");
         bytes.extend_from_slice(b"\n\n");
     }
@@ -134,15 +137,15 @@ pub(super) async fn failure_event(response: Response, stream_id: Option<&Value>)
         .unwrap_or_else(|error| error.to_string().into_bytes());
     let mut error = serde_json::from_slice::<Value>(&body)
         .ok()
-        .and_then(|body| body.get("error").cloned())
+        .and_then(|body| body.get(field::ERROR).cloned())
         .unwrap_or_else(|| serde_json::json!({"message":String::from_utf8_lossy(&body)}));
     // Codex expects string codes; a numeric code makes it ignore the error event.
-    if let Some(code @ Value::Number(_)) = error.get_mut("code") {
+    if let Some(code @ Value::Number(_)) = error.get_mut(field::CODE) {
         *code = Value::String(code.to_string());
     }
     let mut event = serde_json::json!({"type":"error", "status":status, "error":error});
     if let Some(stream_id) = stream_id {
-        event["stream_id"] = stream_id.clone();
+        event[field::STREAM_ID] = stream_id.clone();
     }
     event
 }
