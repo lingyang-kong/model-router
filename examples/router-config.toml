@@ -34,7 +34,7 @@ reasoning_levels = [
 ]
 
 [clients.codex]
-provider = "chatgpt"
+provider = { subscription = "chatgpt", api_key = "openai" }
 format = "codex"
 
 [[routes]]

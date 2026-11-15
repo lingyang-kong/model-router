@@ -1,4 +1,5 @@
 mod adapters;
+mod authentication;
 mod body;
 mod capabilities;
 mod catalog;

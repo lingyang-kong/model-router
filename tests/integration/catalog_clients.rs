@@ -76,7 +76,9 @@ async fn example_catalog_serves_each_client_and_keeps_credentials_scoped() {
             .get(gateway.url.clone() + "/models?client_version=test")
             .bearer_auth("chatgpt-credential");
         request = match format {
-            "codex" => request.header("originator", "codex_cli_rs"),
+            "codex" => request
+                .header("originator", "codex_cli_rs")
+                .header("chatgpt-account-id", "account"),
             "anthropic" => request.header("anthropic-version", "2023-06-01"),
             _ => request,
         };
@@ -156,7 +158,9 @@ async fn example_catalog_serves_each_client_and_keeps_credentials_scoped() {
             .header("x-reject-chatgpt", "1");
         let request = match format {
             "anthropic" => request.header("anthropic-version", "2023-06-01"),
-            "codex" => request.header("originator", "codex_cli_rs"),
+            "codex" => request
+                .header("originator", "codex_cli_rs")
+                .header("chatgpt-account-id", "account"),
             _ => request,
         };
         let response = request.send().await.unwrap();

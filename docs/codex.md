@@ -11,13 +11,17 @@ Use GPT through a ChatGPT subscription and custom models through Responses-compa
    openai_base_url = "http://localhost:4134"
    ```
 
-3. Keep your ChatGPT login, or run `codex login`, and select models with `/model`.
+3. Keep your existing ChatGPT or API-key login and select models with `/model`.
 
-This setup uses Codex's built-in OpenAI provider and ChatGPT authentication. Remove a custom `model_provider` selection if it would bypass that setup. API-key catalog discovery requires an explicit catalog URL in Codex.
+This setup uses Codex's built-in OpenAI provider with either ChatGPT or API-key authentication. The router maps ChatGPT account authentication through `subscription` and API-key authentication through `api_key`. Configure only the modes you want to accept; requests using an unmapped mode are rejected. Remove a custom `model_provider` selection if it would bypass that setup. The endpoint is the only client setting required by the router.
 
 For other client options, see the [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
 
-The router selects Codex handling when the `originator` header contains `codex`, ignoring ASCII case. It adapts HTTP and WebSocket `model` routes; other clients and `forward` routes remain unadapted. No router-specific client header is needed. `[clients.codex]` associates Codex with its provider and catalog format; the example uses ChatGPT and `codex`. The same catalog route serves OpenAI and Anthropic clients through their own profiles. The ChatGPT catalog source declares its source format independently.
+The router selects Codex handling when the `originator` header contains `codex`, ignoring ASCII case. It adapts HTTP and WebSocket `model` routes; other clients and `forward` routes remain unadapted. No router-specific client header is needed. `[clients.codex]` selects the provider from the request authentication and uses the `codex` catalog format. The same catalog route serves OpenAI and Anthropic clients through their own profiles. The ChatGPT catalog source declares its source format independently.
+
+## API-key picker discovery
+
+In API-key mode, Codex may use its built-in model list instead of fetching the router's `/models` catalog through the base URL. Local models may therefore be absent from the picker. This discovery limitation does not affect inference: a recognized local model ID routes to its local upstream without a catalog refresh, and other IDs route to the provider selected by the request credentials. No catalog setting is required for routing.
 
 ## Model metadata
 
@@ -81,10 +85,10 @@ HTTP JSON, SSE, and WebSocket replies are supported. Summary generation always u
 
 ## WebSocket routing
 
-Codex's native routing hint selects the initial provider; absent a hint, `[clients.codex].provider` is used. The router requires a real upstream handshake before accepting the client socket, including prewarm connections. Successful non-upgrade responses and HTTP 404/405/426/501 become HTTP 426 so the client can fall back to HTTP. Authentication, rate-limit, and server errors remain errors.
+Codex's native routing hint selects a recognized local model's provider for the initial handshake; otherwise the request's authentication selects the provider. The router requires a real upstream handshake before accepting the client socket, including prewarm connections. Successful non-upgrade responses and HTTP 404/405/426/501 become HTTP 426 so the client can fall back to HTTP. Authentication, rate-limit, and server errors remain errors.
 
 Every subsequent model request is routed again. Each client socket has one upstream connection, reused for requests to the same provider. When a subsequent inference request on the same client WebSocket selects a different provider, the router drops the old upstream connection immediately, cancelling unfinished inference and abandoning any queued or in-flight writes on it, before opening its replacement; switching back opens a fresh connection. A cross-provider request with `previous_response_id` receives a full-history retry error before the current connection is closed.
 
-Requests without a model use the original handshake model or the client's configured default provider. Control and unknown typed events stay on the current connection. Upstream writes remain ordered, while slow writes do not block preparation of later requests. Pending local summaries and replies survive switches. Client disconnects cancel pending work, including replacement handshakes. A rejected replacement upgrade emits an error and closes the client socket; an unexpected upstream disconnect also ends the client session.
+Requests without a model use the original handshake model or the provider selected by the handshake authentication. Control and unknown typed events stay on the current connection. Upstream writes remain ordered, while slow writes do not block preparation of later requests. Pending local summaries and replies survive switches. Client disconnects cancel pending work, including replacement handshakes. A rejected replacement upgrade emits an error and closes the client socket; an unexpected upstream disconnect also ends the client session.
 
 There is no WebSocket-to-HTTP bridge for ordinary inference, so seamless switching to an HTTP-only provider is not guaranteed. Adapted handshakes disable `permessage-deflate`; request-body compression can remain enabled. WebSocket `forward` routes retain negotiated extensions.

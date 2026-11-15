@@ -138,12 +138,12 @@ async fn catalog_refresh_preserves_origin_credentials_and_strips_cache_condition
 }
 
 #[tokio::test]
-async fn buffered_model_routes_use_native_ids_and_learn_catalog_updates_atomically() {
+async fn catalog_refresh_does_not_create_remote_routes_without_a_selected_provider() {
     let fixture = Fixture::new().await;
     let config = parse_config(&json!({"providers":{
         "live":{"base_url":fixture._live_server.url,"auth":"passthrough","catalog":{"path":"/models","format":"codex"}},
         "manual":{"base_url":fixture._manual_server.url,"auth":"none","catalog":{"file":"models.json","format":"codex"}}
-    },"clients":{"openai":{"format":"codex"}},"routes":[
+    },"clients":{"openai":{"format":"codex"},"codex":{"provider":"live","format":"codex"}},"routes":[
         {"method":"GET","path":"/models","action":"catalog"},
         {"action":"model"}
     ]}).to_string(),fixture.root.path()).unwrap();
@@ -174,21 +174,21 @@ async fn buffered_model_routes_use_native_ids_and_learn_catalog_updates_atomical
         fixture
             .client
             .get(gateway.url.clone() + "/models")
+            .header("originator", "codex_cli_rs")
             .send()
             .await
             .unwrap()
             .status(),
         StatusCode::OK
     );
-    let response: Value = send(r#"{"model":"gpt-test"}"#)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(response["provider"], "service-a");
-    assert_eq!(response["headers"]["authorization"], "Bearer session-token");
+    assert_eq!(
+        send(r#"{"model":"gpt-test"}"#)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
     *fixture.live.models.lock().unwrap() = vec![
         json!({"slug":"new-model"}),
         json!({"slug":"publisher/model"}),
@@ -197,11 +197,12 @@ async fn buffered_model_routes_use_native_ids_and_learn_catalog_updates_atomical
         fixture
             .client
             .get(gateway.url.clone() + "/models")
+            .header("originator", "codex_cli_rs")
             .send()
             .await
             .unwrap()
             .status(),
-        StatusCode::SERVICE_UNAVAILABLE
+        StatusCode::OK
     );
     assert_eq!(
         send(r#"{"model":"new-model"}"#)
@@ -216,6 +217,7 @@ async fn buffered_model_routes_use_native_ids_and_learn_catalog_updates_atomical
         fixture
             .client
             .get(gateway.url.clone() + "/models")
+            .header("originator", "codex_cli_rs")
             .send()
             .await
             .unwrap()
@@ -228,7 +230,7 @@ async fn buffered_model_routes_use_native_ids_and_learn_catalog_updates_atomical
             .await
             .unwrap()
             .status(),
-        StatusCode::OK
+        StatusCode::NOT_FOUND
     );
     assert_eq!(
         send(r#"{"model":"gpt-test"}"#)
@@ -236,7 +238,7 @@ async fn buffered_model_routes_use_native_ids_and_learn_catalog_updates_atomical
             .await
             .unwrap()
             .status(),
-        StatusCode::OK
+        StatusCode::NOT_FOUND
     );
     assert_eq!(
         send(r#"{"model":7}"#).send().await.unwrap().status(),
@@ -260,6 +262,7 @@ async fn buffered_model_routes_use_native_ids_and_learn_catalog_updates_atomical
         let catalog: Value = fixture
             .client
             .get(gateway.url.clone() + "/models")
+            .header("originator", "codex_cli_rs")
             .send()
             .await
             .unwrap()
@@ -278,7 +281,11 @@ async fn buffered_model_routes_use_native_ids_and_learn_catalog_updates_atomical
                     .await
                     .unwrap()
                     .status(),
-                StatusCode::OK
+                if model == "publisher/model" {
+                    StatusCode::OK
+                } else {
+                    StatusCode::NOT_FOUND
+                }
             );
         }
     }
@@ -1053,4 +1060,47 @@ fn rejects_missing_or_unknown_catalog_and_route_fields() {
         let config = json!({"providers":{"api":provider},"routes":[{"action":"model"}]});
         assert!(parse_config(&config.to_string(), root.path()).is_err());
     }
+}
+
+#[tokio::test]
+async fn local_id_shadows_remote_catalog_but_can_inherit_its_metadata() {
+    let fixture = Fixture::new().await;
+    *fixture.live.models.lock().unwrap() = vec![json!({
+        "slug":"publisher/model", "base_instructions":"donor instructions", "context_window":12345
+    })];
+    let config = parse_config(&json!({"providers":{
+        "live":{"base_url":fixture._live_server.url,"auth":"passthrough","catalog":{"path":"/models","format":"codex"}},
+        "manual":{"base_url":fixture._manual_server.url,"auth":"none","catalog":{"file":"models.json","format":"codex"},
+            "models":{"publisher/model":{"extends":{"provider":"live","model":"publisher/model"}}}}
+    },"clients":{"openai":{"provider":"live","format":"codex"}},"routes":[
+        {"method":"GET","path":"/models","action":"catalog"}, {"action":"model"}
+    ]}).to_string(), fixture.root.path()).unwrap();
+    let gateway = serve(router(config).unwrap()).await;
+    let response = fixture
+        .client
+        .get(gateway.url.clone() + "/models")
+        .bearer_auth("token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "private, no-store");
+    let catalog: Value = response.json().await.unwrap();
+    let models = catalog["models"].as_array().unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0]["base_instructions"], "donor instructions");
+    assert_eq!(models[0]["display_name"], "Manually managed");
+    let routed: Value = fixture
+        .client
+        .post(gateway.url.clone() + "/responses")
+        .bearer_auth("token")
+        .json(&json!({"model":"publisher/model"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(routed["provider"], "service-b");
+    assert!(routed["headers"].get("authorization").is_none());
 }

@@ -42,25 +42,9 @@ impl RouterState {
         fallback: Option<&Arc<Provider>>,
     ) -> Result<Arc<Provider>> {
         if let Some(model) = model
-            && let Some(entry) = self.catalog.read().await.models.get(model)
+            && let Some(provider) = self.catalog.read().await.local_routes.get(model)
         {
-            return Ok(Arc::clone(&entry.provider));
-        }
-        // Explicit native IDs already identify their provider before remote discovery.
-        if let Some(model) = model {
-            let mut configured = self
-                .config
-                .providers
-                .values()
-                .filter(|provider| provider.models.contains_key(model));
-            if let Some(provider) = configured.next() {
-                if configured.next().is_some() {
-                    return Err(Error::bad_gateway(format!(
-                        "Conflicting providers for model: {model}"
-                    )));
-                }
-                return Ok(Arc::clone(provider));
-            }
+            return Ok(Arc::clone(provider));
         }
         if let Some(fallback) = fallback {
             return Ok(Arc::clone(fallback));
@@ -118,9 +102,10 @@ pub fn router(config: Config) -> anyhow::Result<Router> {
             .providers
             .values()
             .all(|provider| provider.catalog.is_none() || from_file(provider));
+    let catalog = CatalogState::new(&config, models, ready)?;
     let state = RouterState {
         config,
-        catalog: RwLock::new(CatalogState::new(models, ready)),
+        catalog: RwLock::new(catalog),
         client: build_http_client(false)?,
         loopback_client: build_http_client(true)?,
     };
@@ -156,9 +141,12 @@ async fn handle_request(
         .config
         .route(request.method(), request.uri(), request.headers())?
         .action;
-    let origin = action
-        .provider()
-        .or_else(|| profile.and_then(|profile| profile.provider.as_deref()))
+    let selected = profile
+        .and_then(|profile| profile.provider.as_ref())
+        .map(|selection| selection.select(request.headers()))
+        .transpose()?;
+    let origin = selected
+        .or_else(|| action.provider())
         .map(|name| state.config.provider(name))
         .transpose()?;
     if matches!(action, RouteAction::Forward { .. }) && origin.is_none() {
@@ -194,7 +182,12 @@ async fn forward_http(
         }
         RouteAction::Model { .. } => inspect_body(body, &parts.headers).await?,
     };
-    let provider = state.resolve_provider(model.as_deref(), origin).await?;
+    let provider = match action {
+        RouteAction::Forward {
+            provider: Some(name),
+        } => Arc::clone(state.config.provider(name)?),
+        _ => state.resolve_provider(model.as_deref(), origin).await?,
+    };
     let (client, request) = state.prepare_request(&provider, origin, &parts, body)?;
     let response = client.execute(request).await.map_err(Error::bad_gateway)?;
     Ok(stream_response(response))

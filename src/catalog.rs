@@ -33,6 +33,7 @@ const CATALOG_TIMEOUT: Duration = Duration::from_secs(3);
 // Preserve the wire spelling while keeping the catalog's cache dimensions together.
 const VARY_HEADERS: [&str; 3] = ["Accept-Encoding", "Originator", "Anthropic-Version"];
 
+#[derive(Clone)]
 pub(crate) struct ModelEntry {
     pub provider: Arc<Provider>,
     pub format: CatalogFormat,
@@ -56,20 +57,43 @@ pub(crate) type ModelRegistry = IndexMap<String, ModelEntry>;
 
 pub(crate) struct CatalogState {
     pub models: ModelRegistry,
+    pub local_routes: IndexMap<String, Arc<Provider>>,
     listings: BTreeMap<(ClientKind, Option<usize>, u64), Arc<str>>,
     credentials: RandomState,
     file_listing: Option<Arc<str>>,
 }
 
 impl CatalogState {
-    pub fn new(models: ModelRegistry, ready: bool) -> Self {
+    pub fn new(config: &Config, models: ModelRegistry, ready: bool) -> Result<Self> {
         let file_listing = ready.then(|| model_listing(&models));
-        Self {
+        let mut local_routes = IndexMap::new();
+        let configured = config
+            .providers
+            .values()
+            .filter(|provider| !provider.uses_incoming_credentials())
+            .flat_map(|provider| provider.models.keys().map(move |id| (id, provider)));
+        let files = models
+            .iter()
+            .filter(|(_, entry)| !entry.provider.uses_incoming_credentials())
+            .map(|(id, entry)| (id, &entry.provider));
+        for (id, provider) in configured.chain(files) {
+            if local_routes
+                .get(id)
+                .is_some_and(|previous| !Arc::ptr_eq(previous, provider))
+            {
+                return Err(Error::service_unavailable(format!(
+                    "Model belongs to multiple providers: {id}"
+                )));
+            }
+            local_routes.insert(id.clone(), Arc::clone(provider));
+        }
+        Ok(Self {
             models,
+            local_routes,
             listings: BTreeMap::new(),
             credentials: RandomState::new(),
             file_listing,
-        }
+        })
     }
 
     fn scope(
@@ -207,7 +231,7 @@ pub(crate) fn load_manual_models(config: &Config) -> Result<ModelRegistry> {
         for model in settings.format.models(&mut document)? {
             let metadata = resolve_metadata(provider, model, settings.format)?;
             let id = settings.format.model_id(&metadata)?.to_owned();
-            validate_ownership(config, &registry, &id, provider)?;
+            validate_ownership(&registry, &id, provider)?;
             registry.insert(
                 id,
                 ModelEntry {
@@ -373,12 +397,21 @@ impl RouterState {
     ) -> Result<Response> {
         let gzip = accepts_gzip(&parts.headers)?;
         let incoming_headers = parts.headers.clone();
-        // Client identity owns credentials; every configured catalog is a peer.
+        // Fetch passthrough catalogs only for the selected credential owner.
+        let skipped = |provider: &&Arc<Provider>| {
+            provider
+                .catalog
+                .as_ref()
+                .is_some_and(|source| source.path.is_some())
+                && provider.uses_incoming_credentials()
+                && !origin.is_some_and(|origin| Arc::ptr_eq(provider, origin))
+        };
+        let mut unavailable: Vec<_> = self.config.providers.values().filter(skipped).collect();
         let mut requests = self
             .config
             .providers
             .values()
-            .filter(|provider| provider.catalog.is_some())
+            .filter(|provider| provider.catalog.is_some() && !skipped(provider))
             .map(|provider| {
                 let incoming = origin
                     .is_some_and(|origin| Arc::ptr_eq(provider, origin))
@@ -392,7 +425,6 @@ impl RouterState {
             })
             .collect::<FuturesOrdered<_>>();
         let mut snapshots = Vec::new();
-        let mut unavailable = Vec::new();
         let mut rejection = None;
         while let Some((provider, reply)) = requests.next().await {
             match reply? {
@@ -408,23 +440,51 @@ impl RouterState {
             }
         }
         if snapshots.is_empty() {
-            return Ok(rejection.expect("configured catalog sources failed"));
+            return rejection.ok_or_else(|| {
+                Error::bad_gateway("No catalog is available for the selected provider")
+            });
         }
-        // References resolve against this refresh, never stale routing metadata.
+        // References are provider-qualified, even when a local ID shadows a remote row.
+        let local_routes = self.catalog.read().await.local_routes.clone();
+        let mut donors = IndexMap::new();
         let mut staged = ModelRegistry::new();
         for snapshot in &mut snapshots {
             for metadata in std::mem::take(snapshot.format.models(&mut snapshot.document)?) {
                 let id = snapshot.format.model_id(&metadata)?.to_owned();
-                validate_ownership(&self.config, &staged, &id, &snapshot.provider)?;
-                staged.insert(
-                    id,
-                    ModelEntry {
-                        provider: Arc::clone(&snapshot.provider),
-                        format: snapshot.format,
-                        metadata,
-                        listed: true,
-                    },
-                );
+                let provider = &snapshot.provider;
+                let entry = ModelEntry {
+                    provider: Arc::clone(provider),
+                    format: snapshot.format,
+                    metadata,
+                    listed: true,
+                };
+                donors.insert((Arc::as_ptr(provider) as usize, id.clone()), entry.clone());
+                let remote = provider.uses_incoming_credentials();
+                let local_claim = local_routes
+                    .get(&id)
+                    .is_some_and(|owner| !Arc::ptr_eq(owner, provider));
+                if remote && local_routes.contains_key(&id) {
+                    continue;
+                }
+                if let Some(previous) = staged.get(&id) {
+                    let previous_remote = previous.provider.uses_incoming_credentials();
+                    match (previous_remote, remote) {
+                        (false, true) => continue,
+                        (true, false) => {}
+                        _ if !Arc::ptr_eq(&previous.provider, provider) => {
+                            return Err(Error::service_unavailable(format!(
+                                "Model belongs to multiple providers: {id}"
+                            )));
+                        }
+                        _ => {}
+                    }
+                }
+                if !remote && local_claim {
+                    return Err(Error::service_unavailable(format!(
+                        "Model belongs to multiple providers: {id}"
+                    )));
+                }
+                staged.insert(id, entry);
             }
         }
         for (id, entry) in &mut staged {
@@ -439,7 +499,7 @@ impl RouterState {
         }
         let projections = staged.iter().map(|(id, entry)| {
             let snapshots = &snapshots;
-            let staged = &staged;
+            let donors = &donors;
             let incoming_headers = &incoming_headers;
             async move {
                 if !entry.listed && output == CatalogFormat::Codex {
@@ -460,9 +520,8 @@ impl RouterState {
                     .filter(|_| entry.listed)
                     .map(|reference| {
                         let provider = self.config.provider(&reference.provider)?;
-                        staged
-                            .get(&reference.model)
-                            .filter(|model| Arc::ptr_eq(&model.provider, provider))
+                        donors
+                            .get(&(Arc::as_ptr(provider) as usize, reference.model.clone()))
                             .map(|model| (&model.metadata, model.format))
                             .ok_or_else(|| {
                                 Error::bad_gateway(format!(
@@ -574,14 +633,28 @@ impl RouterState {
             .flatten()
             .collect();
         let listing = model_listing(&staged);
-        // Validate successful sources together before publishing the partial refresh.
+        // Only credential-independent destinations establish shared routes.
+        // Remote metadata remains in this request's snapshots.
         let mut catalog = self.catalog.write().await;
         for (id, entry) in &staged {
-            validate_ownership(&self.config, &catalog.models, id, &entry.provider)?;
+            if !entry.provider.uses_incoming_credentials()
+                && catalog
+                    .local_routes
+                    .get(id)
+                    .is_some_and(|provider| !Arc::ptr_eq(provider, &entry.provider))
+            {
+                return Err(Error::service_unavailable(format!(
+                    "Model belongs to multiple providers: {id}"
+                )));
+            }
         }
         let scope = catalog.scope(&incoming_headers, origin);
         catalog.listings.insert(scope, listing);
-        catalog.models.extend(staged);
+        for (id, entry) in staged {
+            if !entry.provider.uses_incoming_credentials() {
+                catalog.local_routes.insert(id, entry.provider);
+            }
+        }
         drop(catalog);
         // FuturesOrdered preserves provider-name order. File sources supply rows
         // only; credentials never determine the response envelope.
@@ -615,6 +688,7 @@ impl RouterState {
             headers.remove(name);
         }
         headers.insert(header::CONTENT_TYPE, media_type::JSON.parse().unwrap());
+        headers.insert(header::CACHE_CONTROL, "private, no-store".parse().unwrap());
         if gzip {
             headers.insert(header::CONTENT_ENCODING, encoding::GZIP.parse().unwrap());
         }
@@ -641,21 +715,14 @@ fn validate_complete_catalog(document: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Catalog entries and each provider's explicit `models` table both establish
-/// ownership, so a refresh cannot transfer a model to another provider.
 fn validate_ownership(
-    config: &Config,
     registry: &ModelRegistry,
     model: &str,
     provider: &Arc<Provider>,
 ) -> Result<()> {
     let claimed_elsewhere = registry
         .get(model)
-        .is_some_and(|previous| !Arc::ptr_eq(&previous.provider, provider))
-        || config
-            .providers
-            .values()
-            .any(|other| !Arc::ptr_eq(other, provider) && other.models.contains_key(model));
+        .is_some_and(|previous| !Arc::ptr_eq(&previous.provider, provider));
     if claimed_elsewhere {
         return Err(Error::service_unavailable(format!(
             "Model belongs to multiple providers: {model}"

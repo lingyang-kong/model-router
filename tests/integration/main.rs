@@ -2,6 +2,7 @@
 mod common;
 
 mod adapter_regressions;
+mod authentication;
 mod capabilities;
 mod catalog;
 mod catalog_availability;

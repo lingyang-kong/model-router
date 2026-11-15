@@ -10,7 +10,7 @@ Adapt [router-config.toml](examples/router-config.toml), then run from this dire
 MODEL_ROUTER_CONFIG=examples/router-config.toml cargo run --release --locked
 ```
 
-The example connects a ChatGPT subscription and SGLang. Client setup: [Codex](docs/codex.md), [Claude Code](docs/claude-code.md).
+The example connects ChatGPT accounts, OpenAI API keys, and SGLang concurrently. Client setup: [Codex](docs/codex.md), [Claude Code](docs/claude-code.md).
 
 Builds require Rust with edition 2024 support. A clean first build also needs `curl` and network access: [build.rs](build.rs) fetches compaction prompts and their license from a pinned Codex revision into Cargo's `OUT_DIR`. Incremental builds reuse them; `cargo --offline` does not supply missing prompt files.
 
@@ -39,14 +39,14 @@ Define rules with `[[routes]]`. Rules can match `method`, `path` or `path_prefix
 | Action | Behavior |
 | --- | --- |
 | `forward` | Stream to `provider`, or the selected client's provider when omitted. |
-| `model` | Route by the top-level JSON `model`, using the client's configured provider as a fallback. |
-| `catalog` | Merge all configured provider catalogs in the client's format. |
+| `model` | Route by the top-level JSON `model`, using the request's selected provider as a fallback. |
+| `catalog` | Merge eligible provider catalogs in the client's format. |
 
 Provider and output format belong to clients, independently of endpoint routing:
 
 ```toml
 [clients.codex]
-provider = "chatgpt"
+provider = { subscription = "chatgpt", api_key = "openai" }
 format = "codex"
 
 [[routes]]
@@ -57,7 +57,7 @@ action = "catalog"
 
 Supported client profiles are `codex`, `anthropic`, and `openai`. A Codex `originator` header selects `codex`; otherwise `anthropic-version` selects `anthropic`; other requests select `openai`. Profiles are optional. Their `format` defaults to the client's name, and `provider` has no default. For example, an unconfigured OpenAI client gets an OpenAI catalog and can route known model IDs without using ChatGPT credentials.
 
-A client's provider identifies the owner of incoming credentials and supplies fallback routing for empty bodies, missing HTTP models, or unknown IDs. Routing inference from that provider to another `passthrough` provider is rejected; configure the destination's credentials on the router. Catalog and model routes do not accept `provider` or `format`; `forward` routes can name their destination explicitly.
+A profile can select a fixed provider by name, or use the authentication mapping shown above. The keys name authentication modes; the values name configured providers. Each mode is optional: for example, `provider = { api_key = "openai" }` accepts only API-key credentials. A recognized but unmapped mode is rejected without contacting an upstream. A Bearer token and ChatGPT-Account-ID select the `subscription` provider; a Bearer token beginning `sk-` without an account ID selects the `api_key` provider. The `subscription` mode identifies ChatGPT account authentication; the router does not check subscription status. Missing, malformed, duplicated, unrecognized, or conflicting authentication signals are rejected. The selected provider owns the incoming credentials and supplies fallback routing for empty bodies, missing HTTP models, or unknown IDs. Routing inference from that provider to another `passthrough` provider is rejected; configure the destination's credentials on the router. Catalog and model routes do not accept `provider` or `format`; `forward` routes can name their destination explicitly. An explicit destination does not change the selected credential owner, so the same passthrough scope validation applies.
 
 To forward auxiliary requests such as webtools, append a catch-all after the catalog and model rules:
 
@@ -66,7 +66,7 @@ To forward auxiliary requests such as webtools, append a catch-all after the cat
 action = "forward"
 ```
 
-This streams HTTP bodies and tunnels WebSockets to the selected client's provider without model inspection or inference adaptation. Each client using this route needs a `provider` in its profile (`codex`, `openai`, or `anthropic`); a missing provider returns 400. The example config enables this for Codex. Earlier matching rules retain priority, and configurations without a catch-all still reject unmatched requests with 404.
+This streams HTTP bodies and tunnels WebSockets to the selected client's provider without model inspection or inference adaptation. Each client using this route needs a `provider` in its profile (`codex`, `openai`, or `anthropic`); a missing provider returns 400. Authentication selection also applies to auxiliary HTTP requests and WebSocket handshakes. The example config enables this for Codex. Earlier matching rules retain priority, and configurations without a catch-all still reject unmatched requests with 404.
 
 The full incoming path is appended to `base_url`: a base ending in `/v1` plus `/responses` becomes `/v1/responses`. Incoming queries are preserved; base URLs cannot contain queries. Paths changed by URL normalization, such as dot segments or backslashes, are rejected. Upstream redirects are not followed. Loopback upstreams bypass proxy environment variables; remote upstreams honor them.
 
@@ -91,7 +91,7 @@ Source and output formats are independent. Each contributing provider declares i
 
 The response retains the envelope and headers of the first successful remote source matching the output format, in provider-name order. If none matches, it uses a standard envelope and fresh headers. File sources contribute rows only. Use complete catalog endpoints: upstream pagination is not implemented, and `has_more = true` is rejected. Anthropic `first_id`, `last_id`, and `has_more` describe the final merged list.
 
-Only the selected client's provider receives incoming credentials, headers, and query parameters during catalog fetching. Every remote catalog uses its configured path and a GET request with an empty body. Other sources receive only their own configured credentials and headers; a passthrough source without matching client ownership is queried anonymously. Providers without a catalog source do not participate in catalog refreshes.
+Only the selected provider receives incoming credentials, headers, and query parameters during catalog fetching. Every remote catalog uses its configured path and a GET request with an empty body. Other credential-independent sources receive only their own configured credentials and headers; unmatched passthrough remote sources are skipped. Credentials are never retried against another provider. Providers without a catalog source do not participate in catalog refreshes.
 
 ### Metadata and inheritance
 
@@ -122,13 +122,13 @@ Additional metadata keys are merged into source-format rows: objects merge recur
 
 ### Refresh and ownership
 
-Each catalog request refreshes all configured remote catalogs and optional discovery sources. There is no background refresh. IDs in explicit `models` tables and file catalogs are routable at startup; other remote IDs require a successful catalog request. A model-only route does not initiate discovery.
+Each catalog request builds its response from that request's eligible sources and optional discovery calls. There is no background refresh. Static file metadata is shared. Credential-independent providers (`none` or `bearer`) establish local routes from explicit `models` tables, file catalogs, and successful remote catalog fetches. These routes take priority and strip client credentials. All other model IDs go directly to the selected provider, including before any catalog refresh. Remote passthrough catalogs never establish global ownership of native IDs.
 
-Catalogs are merged on a best-effort basis: transport failures and non-200 responses omit that source, while successful remote catalogs (including empty ones) and file catalogs still contribute. Each remote catalog request has a three-second timeout covering connection, response headers, and body transfer. Models whose inheritance donor's source is unavailable are omitted from Codex output and subagent listings; OpenAI and Anthropic output can still describe them using their own source metadata. If every catalog source fails, the client's provider supplies the error when it has a catalog source; otherwise the first source in provider-name order supplies it. The previous routing data and subagent listing are preserved.
+Catalogs are merged on a best-effort basis: transport failures and non-200 responses omit that source, while successful remote catalogs (including empty ones) and file catalogs still contribute. Each remote catalog request has a three-second timeout covering connection, response headers, and body transfer. Models whose inheritance donor's source is unavailable are omitted from Codex output and subagent listings; OpenAI and Anthropic output can still describe them using their own source metadata. If every catalog source fails, the selected provider supplies the error when available; otherwise the first source in provider-name order supplies it.
 
-Successful partial refreshes update routing ownership and the requesting client's subagent listing together; unavailable models retain their known routes but are no longer advertised in that listing. Listings are scoped by client profile, credential-owning provider, and a process-keyed fingerprint of authorization, cookie, API-key, organization/project, and ChatGPT account-ID headers. Raw credentials are not retained; feature and tracing headers do not change listing identity. Another client's or account's refresh cannot replace an existing listing or supply private metadata to a scope that has not refreshed. File-only configurations retain their startup listing for all scopes. Invalid catalog data, missing donors from successful sources, and ownership conflicts still reject the refresh without publishing changes. Optional discovery failures contribute no capability facts.
+Successful refreshes update credential-independent local routes and the requesting client's subagent listing. Listings are scoped by client profile, credential-owning provider, and a process-keyed fingerprint of authorization, cookie, API-key, organization/project, and ChatGPT account-ID headers. Raw credentials are not retained. Another client's or account's refresh cannot replace an existing listing. File-only configurations retain their startup listing for all scopes. Invalid catalog data and ownership conflicts reject the refresh without publishing changes. Optional discovery failures contribute no capability facts.
 
-IDs removed by a later successful refresh remain owned and routable until restart, but are no longer advertised. Hidden models likewise remain routable and participate in ownership checks. The router never reads client cache files.
+Local IDs removed by a later refresh remain routable until restart, but are no longer advertised. Hidden models remain routable. The router never reads client cache files.
 
 ### Hidden models
 
@@ -181,4 +181,4 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-The main boundaries are routing/authentication in `router.rs` and `config.rs`, catalog snapshots and projection in `catalog.rs` and `adapters/catalog.rs`, evidence collection in `discovery.rs` and `capabilities.rs`, and Codex protocol adaptation under `adapters/codex/`. Keep source metadata separate from client projections, publish routing changes atomically, and preserve opaque payloads outside the protocol fields being adapted.
+The main boundaries are routing/authentication in `router.rs` and `config.rs`, catalog snapshots and projection in `catalog.rs` and `adapters/catalog.rs`, evidence collection in `discovery.rs` and `capabilities.rs`, and Codex protocol adaptation under `adapters/codex/`. Keep source metadata separate from client projections, publish local routing changes atomically, and preserve opaque payloads outside the protocol fields being adapted.

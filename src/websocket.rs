@@ -36,7 +36,12 @@ pub(crate) async fn forward(
             return Err(Error::bad_request("Catalog actions use HTTP requests"));
         }
     };
-    let provider = state.resolve_provider(model, origin).await?;
+    let provider = match action {
+        RouteAction::Forward {
+            provider: Some(name),
+        } => Arc::clone(state.config.provider(name)?),
+        _ => state.resolve_provider(model, origin).await?,
+    };
     let model = model.map(str::to_owned);
     let mut downstream = hyper::upgrade::on(&mut request);
     let (parts, body) = request.into_parts();

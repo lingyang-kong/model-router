@@ -68,6 +68,7 @@ async fn example_auxiliary_routes_use_each_clients_provider_without_model_inspec
             let response = client
                 .request(method.clone(), gateway.url.clone() + path)
                 .header(header, value)
+                .header("chatgpt-account-id", "account")
                 .bearer_auth("client-token")
                 .header("cookie", "client-cookie")
                 .body(body.to_vec())
@@ -96,6 +97,8 @@ async fn example_auxiliary_routes_use_each_clients_provider_without_model_inspec
         let response: Value = client
             .post(gateway.url.clone() + "/responses")
             .header(header, value)
+            .header("chatgpt-account-id", "account")
+            .bearer_auth("client-token")
             .body(model_body.clone())
             .send()
             .await
@@ -110,6 +113,8 @@ async fn example_auxiliary_routes_use_each_clients_provider_without_model_inspec
             client
                 .post(gateway.url.clone() + "/responses")
                 .header(header, value)
+                .header("chatgpt-account-id", "account")
+                .bearer_auth("client-token")
                 .body(r#"{"model":7}"#)
                 .send()
                 .await
@@ -122,6 +127,8 @@ async fn example_auxiliary_routes_use_each_clients_provider_without_model_inspec
     let response: Value = client
         .post(gateway.url.clone() + "/webtools")
         .header("originator", "codex_cli_rs")
+        .header("chatgpt-account-id", "account")
+        .bearer_auth("client-token")
         .header("content-encoding", "custom")
         .body(vec![0, 255, 3])
         .send()
@@ -342,22 +349,20 @@ async fn providers_sharing_an_endpoint_keep_distinct_credential_scopes() {
         .send()
         .await
         .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response: Value = response.json().await.unwrap();
+    assert_eq!(response["headers"]["authorization"], "Bearer first-token");
+    assert_eq!(fixture.live.seen.lock().unwrap().len(), seen + 1);
+    let response = fixture
+        .client
+        .post(gateway.url.clone() + "/direct")
+        .bearer_auth("first-token")
+        .json(&json!({"model":"publisher/model"}))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(fixture.live.seen.lock().unwrap().len(), seen);
-    for (path, model) in [("/responses", "unknown"), ("/direct", "publisher/model")] {
-        let response: Value = fixture
-            .client
-            .post(gateway.url.clone() + path)
-            .bearer_auth("own-token")
-            .json(&json!({"model":model}))
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(response["headers"]["authorization"], "Bearer own-token");
-    }
+    assert_eq!(fixture.live.seen.lock().unwrap().len(), seen + 1);
 }
 
 #[tokio::test]

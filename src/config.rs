@@ -15,6 +15,7 @@ use url::{Host, Url};
 use crate::protocol::{header, token};
 use crate::{
     adapters::{CatalogFormat, ClientKind},
+    authentication::Authentication,
     capabilities::Capabilities,
     error::{Error, Result},
 };
@@ -86,8 +87,36 @@ struct ConfigDocument {
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ClientProfile {
-    pub provider: Option<String>,
+    pub provider: Option<ProviderSelection>,
     pub format: Option<CatalogFormat>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+pub(crate) enum ProviderSelection {
+    Fixed(String),
+    Authentication(BTreeMap<Authentication, String>),
+}
+
+impl ProviderSelection {
+    pub fn select<'a>(&'a self, headers: &HeaderMap) -> Result<&'a str> {
+        match self {
+            Self::Fixed(name) => Ok(name),
+            Self::Authentication(providers) => providers
+                .get(&crate::authentication::classify(headers)?)
+                .map(String::as_str)
+                .ok_or_else(|| {
+                    Error::bad_request("No provider configured for this authentication kind")
+                }),
+        }
+    }
+
+    fn names(&self) -> Vec<&str> {
+        match self {
+            Self::Fixed(name) => vec![name],
+            Self::Authentication(providers) => providers.values().map(String::as_str).collect(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -276,10 +305,12 @@ impl Config {
             bail!("Configure at least one routing rule");
         }
         for profile in clients.values() {
-            if let Some(name) = &profile.provider
-                && !providers.contains_key(name)
-            {
-                bail!("Unknown provider in client profile: {name}");
+            if let Some(selection) = &profile.provider {
+                for name in selection.names() {
+                    if !providers.contains_key(name) {
+                        bail!("Unknown provider in client profile: {name}");
+                    }
+                }
             }
         }
         for route in &routes {
@@ -329,6 +360,10 @@ impl Config {
 }
 
 impl Provider {
+    pub(crate) fn uses_incoming_credentials(&self) -> bool {
+        matches!(self.auth, AuthMode::Passthrough {})
+    }
+
     pub(crate) fn validate_credential_scope(
         self: &Arc<Self>,
         origin: Option<&Arc<Self>>,
@@ -488,11 +523,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            config.clients[&ClientKind::Codex].provider.as_deref(),
+            config.clients[&ClientKind::Codex]
+                .provider
+                .as_ref()
+                .map(|selection| selection.select(&HeaderMap::new()).unwrap()),
             Some("api")
         );
         assert_eq!(config.clients[&ClientKind::Codex].format, None);
-        assert_eq!(config.clients[&ClientKind::Openai].provider, None);
+        assert!(config.clients[&ClientKind::Openai].provider.is_none());
         assert_eq!(
             config.clients[&ClientKind::Openai].format,
             Some(CatalogFormat::Anthropic)
@@ -512,6 +550,9 @@ mod tests {
             "[[routes]]\naction='catalog'\nprovider='api'",
             "[[routes]]\naction='catalog'\nformat='codex'",
             "[clients.codex]\nprovider='missing'\n[[routes]]\naction='model'",
+            "[clients.codex]\nprovider={subscription='missing'}\n[[routes]]\naction='model'",
+            "[clients.codex]\nprovider={api_key='missing'}\n[[routes]]\naction='model'",
+            "[clients.codex]\nprovider={unknown='api'}\n[[routes]]\naction='model'",
             "[clients.unknown]\nprovider='api'\n[[routes]]\naction='model'",
             "[clients.codex]\nunknown=true\n[[routes]]\naction='model'",
             "[clients.codex]\nformat='unknown'\n[[routes]]\naction='model'",
