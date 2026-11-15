@@ -146,8 +146,8 @@ async fn handle_request(
     State(state): State<Arc<RouterState>>,
     request: Request,
 ) -> Result<Response> {
-    let adapter = Client::from_headers(request.headers());
     let client = ClientKind::from_headers(request.headers());
+    let adapter = client.adapter();
     let profile = state.config.clients.get(&client);
     let format = profile
         .and_then(|profile| profile.format)

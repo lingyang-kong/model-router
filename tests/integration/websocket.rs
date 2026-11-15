@@ -190,13 +190,10 @@ async fn model_websockets_select_a_provider_from_handshake_hints() {
         .headers_mut()
         .insert("x-codex-routing-hint", "model=gpt-test".parse().unwrap());
     let tungstenite::Error::Http(response) = connect_async(request).await.unwrap_err() else {
-        panic!("Expected missing generic model hint");
+        panic!("Expected unsupported client rejection");
     };
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    for (header, value) in [
-        ("x-model", "gpt-test"),
-        ("x-codex-routing-hint", "model=gpt-test"),
-    ] {
+    for hint in ["model=gpt-test", "model=publisher/model;model=gpt-test"] {
         let mut request = url.clone().into_client_request().unwrap();
         request
             .headers_mut()
@@ -205,7 +202,9 @@ async fn model_websockets_select_a_provider_from_handshake_hints() {
             "x-codex-routing-hint",
             "model=publisher/model".parse().unwrap(),
         );
-        request.headers_mut().append(header, value.parse().unwrap());
+        request
+            .headers_mut()
+            .append("x-codex-routing-hint", hint.parse().unwrap());
         let tungstenite::Error::Http(response) = connect_async(request).await.unwrap_err() else {
             panic!("Expected conflicting model hints");
         };
@@ -235,62 +234,6 @@ async fn model_websockets_select_a_provider_from_handshake_hints() {
     assert_eq!(reply["provider"], "service-b");
     assert_eq!(reply["body"], codex_body);
     codex_socket.close(None).await.unwrap();
-
-    // Generic x-model routing remains available and fixes the destination for the connection.
-    let mut request = url.clone().into_client_request().unwrap();
-    request
-        .headers_mut()
-        .insert("x-model", "publisher/model".parse().unwrap());
-    let (mut socket, _) = connect_async(request).await.unwrap();
-    let original = "{ \"model\" : \"publisher/model\", \"input\" : \"preserved\" }";
-    socket
-        .send(tungstenite::Message::Text(original.into()))
-        .await
-        .unwrap();
-    let reply = timeout(Duration::from_secs(2), socket.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap()
-        .into_data();
-    let reply: Value = serde_json::from_slice(&reply).unwrap();
-    assert_eq!(reply["provider"], "service-b");
-    assert_eq!(reply["body"], original);
-    socket
-        .send(tungstenite::Message::Binary(
-            br#"{"type":"followup"}"#.to_vec().into(),
-        ))
-        .await
-        .unwrap();
-    let reply = socket.next().await.unwrap().unwrap().into_data();
-    assert_eq!(
-        serde_json::from_slice::<Value>(&reply).unwrap()["provider"],
-        "service-b"
-    );
-    socket
-        .send(tungstenite::Message::Text(r#"{"model":"gpt-test"}"#.into()))
-        .await
-        .unwrap();
-    let reply = socket.next().await.unwrap().unwrap().into_data();
-    let reply: Value = serde_json::from_slice(&reply).unwrap();
-    assert_eq!(reply["provider"], "service-b");
-    assert_eq!(reply["model"], "gpt-test");
-    socket.close(None).await.unwrap();
-    let mut request = url.into_client_request().unwrap();
-    request
-        .headers_mut()
-        .insert("originator", "codex_cli_rs".parse().unwrap());
-    request
-        .headers_mut()
-        .insert("x-model", "gpt-test".parse().unwrap());
-    request.headers_mut().insert(
-        "x-codex-routing-hint",
-        "model=publisher/model".parse().unwrap(),
-    );
-    let tungstenite::Error::Http(response) = connect_async(request).await.unwrap_err() else {
-        panic!("Expected conflicting native and generic model hints");
-    };
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -482,7 +425,7 @@ async fn profile_forward_websockets_use_client_provider_without_model_hints() {
     let url = gateway.url.replace("http:", "ws:") + "/webtools";
     for (originator, expected) in [
         ("codex_cli_rs", "/codex/webtools"),
-        ("opencode", "/openai/webtools"),
+        ("router_test_host", "/openai/webtools"),
     ] {
         let mut request = url.clone().into_client_request().unwrap();
         request

@@ -50,7 +50,7 @@ async fn example_auxiliary_routes_use_each_clients_provider_without_model_inspec
     let model_body = json!({"model":native}).to_string();
     for (header, value, prefix, credentials) in [
         ("originator", "codex_cli_rs", "/chatgpt", true),
-        ("originator", "opencode", "/v1", false),
+        ("originator", "router_test_host", "/v1", false),
         ("anthropic-version", "2023-06-01", "/chatgpt", true),
     ] {
         for (method, path, body) in [
@@ -156,7 +156,7 @@ async fn forward_requires_a_route_or_selected_client_provider() {
     let gateway = serve(router(config).unwrap()).await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     for (header, value) in [
-        ("originator", "opencode"),
+        ("originator", "router_test_host"),
         ("anthropic-version", "2023-06-01"),
     ] {
         let response = client
@@ -278,8 +278,8 @@ async fn empty_model_requests_use_only_the_client_profile_fallback() {
     }
     for (originator, body) in [
         ("codex_cli_rs", ""),
-        ("opencode", " "),
-        ("opencode", "{bad"),
+        ("router_test_host", " "),
+        ("router_test_host", "{bad"),
     ] {
         assert_eq!(
             client
@@ -299,7 +299,7 @@ async fn empty_model_requests_use_only_the_client_profile_fallback() {
 async fn other_originators_preserve_payloads_that_resemble_codex_requests() {
     let fixture = Fixture::new().await;
     let original = r#"{ "model": "gpt-test", "tools": [{"type":"namespace","name":"collaboration","tools":[]}], "input": [{"type":"agent_message","content":[{"type":"encrypted_content","encrypted_content":"plain text"}]}] }"#;
-    for originator in ["opencode", "claude-code", "router_test_host"] {
+    for originator in ["claude-code", "router_test_host"] {
         let response: Value = fixture
             .client
             .post(fixture.routed.url.clone() + "/responses")

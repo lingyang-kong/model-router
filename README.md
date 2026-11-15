@@ -10,7 +10,7 @@ Adapt [router-config.toml](examples/router-config.toml), then run from this dire
 MODEL_ROUTER_CONFIG=examples/router-config.toml cargo run --release --locked
 ```
 
-The example connects a ChatGPT subscription and SGLang. Client setup: [Codex](docs/codex.md), [Claude Code](docs/claude-code.md), [OpenCode](docs/opencode.md).
+The example connects a ChatGPT subscription and SGLang. Client setup: [Codex](docs/codex.md), [Claude Code](docs/claude-code.md).
 
 Builds require Rust with edition 2024 support. A clean first build also needs `curl` and network access: [build.rs](build.rs) fetches compaction prompts and their license from a pinned Codex revision into Cargo's `OUT_DIR`. Incremental builds reuse them; `cargo --offline` does not supply missing prompt files.
 
@@ -160,7 +160,7 @@ HTTP model routing buffers requests to read `model`. Forward routes stream reque
 
 Merged catalogs use gzip when accepted, otherwise uncompressed JSON. Encoding exclusions and explicit identity preferences are respected; rejecting both supported encodings returns 406. Merged responses discard stale lengths, integrity fields, and cache validators, and vary on `Accept-Encoding`, `Originator`, and `Anthropic-Version`.
 
-Generic WebSocket model routes require `x-model: <native ID>` and tunnel bytes after the handshake. Reconnect to change providers. [Codex WebSocket routing](docs/codex.md#websocket-routing) supports per-request selection and has separate fallback behavior. Clients own fallback to HTTP when an upstream rejects WebSocket.
+WebSocket model routes use [Codex WebSocket routing](docs/codex.md#websocket-routing), which supports per-request provider selection. Other WebSocket traffic can use `forward` routes to tunnel bytes to a configured provider. Clients own fallback to HTTP when an upstream rejects WebSocket.
 
 ## Deployment
 

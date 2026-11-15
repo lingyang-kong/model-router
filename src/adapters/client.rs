@@ -2,7 +2,7 @@ use axum::http::HeaderMap;
 use serde::Deserialize;
 
 use super::{catalog::CatalogFormat, codex, websocket};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::protocol::header;
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -30,6 +30,13 @@ impl ClientKind {
             Self::Codex => CatalogFormat::Codex,
             Self::Openai => CatalogFormat::Openai,
             Self::Anthropic => CatalogFormat::Anthropic,
+        }
+    }
+
+    pub fn adapter(self) -> Option<Client> {
+        match self {
+            Self::Codex => Some(Client::Codex),
+            Self::Openai | Self::Anthropic => None,
         }
     }
 }
@@ -76,29 +83,10 @@ impl Client {
         }
     }
 
-    pub fn model_hint<'a>(self, headers: &'a HeaderMap, hint: &mut ModelHint<'a>) -> Result<()> {
+    pub fn model_hint(self, headers: &HeaderMap) -> Result<Option<&str>> {
         match self {
-            Self::Codex => codex::model_hint(headers, hint),
+            Self::Codex => codex::model_hint(headers),
         }
-    }
-}
-
-#[derive(Default)]
-pub(crate) struct ModelHint<'a>(Option<&'a str>);
-
-impl<'a> ModelHint<'a> {
-    pub fn set(&mut self, value: &'a str) -> Result<()> {
-        if value.is_empty() || self.0.is_some_and(|previous| previous != value) {
-            return Err(Error::bad_request(
-                "Empty or conflicting WebSocket model hints",
-            ));
-        }
-        self.0 = Some(value);
-        Ok(())
-    }
-
-    pub fn optional(self) -> Option<&'a str> {
-        self.0
     }
 }
 
@@ -110,7 +98,7 @@ mod tests {
     fn client_kind_uses_protocol_headers_with_openai_as_the_default() {
         let mut headers = HeaderMap::new();
         assert_eq!(ClientKind::from_headers(&headers), ClientKind::Openai);
-        headers.insert("originator", "opencode".parse().unwrap());
+        headers.insert("originator", "router_test_host".parse().unwrap());
         assert_eq!(ClientKind::from_headers(&headers), ClientKind::Openai);
         headers.insert("anthropic-version", "2023-06-01".parse().unwrap());
         assert_eq!(ClientKind::from_headers(&headers), ClientKind::Anthropic);
@@ -145,7 +133,7 @@ mod tests {
                 "{value}"
             );
         }
-        for value in ["", "opencode", "claude-code", "router_test_host"] {
+        for value in ["", "claude-code", "router_test_host"] {
             let mut headers = HeaderMap::new();
             headers.insert("originator", value.parse().unwrap());
             assert!(Client::from_headers(&headers).is_none(), "{value}");

@@ -87,4 +87,4 @@ Every subsequent model request is routed again. Each client socket has one upstr
 
 Requests without a model use the original handshake model or the client's configured default provider. Control and unknown typed events stay on the current connection. Upstream writes remain ordered, while slow writes do not block preparation of later requests. Pending local summaries and replies survive switches. Client disconnects cancel pending work, including replacement handshakes. A rejected replacement upgrade emits an error and closes the client socket; an unexpected upstream disconnect also ends the client session.
 
-There is no WebSocket-to-HTTP bridge for ordinary inference, so seamless switching to an HTTP-only provider is not guaranteed. Adapted handshakes disable `permessage-deflate`; request-body compression can remain enabled. Generic raw WebSocket routes retain negotiated extensions.
+There is no WebSocket-to-HTTP bridge for ordinary inference, so seamless switching to an HTTP-only provider is not guaranteed. Adapted handshakes disable `permessage-deflate`; request-body compression can remain enabled. WebSocket `forward` routes retain negotiated extensions.

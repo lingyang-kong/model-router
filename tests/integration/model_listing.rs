@@ -378,7 +378,7 @@ async fn scoped_description(
         request.headers_mut().extend(headers.clone());
         request
             .headers_mut()
-            .insert("x-model", "local-model".parse().unwrap());
+            .insert("x-codex-routing-hint", "model=local-model".parse().unwrap());
         let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
         socket
             .send(Message::Text(body.to_string().into()))

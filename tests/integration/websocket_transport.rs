@@ -612,7 +612,10 @@ async fn fixture_with_handshakes(first: StatusCode, second: StatusCode) -> Fixtu
         &json!({"clients":{"codex":{"provider":"primary"},"openai":{"provider":"primary"},"anthropic":{"provider":"primary"}},"providers":{
         "primary":{"base_url":first.url,"auth":"passthrough","models":{"gpt-test":{}}},
         "custom":{"base_url":format!("{}/v1",second.url),"auth":"none","models":{"worker":{}}}
-    },"routes":[{"path":"/responses","action":"model"}]})
+    },"routes":[
+        {"path":"/responses","action":"model"},
+        {"path":"/raw","action":"forward","provider":"custom"}
+    ]})
         .to_string(),
         root.path(),
     )
@@ -828,11 +831,9 @@ async fn initial_unsupported_websocket_returns_upgrade_required_without_http_inf
         for adapted in [true, false] {
             let mut request = handshake(&f, Some("worker"));
             if !adapted {
-                request.headers_mut().remove("originator");
-                request.headers_mut().remove("x-codex-routing-hint");
-                request
-                    .headers_mut()
-                    .insert("x-model", "worker".parse().unwrap());
+                request = (f.gateway.url.replace("http:", "ws:") + "/raw")
+                    .into_client_request()
+                    .unwrap();
             }
             let tungstenite::Error::Http(response) = connect_async(request).await.unwrap_err()
             else {

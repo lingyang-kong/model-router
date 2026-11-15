@@ -23,7 +23,6 @@ pub(crate) mod header {
     pub const PROXY_CONNECTION: HeaderName = HeaderName::from_static("proxy-connection");
     pub const REPR_DIGEST: HeaderName = HeaderName::from_static("repr-digest");
     pub const X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
-    pub const X_MODEL: HeaderName = HeaderName::from_static("x-model");
     pub const X_OPENAI_ORGANIZATION: HeaderName = HeaderName::from_static("x-openai-organization");
     pub const X_OPENAI_PROJECT: HeaderName = HeaderName::from_static("x-openai-project");
 

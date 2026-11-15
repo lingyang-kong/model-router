@@ -472,7 +472,7 @@ async fn native_compaction_composes_multiagent_adaptation_over_http_and_websocke
                 .insert("originator", "codex_cli_rs".parse().unwrap());
             handshake
                 .headers_mut()
-                .insert("x-model", "gpt-test".parse().unwrap());
+                .insert("x-codex-routing-hint", "model=gpt-test".parse().unwrap());
             Some(connect_async(handshake).await.unwrap().0)
         } else {
             None
@@ -772,9 +772,10 @@ async fn websocket_summary_uses_handshake_model_unless_body_overrides_it() {
         handshake
             .headers_mut()
             .insert("originator", "codex_cli_rs".parse().unwrap());
-        handshake
-            .headers_mut()
-            .insert("x-model", "handshake-model".parse().unwrap());
+        handshake.headers_mut().insert(
+            "x-codex-routing-hint",
+            "model=handshake-model".parse().unwrap(),
+        );
         handshake
             .headers_mut()
             .insert("idempotency-key", "websocket-operation".parse().unwrap());
@@ -833,7 +834,7 @@ async fn websocket_trigger_uses_http_summary_and_native_messages_still_forward()
         .insert("originator", "codex_cli_rs".parse().unwrap());
     request
         .headers_mut()
-        .insert("x-model", "gpt-test".parse().unwrap());
+        .insert("x-codex-routing-hint", "model=gpt-test".parse().unwrap());
     let (mut socket, _) = connect_async(request).await.unwrap();
     socket.send(tungstenite::Message::Text(json!({"model":"gpt-test","stream_id":"s-1","input":[{"type":"message","role":"user","content":"history"},trigger()]}).to_string().into())).await.unwrap();
     let event: Value =
@@ -896,7 +897,7 @@ async fn closing_either_websocket_hop_cancels_pending_http_summary() {
             .insert("originator", "codex_cli_rs".parse().unwrap());
         request
             .headers_mut()
-            .insert("x-model", "gpt-test".parse().unwrap());
+            .insert("x-codex-routing-hint", "model=gpt-test".parse().unwrap());
         let (mut socket, _) = connect_async(request).await.unwrap();
         socket.send(tungstenite::Message::Text(json!({"model":"gpt-test","stream_id":"cancel-1","input":[{"type":"message","role":"user","content":"history"},trigger()]}).to_string().into())).await.unwrap();
         timeout(Duration::from_secs(2), f.upstream.entered.notified())

@@ -10,7 +10,7 @@ use hyper_util::rt::TokioIo;
 
 use crate::protocol::{header, token};
 use crate::{
-    adapters::{Client, ModelHint, websocket::WebSocketContext},
+    adapters::{Client, websocket::WebSocketContext},
     body::stream_body,
     config::{Provider, RouteAction, header_has_token, sanitize_headers},
     error::{Error, Result},
@@ -24,16 +24,13 @@ pub(crate) async fn forward(
     origin: Option<&Arc<Provider>>,
     adapter: Option<Client>,
 ) -> Result<Response> {
-    let model = match action {
-        RouteAction::Forward { .. } => None,
+    let (model, adapter) = match action {
+        RouteAction::Forward { .. } => (None, None),
         RouteAction::Model { .. } => {
-            let model = model_hint(request.headers(), adapter)?;
-            if model.is_none() && adapter.is_none() {
-                return Err(Error::bad_request(
-                    "WebSocket model routes require a model hint",
-                ));
-            }
-            model
+            let client = adapter.ok_or_else(|| {
+                Error::bad_request("WebSocket model routes require a supported client")
+            })?;
+            (client.model_hint(request.headers())?, Some(client))
         }
         RouteAction::Catalog { .. } => {
             return Err(Error::bad_request("Catalog actions use HTTP requests"));
@@ -43,7 +40,7 @@ pub(crate) async fn forward(
     let model = model.map(str::to_owned);
     let mut downstream = hyper::upgrade::on(&mut request);
     let (parts, body) = request.into_parts();
-    let adapted = matches!(action, RouteAction::Model { .. }) && adapter.is_some();
+    let adapted = adapter.is_some();
     let opening = connect(state, &provider, origin, &parts, stream_body(body), adapted);
     let response = tokio::select! {
         response = opening => response?,
@@ -62,18 +59,23 @@ pub(crate) async fn forward(
     sanitize_headers(&mut headers);
     restore_upgrade_headers(response.headers(), &mut headers);
     let upstream = response.upgrade().await.map_err(Error::bad_gateway)?;
-    let context = WebSocketContext {
-        state: Arc::clone(state),
-        provider: Arc::clone(&provider),
-        headers: parts.headers,
-        uri: parts.uri,
-        model,
-        origin: origin.cloned(),
-    };
+    let adaptation = adapter.map(|adapter| {
+        (
+            adapter,
+            WebSocketContext {
+                state: Arc::clone(state),
+                provider: Arc::clone(&provider),
+                headers: parts.headers,
+                uri: parts.uri,
+                model,
+                origin: origin.cloned(),
+            },
+        )
+    });
     tokio::spawn(async move {
         if let Ok(downstream) = downstream.await {
             let downstream = TokioIo::new(downstream);
-            if let Some(adapter) = adapter.filter(|_| adapted) {
+            if let Some((adapter, context)) = adaptation {
                 crate::adapters::websocket::relay(downstream, upstream, adapter, context).await;
             } else {
                 let mut downstream = downstream;
@@ -143,18 +145,4 @@ fn restore_upgrade_headers(original: &HeaderMap, headers: &mut HeaderMap) {
     for value in original.get_all(header::UPGRADE) {
         headers.append(header::UPGRADE, value.clone());
     }
-}
-
-fn model_hint(headers: &HeaderMap, client: Option<Client>) -> Result<Option<&str>> {
-    let mut model = ModelHint::default();
-    for value in headers.get_all(header::X_MODEL) {
-        let value = value
-            .to_str()
-            .map_err(|_| Error::bad_request("Invalid WebSocket model hint"))?;
-        model.set(value)?;
-    }
-    if let Some(client) = client {
-        client.model_hint(headers, &mut model)?;
-    }
-    Ok(model.optional())
 }

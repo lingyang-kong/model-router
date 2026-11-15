@@ -8,7 +8,7 @@ use serde_json::Value;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::{ROUTING_HINT_HEADER, compaction_transport, error_code, event, transport};
-use crate::protocol::{field, header};
+use crate::protocol::field;
 use crate::{
     adapters::websocket::{WebSocketAction, WebSocketContext, WebSocketSwitch},
     error::Error,
@@ -68,14 +68,8 @@ pub(in crate::adapters) async fn route(
         if let Ok(hint) = format!("model={model}").parse() {
             routed.headers.insert(ROUTING_HINT_HEADER, hint);
         }
-        if routed.headers.contains_key(header::X_MODEL)
-            && let Ok(hint) = model.parse()
-        {
-            routed.headers.insert(header::X_MODEL, hint);
-        }
     } else {
         routed.headers.remove(ROUTING_HINT_HEADER);
-        routed.headers.remove(header::X_MODEL);
     }
     let opening_context = routed.clone();
     WebSocketAction::Switch(Box::new(WebSocketSwitch {

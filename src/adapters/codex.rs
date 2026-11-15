@@ -1,10 +1,7 @@
 use axum::http::{HeaderMap, HeaderName};
 use serde_json::Value;
 
-use super::{
-    catalog::{CatalogLayout, rename_field},
-    client::ModelHint,
-};
+use super::catalog::{CatalogLayout, rename_field};
 use crate::capabilities::Capabilities;
 use crate::error::{Error, Result};
 use crate::protocol::{field, pointer, value};
@@ -357,18 +354,24 @@ fn rewrite_identity(template: &str, model: &Value) -> Option<String> {
     ))
 }
 
-pub(super) fn model_hint<'a>(headers: &'a HeaderMap, hint: &mut ModelHint<'a>) -> Result<()> {
+pub(super) fn model_hint(headers: &HeaderMap) -> Result<Option<&str>> {
+    let mut model = None;
     for value in headers.get_all(ROUTING_HINT_HEADER) {
         let value = value
             .to_str()
             .map_err(|_| Error::bad_request("Invalid Codex routing hint"))?;
         for field in value.split(';') {
             if let Some(value) = field.trim().strip_prefix("model=") {
-                hint.set(value)?;
+                if value.is_empty() || model.is_some_and(|previous| previous != value) {
+                    return Err(Error::bad_request(
+                        "Empty or conflicting Codex routing hints",
+                    ));
+                }
+                model = Some(value);
             }
         }
     }
-    Ok(())
+    Ok(model)
 }
 
 #[cfg(test)]
