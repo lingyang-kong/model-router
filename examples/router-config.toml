@@ -37,6 +37,10 @@ reasoning_levels = [
 provider = { subscription = "chatgpt", api_key = "openai" }
 format = "codex"
 
+[model_overrides]
+"gpt-5.6-*" = "gpt-6-*"
+gpt-6-sol = "gpt-6.1-sol"
+
 [[routes]]
 method = "GET"
 path = "/models"

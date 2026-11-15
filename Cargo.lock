@@ -973,6 +973,8 @@ dependencies = [
  "hyper-util",
  "indexmap",
  "memchr",
+ "regex-automata",
+ "regex-syntax",
  "reqwest",
  "serde",
  "serde_json",

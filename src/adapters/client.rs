@@ -88,6 +88,16 @@ impl Client {
             Self::Codex => codex::model_hint(headers),
         }
     }
+
+    pub fn override_model_hint(
+        self,
+        headers: &mut HeaderMap,
+        overrides: &crate::model_overrides::ModelOverrides,
+    ) -> Result<()> {
+        match self {
+            Self::Codex => codex::override_model_hint(headers, overrides),
+        }
+    }
 }
 
 #[cfg(test)]

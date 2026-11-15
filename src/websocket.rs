@@ -36,15 +36,22 @@ pub(crate) async fn forward(
             return Err(Error::bad_request("Catalog actions use HTTP requests"));
         }
     };
+    let original_model = model.map(str::to_owned);
+    let resolved = model
+        .map(|model| state.config.model_overrides.resolve(model))
+        .transpose()?;
+    let model = resolved.as_deref();
     let provider = match action {
         RouteAction::Forward {
             provider: Some(name),
         } => Arc::clone(state.config.provider(name)?),
         _ => state.resolve_provider(model, origin).await?,
     };
-    let model = model.map(str::to_owned);
     let mut downstream = hyper::upgrade::on(&mut request);
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
+    if let Some(adapter) = adapter {
+        adapter.override_model_hint(&mut parts.headers, &state.config.model_overrides)?;
+    }
     let adapted = adapter.is_some();
     let opening = connect(state, &provider, origin, &parts, stream_body(body), adapted);
     let response = tokio::select! {
@@ -72,7 +79,7 @@ pub(crate) async fn forward(
                 provider: Arc::clone(&provider),
                 headers: parts.headers,
                 uri: parts.uri,
-                model,
+                model: original_model,
                 origin: origin.cloned(),
             },
         )

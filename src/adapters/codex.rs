@@ -374,9 +374,92 @@ pub(super) fn model_hint(headers: &HeaderMap) -> Result<Option<&str>> {
     Ok(model)
 }
 
+pub(super) fn override_model_hint(
+    headers: &mut HeaderMap,
+    overrides: &crate::model_overrides::ModelOverrides,
+) -> Result<()> {
+    if overrides.is_empty() {
+        return Ok(());
+    }
+    // Preserve unrelated hint fields and repeated headers.
+    let mut changed = false;
+    let values = headers
+        .get_all(ROUTING_HINT_HEADER)
+        .iter()
+        .map(|value| {
+            let Ok(text) = value.to_str() else {
+                return Ok(value.clone());
+            };
+            let mut value_changed = false;
+            let rewritten = text
+                .split(';')
+                .map(|field| {
+                    if let Some(source) = field.trim().strip_prefix("model=") {
+                        let target = overrides.resolve(source)?;
+                        if target != source {
+                            value_changed = true;
+                            return Ok(format!("model={target}"));
+                        }
+                    }
+                    Ok(field.to_owned())
+                })
+                .collect::<Result<Vec<_>>>()?
+                .join(";");
+            changed |= value_changed;
+            if value_changed {
+                rewritten.parse().map_err(Error::bad_request)
+            } else {
+                Ok(value.clone())
+            }
+        })
+        .collect::<Result<Vec<axum::http::HeaderValue>>>()?;
+    if changed {
+        headers.remove(ROUTING_HINT_HEADER);
+        for value in values {
+            headers.append(ROUTING_HINT_HEADER, value);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_hint_overrides_preserve_unrelated_fields_and_http_hints() {
+        let overrides = toml::from_str("'old-*' = 'new-*'\nnew-sol = 'final'").unwrap();
+        let mut headers = HeaderMap::new();
+        for hint in [
+            "session=opaque; model=old-sol;extra=1",
+            "model=old-sol",
+            "malformed",
+        ] {
+            headers.append(ROUTING_HINT_HEADER, hint.parse().unwrap());
+        }
+        override_model_hint(&mut headers, &overrides).unwrap();
+        assert_eq!(
+            headers
+                .get_all(ROUTING_HINT_HEADER)
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "session=opaque;model=final;extra=1",
+                "model=final",
+                "malformed"
+            ]
+        );
+        headers.insert(
+            ROUTING_HINT_HEADER,
+            "model=unrelated;model=conflicting".parse().unwrap(),
+        );
+        override_model_hint(&mut headers, &overrides).unwrap();
+        assert_eq!(
+            headers[ROUTING_HINT_HEADER],
+            "model=unrelated;model=conflicting"
+        );
+    }
     use serde_json::json;
 
     #[test]

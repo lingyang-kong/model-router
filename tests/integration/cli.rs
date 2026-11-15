@@ -42,6 +42,66 @@ fn unsupported_arguments_fail_before_loading_configuration() {
 }
 
 #[test]
+fn check_config_reports_derived_overrides_without_starting_a_listener() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/router-config.toml");
+    let output = command()
+        .arg("--check-config")
+        .env("MODEL_ROUTER_CONFIG", path)
+        .env("MODEL_ROUTER_PORT", "unused-by-check-config")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["resolved_model_overrides"]["gpt-5.6-sol"],
+        "gpt-6.1-sol"
+    );
+    assert_eq!(
+        report["resolved_model_overrides"]["gpt-6-sol"],
+        "gpt-6.1-sol"
+    );
+    assert!(
+        report["resolved_model_overrides"]
+            .get("gpt-5.6-x")
+            .is_none()
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn wildcard_cycles_and_growth_fail_at_startup() {
+    for overrides in ["'a*' = 'b*'\n'b*' = 'a*'", "'a*' = 'aa*'"] {
+        let config = format!(
+            "[model_overrides]\n{overrides}\n[providers.api]\nbase_url = 'http://localhost:1'\nauth = 'none'\n[[routes]]\naction = 'model'\n"
+        );
+        for flag in [None, Some("--check-config")] {
+            let mut command = command();
+            if let Some(flag) = flag {
+                command.arg(flag);
+            }
+            let output = command
+                .env_remove("MODEL_ROUTER_CONFIG")
+                .env("MODEL_ROUTER_CONFIG_TOML", &config)
+                .env("MODEL_ROUTER_PORT", "unused-before-validation")
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            let error = String::from_utf8(output.stderr).unwrap();
+            assert!(error.contains("Invalid model override"), "{error}");
+            assert!(
+                error.contains("cycle") || error.contains("possible loop"),
+                "{error}"
+            );
+            assert!(!error.contains("listening"));
+        }
+    }
+}
+
+#[test]
 fn file_configuration_resolves_catalog_paths_and_overrides_inline_configuration() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("models.json"), r#"{"data":[{"id":""}]}"#).unwrap();

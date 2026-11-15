@@ -7,6 +7,8 @@ mod compression;
 mod config;
 mod discovery;
 mod error;
+mod model_overrides;
+mod model_pattern;
 mod protocol;
 mod router;
 mod websocket;

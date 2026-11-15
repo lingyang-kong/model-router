@@ -70,6 +70,30 @@ This streams HTTP bodies and tunnels WebSockets to the selected client's provide
 
 The full incoming path is appended to `base_url`: a base ending in `/v1` plus `/responses` becomes `/v1/responses`. Incoming queries are preserved; base URLs cannot contain queries. Paths changed by URL normalization, such as dot segments or backslashes, are rejected. Upstream redirects are not followed. Loopback upstreams bypass proxy environment variables; remote upstreams honor them.
 
+### Model overrides
+
+Replace requested model IDs before provider selection using the same [glob syntax](#hidden-models) as `hidden_models`:
+
+```toml
+[model_overrides]
+"gpt-5.6-*" = "gpt-6-*"
+"gpt-6-sol" = "gpt-6.1-sol"
+```
+
+Each destination `*` copies the corresponding source `*` match greedily. Substitutions require literal text and single `*` wildcards in the source, with equal star counts; `?`, classes, braces, and `**` are supported only with fixed destinations. Backslash escapes preserve literal metacharacters; use TOML literal strings such as `'literal-\*'`.
+
+Overrides follow chains: the example maps `gpt-5.6-sol` to `gpt-6.1-sol`. Matching rules must agree on the immediate replacement; conflicts fail independently of table order. Self-mappings end the chain. Blank IDs and targets containing semicolons or ASCII control characters are rejected.
+
+Startup analysis validates concrete IDs and wildcard samples, derives predecessors, and caches resolved chains. It rejects discovered cycles and conflicts but is not exhaustive: backward derivation stops at 1,024 known IDs. Runtime checks reject cycles and chains exceeding 64 changes before forwarding. Inspect startup results with:
+
+```sh
+MODEL_ROUTER_CONFIG=examples/router-config.toml cargo run --release --locked -- --check-config
+```
+
+This validates configuration and local catalogs without starting a listener or fetching remote catalogs. The JSON `resolved_model_overrides` map lists concrete results, not every wildcard match.
+
+Overrides apply only to `model` routes: HTTP JSON models and Codex WebSocket handshake hints and valid JSON text requests. The final ID selects the provider and is sent upstream; credential scoping is unchanged. Other request content and upstream response model IDs are preserved. Catalogs, `forward` routes, opaque WebSocket messages, and server-side model choices are unaffected. Targets must support the request parameters and model-specific state. Overrides default to empty and require a restart after edits. See [Codex internal requests](docs/codex.md#internal-model-requests).
+
 ## Catalogs
 
 Each provider can use one remote endpoint or JSON file:

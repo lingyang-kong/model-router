@@ -7,7 +7,7 @@ use std::{
 
 use anyhow::{Context, bail};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Uri};
-use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use globset::{GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Deserializer, de::Error as _};
 use serde_json::{Map, Value};
 use url::{Host, Url};
@@ -19,6 +19,7 @@ use crate::{
     capabilities::Capabilities,
     error::{Error, Result},
 };
+use crate::{model_overrides::ModelOverrides, model_pattern::compile_glob};
 
 const CONFIG_PATH_ENV: &str = "MODEL_ROUTER_CONFIG";
 const CONFIG_TOML_ENV: &str = "MODEL_ROUTER_CONFIG_TOML";
@@ -79,6 +80,8 @@ pub(crate) struct Provider {
 #[derive(Deserialize)]
 struct ConfigDocument {
     providers: BTreeMap<String, Provider>,
+    #[serde(default)]
+    model_overrides: ModelOverrides,
     #[serde(default)]
     clients: BTreeMap<ClientKind, ClientProfile>,
     routes: Vec<Route>,
@@ -148,13 +151,7 @@ fn deserialize_hidden_models<'de, D: Deserializer<'de>>(
         |error: globset::Error| D::Error::custom(format!("Invalid hidden_models: {error}"));
     let mut builder = GlobSetBuilder::new();
     for pattern in Vec::<String>::deserialize(deserializer)? {
-        builder.add(
-            GlobBuilder::new(&pattern)
-                .backslash_escape(true)
-                .empty_alternates(true)
-                .build()
-                .map_err(invalid)?,
-        );
+        builder.add(compile_glob(&pattern).map_err(invalid)?);
     }
     builder.build().map_err(invalid)
 }
@@ -228,11 +225,17 @@ impl Route {
 
 pub struct Config {
     pub(crate) providers: BTreeMap<String, Arc<Provider>>,
+    pub(crate) model_overrides: ModelOverrides,
     pub(crate) clients: BTreeMap<ClientKind, ClientProfile>,
     pub(crate) routes: Vec<Route>,
 }
 
 impl Config {
+    /// Concrete override chains resolved at startup; wildcard domains may contain more IDs.
+    pub fn resolved_model_overrides(&self) -> &BTreeMap<String, String> {
+        self.model_overrides.resolved()
+    }
+
     pub fn from_env() -> anyhow::Result<Self> {
         let (text, root) = match env::var_os(CONFIG_PATH_ENV) {
             Some(path) => {
@@ -253,6 +256,7 @@ impl Config {
     pub fn from_toml(text: &str, root: &Path) -> anyhow::Result<Self> {
         let ConfigDocument {
             mut providers,
+            model_overrides,
             clients,
             routes,
         } = toml::from_str(text).context("Invalid router configuration")?;
@@ -337,6 +341,7 @@ impl Config {
         }
         Ok(Self {
             clients,
+            model_overrides,
             providers: providers
                 .into_iter()
                 .map(|(name, provider)| (name, Arc::new(provider)))
@@ -500,6 +505,35 @@ pub(crate) fn sanitize_headers(headers: &mut HeaderMap) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_overrides_reject_ambiguous_or_invalid_targets() {
+        let base = r#"
+            [providers.api]
+            base_url = "http://localhost:30000"
+            auth = "none"
+            [[routes]]
+            action = "model"
+        "#;
+        for mappings in [r#"a = "b""#, r#"a = "a""#, "a = 'b'\nb = 'c'", ""] {
+            let text = format!("{base}\n[model_overrides]\n{mappings}");
+            assert!(Config::from_toml(&text, Path::new(".")).is_ok());
+        }
+        for mappings in [
+            r#""" = "b""#,
+            r#"a = " ""#,
+            "a = 'b'\nb = 'a'",
+            "'[' = 'b'",
+            r#"a = "b;model=c""#,
+            r#"a = "b\nc""#,
+        ] {
+            let text = format!("{base}\n[model_overrides]\n{mappings}");
+            assert!(
+                Config::from_toml(&text, Path::new(".")).is_err(),
+                "{mappings}"
+            );
+        }
+    }
 
     #[test]
     fn client_profiles_select_provider_and_catalog_format_independently() {

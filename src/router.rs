@@ -168,7 +168,7 @@ async fn forward_http(
     adapter: Option<Client>,
     format: CatalogFormat,
 ) -> Result<Response> {
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
     let (model, body) = match action {
         RouteAction::Catalog {} => {
             return state.catalog_response(parts, origin, format).await;
@@ -180,7 +180,9 @@ async fn forward_http(
                 .forward_model(state, parts, body, origin)
                 .await;
         }
-        RouteAction::Model { .. } => inspect_body(body, &parts.headers).await?,
+        RouteAction::Model { .. } => {
+            inspect_body(body, &mut parts.headers, &state.config.model_overrides).await?
+        }
     };
     let provider = match action {
         RouteAction::Forward {

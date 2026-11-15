@@ -23,6 +23,10 @@ The router selects Codex handling when the `originator` header contains `codex`,
 
 In API-key mode, Codex may use its built-in model list instead of fetching the router's `/models` catalog through the base URL. Local models may therefore be absent from the picker. This discovery limitation does not affect inference: a recognized local model ID routes to its local upstream without a catalog refresh, and other IDs route to the provider selected by the request credentials. No catalog setting is required for routing.
 
+## Internal model requests
+
+Codex may select internal models independently of agent settings. The example [model overrides](../README.md#model-overrides) replace GPT-5.6 requests that reach the router's `model` routes. Catalog hiding alone does not prevent explicit requests. Overrides cannot affect calls that bypass the router or model selection inside OpenAI's servers. Replacing a classifier or approval model may change its decisions.
+
 ## Model metadata
 
 Use [catalog inheritance](../README.md#metadata-and-inheritance) to supply a custom model with a native Codex catalog entry. The example inherits a ChatGPT row, including instructions and native settings, then applies local shared settings and discovered capabilities.

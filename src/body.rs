@@ -4,7 +4,9 @@ use std::{
 };
 
 use crate::compression::decode_body;
+use crate::config::remove_body_headers;
 use crate::error::{Error, Result as RouterResult};
+use crate::model_overrides::ModelOverrides;
 use crate::protocol::header;
 use axum::{
     body::{Body, Bytes},
@@ -13,6 +15,7 @@ use axum::{
 use http_body::{Body as HttpBody, Frame, SizeHint};
 use http_body_util::{BodyExt, StreamBody};
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use sync_wrapper::SyncWrapper;
 
 #[derive(Deserialize)]
@@ -38,11 +41,49 @@ pub(crate) fn request_model(bytes: &[u8]) -> RouterResult<Option<String>> {
 
 pub(crate) async fn inspect_body(
     body: Body,
-    headers: &HeaderMap,
+    headers: &mut HeaderMap,
+    overrides: &ModelOverrides,
 ) -> RouterResult<(Option<String>, reqwest::Body)> {
     let body = BufferedRequest::collect(body, headers).await?;
     let model = request_model(body.decoded())?;
+    let resolved = model
+        .as_deref()
+        .map(|model| overrides.resolve(model))
+        .transpose()?;
+    if let Some(target) = resolved.as_deref()
+        && model.as_deref() != Some(target)
+    {
+        let bytes = rewrite_model(body.decoded(), target)?;
+        return Ok((Some(target.to_owned()), rewritten_body(bytes, headers)));
+    }
     Ok((model, body.into_body()))
+}
+
+/// Replace only the top-level model value, leaving opaque JSON bytes intact.
+pub(crate) fn rewrite_model(bytes: &[u8], target: &str) -> RouterResult<Vec<u8>> {
+    #[derive(Deserialize)]
+    struct Selector<'a> {
+        #[serde(borrow)]
+        model: &'a RawValue,
+    }
+    let selector: Selector<'_> = serde_json::from_slice(bytes).map_err(Error::bad_request)?;
+    let raw = selector.model.get();
+    // RawValue borrows its exact token from bytes, including escaped model IDs.
+    let start = raw.as_ptr() as usize - bytes.as_ptr() as usize;
+    let value = serde_json::to_vec(target).map_err(Error::bad_request)?;
+    let mut rewritten = Vec::with_capacity(bytes.len() - raw.len() + value.len());
+    rewritten.extend_from_slice(&bytes[..start]);
+    rewritten.extend_from_slice(&value);
+    rewritten.extend_from_slice(&bytes[start + raw.len()..]);
+    Ok(rewritten)
+}
+
+pub(crate) fn rewritten_body(bytes: Vec<u8>, headers: &mut HeaderMap) -> reqwest::Body {
+    // Changed bytes invalidate their encoding, length, integrity, and trailers.
+    remove_body_headers(headers);
+    headers.remove(header::CONTENT_LENGTH);
+    headers.remove(header::TE);
+    reqwest::Body::from(bytes)
 }
 
 /// Keep the original payload and trailers while exposing decoded inspection bytes.
@@ -152,6 +193,20 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt;
 
+    #[test]
+    fn model_rewrite_preserves_opaque_fields_and_deep_payloads() {
+        let input = format!(
+            " {{\"mo\\u0064el\" : \"gpt-5.6-\\u006cuna\",\"opaque\":{{ \"model\":\"gpt-5.6-luna\",\"n\":123456789012345678901234567890 }},\"input\":{}0{}}}\n",
+            "[".repeat(256),
+            "]".repeat(256)
+        );
+        let expected = input.replacen(r#""gpt-5.6-\u006cuna""#, r#""gpt-6-luna""#, 1);
+        assert_eq!(
+            rewrite_model(input.as_bytes(), "gpt-6-luna").unwrap(),
+            expected.as_bytes()
+        );
+    }
+
     #[tokio::test]
     async fn original_frames_lengths_and_trailers_are_forwarded() {
         let bytes = Bytes::from_static(b"opaque bytes");
@@ -212,9 +267,10 @@ mod tests {
         let body = Body::new(http_body_util::StreamBody::new(futures_util::stream::iter(
             frames,
         )));
-        let (model, mut forwarded) = inspect_body(body, &HeaderMap::new())
-            .await
-            .unwrap_or_else(|_| panic!("invalid buffered request"));
+        let (model, mut forwarded) =
+            inspect_body(body, &mut HeaderMap::new(), &ModelOverrides::default())
+                .await
+                .unwrap_or_else(|_| panic!("invalid buffered request"));
         assert_eq!(model.as_deref(), Some("vendor/雪"));
         assert_eq!(forwarded.size_hint().exact(), None);
         assert_eq!(
