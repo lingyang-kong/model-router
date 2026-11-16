@@ -11,7 +11,6 @@ mod cli;
 mod compaction;
 mod discovery;
 mod http_forwarding;
-mod model_listing;
 mod model_overrides;
 mod multiagent;
 mod multiagent_websocket;

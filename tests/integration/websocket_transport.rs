@@ -291,7 +291,7 @@ async fn preparation_during_response(during: DuringPreparation) {
         let description = first.2["tools"][0]["tools"][0]["description"]
             .as_str()
             .unwrap();
-        assert_eq!(description.matches("Available model overrides").count(), 1);
+        assert_eq!(description, "d");
         let ids: Vec<_> = requests
             .iter()
             .map(|request| request.2["stream_id"].as_str().unwrap())

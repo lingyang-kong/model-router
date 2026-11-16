@@ -95,7 +95,6 @@ pub(super) fn has_convertible_agent_message(bytes: &[u8]) -> serde_json::Result<
 pub(super) fn prepare_bytes(
     bytes: &[u8],
     text_agent_messages: bool,
-    listing: &str,
 ) -> serde_json::Result<Option<Vec<u8>>> {
     let Some(mut object) = parse_object_bytes::<Box<RawValue>>(bytes)? else {
         return Ok(None);
@@ -104,7 +103,7 @@ pub(super) fn prepare_bytes(
     if let Some(tools) = object.get(field::TOOLS)
         && let Some(items) = parse_array(tools)?
     {
-        let (items, tools_changed) = prepare_tools(items, listing)?;
+        let (items, tools_changed) = prepare_tools(items)?;
         if tools_changed {
             object.insert(field::TOOLS.into(), encode_json(&items)?);
             changed = true;
@@ -113,7 +112,7 @@ pub(super) fn prepare_bytes(
     if let Some(input) = object.get(field::INPUT)
         && let Some(items) = parse_array(input)?
     {
-        let (items, input_changed) = prepare_input(items, text_agent_messages, listing)?;
+        let (items, input_changed) = prepare_input(items, text_agent_messages)?;
         if input_changed {
             object.insert(field::INPUT.into(), encode_json(&items)?);
             changed = true;
@@ -124,10 +123,7 @@ pub(super) fn prepare_bytes(
     }
     Ok(Some(serde_json::to_vec(&object)?))
 }
-fn prepare_tools(
-    mut tools: Vec<Box<RawValue>>,
-    listing: &str,
-) -> serde_json::Result<(Vec<Box<RawValue>>, bool)> {
+fn prepare_tools(mut tools: Vec<Box<RawValue>>) -> serde_json::Result<(Vec<Box<RawValue>>, bool)> {
     let mut changed = false;
     for entry in &mut tools {
         let Some(mut tool) = parse_object(entry)? else {
@@ -149,8 +145,7 @@ fn prepare_tools(
             && let Some(nested_tools) = tool.get(field::TOOLS)
             && let Some(nested_items) = parse_array(nested_tools)?
         {
-            let (nested_items, nested_changed) =
-                prepare_collaboration_tools(nested_items, listing)?;
+            let (nested_items, nested_changed) = prepare_collaboration_tools(nested_items)?;
             if nested_changed {
                 tool.insert(field::TOOLS.into(), encode_json(&nested_items)?);
                 changed = true;
@@ -165,7 +160,6 @@ fn prepare_tools(
 }
 fn prepare_collaboration_tools(
     mut tools: Vec<Box<RawValue>>,
-    listing: &str,
 ) -> serde_json::Result<(Vec<Box<RawValue>>, bool)> {
     let mut changed = false;
     for entry in &mut tools {
@@ -204,21 +198,6 @@ fn prepare_collaboration_tools(
                 tool_changed = true;
             }
         }
-        if name.as_deref() == Some(collaboration_tool::SPAWN_AGENT)
-            && !listing.is_empty()
-            && let Some(description) = string(tool.get(field::DESCRIPTION))
-        {
-            // Replace Codex's model-list prefix when the expected description marker is present.
-            let description = description
-                .find("Spawns an agent")
-                .map_or(description.as_str(), |start| &description[start..]);
-            let combined = format!("{listing}{description}");
-            if combined != description {
-                set_str(&mut tool, field::DESCRIPTION, &combined);
-                changed = true;
-                tool_changed = true;
-            }
-        }
         if tool_changed {
             *entry = encode_json(&tool)?;
         }
@@ -228,7 +207,6 @@ fn prepare_collaboration_tools(
 fn prepare_input(
     mut items: Vec<Box<RawValue>>,
     text_agent_messages: bool,
-    listing: &str,
 ) -> serde_json::Result<(Vec<Box<RawValue>>, bool)> {
     let mut changed = false;
     for entry in &mut items {
@@ -244,7 +222,7 @@ fn prepare_input(
             && let Some(tools) = item.get(field::TOOLS)
             && let Some(tools) = parse_array(tools)?
         {
-            let (tools, tools_changed) = prepare_tools(tools, listing)?;
+            let (tools, tools_changed) = prepare_tools(tools)?;
             if tools_changed {
                 item.insert(field::TOOLS.into(), encode_json(&tools)?);
                 changed = true;
@@ -444,7 +422,7 @@ mod tests {
     fn encrypted_agent_messages_remain_unchanged_even_when_native_items_are_rejected() {
         let input = br#"{"input":[{"type":"agent_message","author":"worker","recipient":"parent","content":[{"type":"input_text","text":"context"},{"type":"encrypted_content","encrypted_content":"opaque-ciphertext"}]}]}"#;
         for convert in [false, true] {
-            assert!(prepare_bytes(input, convert, "").unwrap().is_none());
+            assert!(prepare_bytes(input, convert).unwrap().is_none());
         }
         assert!(!has_convertible_agent_message(input).unwrap());
     }
@@ -511,10 +489,10 @@ mod tests {
     #[test]
     fn targeted_adaptation_and_restore() {
         let input=br#"{"tools":[{"type":"namespace","name":"collaboration","tools":[{"name":"spawn_agent","description":"d","parameters":{"properties":{"message":{"encrypted":true,"deep":{"x":1}}}}}]}],"input":[{"type":"agent_message","author":"a","content":[{"type":"input_text","text":"literal"}]},{"type":"function_call","name":"collaboration__send_message","arguments":"collaboration"}]}"#;
-        let out = prepare_bytes(input, true, "listing\n").unwrap().unwrap();
+        let out = prepare_bytes(input, true).unwrap().unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["tools"][0]["name"], COLLABORATION.upstream);
-        assert_eq!(v["tools"][0]["tools"][0]["description"], "listing\nd");
+        assert_eq!(v["tools"][0]["tools"][0]["description"], "d");
         assert!(
             v["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
                 .get("encrypted")
@@ -534,7 +512,7 @@ mod tests {
     #[test]
     fn preserves_unrelated_tool_scopes_and_restores_all_snapshot_types() {
         let request = br#"{"tools":[{"type":"namespace","name":"collaboration","tools":[{"name":"other","parameters":{"properties":{"message":{"encrypted":true}}}},{"type":"namespace","name":"nested","tools":[{"name":"send_message","parameters":{"properties":{"message":{"encrypted":true}}}}]}]},{"type":"namespace","name":"other","tools":[{"name":"send_message","parameters":{"properties":{"message":{"encrypted":true}}}}]},{"type":"function","name":"send_message","parameters":{"properties":{"message":{"encrypted":true}}}}]}"#;
-        let prepared = prepare_bytes(request, false, "").unwrap().unwrap();
+        let prepared = prepare_bytes(request, false).unwrap().unwrap();
         let value: serde_json::Value = serde_json::from_slice(&prepared).unwrap();
         assert!(
             value["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
@@ -573,7 +551,7 @@ mod tests {
         .to_owned()
             + &deep
             + r#"}}}]}],"input":[{"type":"function_call","name":"collaboration__x"}]}"#;
-        let out = prepare_bytes(input.as_bytes(), false, "").unwrap().unwrap();
+        let out = prepare_bytes(input.as_bytes(), false).unwrap().unwrap();
         let output = String::from_utf8(out).unwrap();
         assert!(output.contains("collaboration_compat__x"));
         assert!(output.contains("\"name\":\"collaboration_compat\""));
@@ -644,7 +622,7 @@ mod tests {
         let escaped = br#"{"input":[{"type":"ag\u0065nt_message","content":[] }]}"#;
         assert!(request_may_need_adaptation(escaped));
         assert!(has_convertible_agent_message(escaped).unwrap());
-        let prepared = prepare_bytes(escaped, true, "").unwrap().unwrap();
+        let prepared = prepare_bytes(escaped, true).unwrap().unwrap();
         let prepared: serde_json::Value = serde_json::from_slice(&prepared).unwrap();
         assert_eq!(prepared["input"][0]["type"], "message");
     }
@@ -653,7 +631,7 @@ mod tests {
     fn escaped_relevant_name_is_seen() {
         let input=br#"{"input":[{"type":"function_call","name":"collab\u006fration\u005f\u005fx"}],"text":"a\\nb"}"#;
         assert!(request_may_need_adaptation(input));
-        let out = prepare_bytes(input, false, "").unwrap().unwrap();
+        let out = prepare_bytes(input, false).unwrap().unwrap();
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["input"][0]["name"], "collaboration_compat__x");
         assert_eq!(v["text"], r"a\nb");

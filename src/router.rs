@@ -88,21 +88,7 @@ pub fn router(config: Config) -> anyhow::Result<Router> {
     } else {
         ModelRegistry::new()
     };
-    let from_file = |provider: &Provider| {
-        provider
-            .catalog
-            .as_ref()
-            .is_some_and(|catalog| catalog.file.is_some())
-    };
-    let ready = config
-        .providers
-        .values()
-        .any(|provider| from_file(provider))
-        && config
-            .providers
-            .values()
-            .all(|provider| provider.catalog.is_none() || from_file(provider));
-    let catalog = CatalogState::new(&config, models, ready)?;
+    let catalog = CatalogState::new(&config, models)?;
     let state = RouterState {
         config,
         catalog: RwLock::new(catalog),

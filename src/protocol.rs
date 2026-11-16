@@ -26,7 +26,7 @@ pub(crate) mod header {
     pub const X_OPENAI_ORGANIZATION: HeaderName = HeaderName::from_static("x-openai-organization");
     pub const X_OPENAI_PROJECT: HeaderName = HeaderName::from_static("x-openai-project");
 
-    /// Credential and tenant headers shared by authentication and cache scoping.
+    /// Credential and tenant headers used by authentication.
     pub const CREDENTIALS: [HeaderName; 6] = [
         AUTHORIZATION,
         COOKIE,
@@ -35,9 +35,6 @@ pub(crate) mod header {
         X_API_KEY,
         API_KEY,
     ];
-
-    pub const ACCOUNT_SCOPE: [HeaderName; 3] =
-        [CHATGPT_ACCOUNT_ID, X_OPENAI_ORGANIZATION, X_OPENAI_PROJECT];
 
     pub const HOP_BY_HOP: [HeaderName; 9] = [
         HOST,

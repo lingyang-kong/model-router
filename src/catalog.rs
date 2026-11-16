@@ -1,11 +1,4 @@
-use std::{
-    borrow::Cow,
-    collections::{BTreeMap, hash_map::RandomState},
-    hash::{BuildHasher, Hash, Hasher},
-    io,
-    sync::Arc,
-    time::Duration,
-};
+use std::{borrow::Cow, io, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -21,7 +14,7 @@ use tokio_util::io::StreamReader;
 use crate::protocol::{encoding, field, header, item_type, media_type, role};
 use crate::{
     Config,
-    adapters::{CatalogFormat, ClientKind},
+    adapters::CatalogFormat,
     capabilities::{self, Discovery},
     compression::{accepts_gzip, decode_body, encode_body},
     config::{ModelReference, Provider, header_has_token, remove_body_headers},
@@ -58,14 +51,10 @@ pub(crate) type ModelRegistry = IndexMap<String, ModelEntry>;
 pub(crate) struct CatalogState {
     pub models: ModelRegistry,
     pub local_routes: IndexMap<String, Arc<Provider>>,
-    listings: BTreeMap<(ClientKind, Option<usize>, u64), Arc<str>>,
-    credentials: RandomState,
-    file_listing: Option<Arc<str>>,
 }
 
 impl CatalogState {
-    pub fn new(config: &Config, models: ModelRegistry, ready: bool) -> Result<Self> {
-        let file_listing = ready.then(|| model_listing(&models));
+    pub fn new(config: &Config, models: ModelRegistry) -> Result<Self> {
         let mut local_routes = IndexMap::new();
         let configured = config
             .providers
@@ -90,86 +79,8 @@ impl CatalogState {
         Ok(Self {
             models,
             local_routes,
-            listings: BTreeMap::new(),
-            credentials: RandomState::new(),
-            file_listing,
         })
     }
-
-    fn scope(
-        &self,
-        headers: &HeaderMap,
-        origin: Option<&Arc<Provider>>,
-    ) -> (ClientKind, Option<usize>, u64) {
-        // Keep only a process-keyed fingerprint, never the incoming credentials.
-        // Sorting names makes header insertion order irrelevant; repeated values matter.
-        let mut names: Vec<_> = headers
-            .keys()
-            .filter(|name| {
-                header::CREDENTIALS.contains(name) || header::ACCOUNT_SCOPE.contains(name)
-            })
-            .collect();
-        names.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        let mut fingerprint = self.credentials.build_hasher();
-        for name in names {
-            name.as_str().hash(&mut fingerprint);
-            for value in headers.get_all(name) {
-                value.as_bytes().hash(&mut fingerprint);
-            }
-        }
-        (
-            ClientKind::from_headers(headers),
-            origin.map(|provider| Arc::as_ptr(provider) as usize),
-            fingerprint.finish(),
-        )
-    }
-
-    pub fn listing(&self, headers: &HeaderMap, origin: Option<&Arc<Provider>>) -> Arc<str> {
-        self.listings
-            .get(&self.scope(headers, origin))
-            .or(self.file_listing.as_ref())
-            .cloned()
-            .unwrap_or_default()
-    }
-}
-
-fn model_listing(models: &ModelRegistry) -> Arc<str> {
-    let mut listing = String::from(
-        "Available model overrides (optional; inherited parent model is preferred):\n",
-    );
-    for (id, entry) in models {
-        if !entry.listed || entry.provider.hidden_models.is_match(id) {
-            continue;
-        }
-        listing.push_str("- ");
-        listing.push_str(id);
-        if let Some(description) = entry
-            .metadata
-            .get(field::DESCRIPTION)
-            .and_then(Value::as_str)
-        {
-            listing.push_str(": ");
-            listing.push_str(description);
-        }
-        let shared = entry.format.shared_metadata(&entry.metadata);
-        if let Some(levels) = shared
-            .get(field::REASONING_LEVELS)
-            .and_then(Value::as_array)
-        {
-            let levels: Vec<_> = levels
-                .iter()
-                .filter_map(|level| level.get(field::LEVEL).and_then(Value::as_str))
-                .collect();
-            if !levels.is_empty() {
-                listing.push_str(". Reasoning efforts: ");
-                listing.push_str(&levels.join(", "));
-                listing.push('.');
-            }
-        }
-        listing.push('\n');
-    }
-    listing.push('\n');
-    listing.into()
 }
 
 /// Object fields combine recursively; arrays and scalar values replace the old value.
@@ -491,7 +402,7 @@ impl RouterState {
             if let Some(reference) = entry.reference(id) {
                 let provider = self.config.provider(&reference.provider)?;
                 // Keep dependent IDs routable, but do not advertise incomplete
-                // inherited metadata to Codex or its subagent listing.
+                // inherited metadata to Codex.
                 entry.listed = !unavailable
                     .iter()
                     .any(|source| Arc::ptr_eq(source, provider));
@@ -632,7 +543,6 @@ impl RouterState {
             .into_iter()
             .flatten()
             .collect();
-        let listing = model_listing(&staged);
         // Only credential-independent destinations establish shared routes.
         // Remote metadata remains in this request's snapshots.
         let mut catalog = self.catalog.write().await;
@@ -648,8 +558,6 @@ impl RouterState {
                 )));
             }
         }
-        let scope = catalog.scope(&incoming_headers, origin);
-        catalog.listings.insert(scope, listing);
         for (id, entry) in staged {
             if !entry.provider.uses_incoming_credentials() {
                 catalog.local_routes.insert(id, entry.provider);

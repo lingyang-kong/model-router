@@ -247,7 +247,7 @@ async fn codex_multiagent_websocket_transforms_requests_and_restores_events() {
     );
     let (mut socket, _) = connect_async(request).await.unwrap();
     let original = json!({"type":"response.create","model":"publisher/model","tools":[{"type":"namespace","name":"collaboration","tools":[
-        {"type":"function","name":"spawn_agent","description":"spawn","parameters":{"properties":{"message":{"type":"string","encrypted":true}}}}
+        {"type":"function","name":"spawn_agent","description":"Client models: example. Spawns an agent.","parameters":{"properties":{"message":{"type":"string","encrypted":true}}}}
     ]}],"input":[
         {"type":"additional_tools","tools":[{"type":"namespace","name":"collaboration","tools":[
             {"type":"function","name":"send_message","parameters":{"properties":{"message":{"type":"string","encrypted":true}}}}
@@ -297,6 +297,10 @@ async fn codex_multiagent_websocket_transforms_requests_and_restores_events() {
         "__model_router_capability_check__"
     );
     assert_eq!(wire["tools"][0]["name"], "collaboration_compat");
+    assert_eq!(
+        wire["tools"][0]["tools"][0]["description"],
+        "Client models: example. Spawns an agent."
+    );
     assert!(
         wire["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
             .get("encrypted")

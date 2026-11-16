@@ -201,9 +201,7 @@ async fn prepare_request(
     }
     let bytes = prepared.rewritten.as_deref().unwrap_or(bytes);
     if multiagent::request_may_need_adaptation(bytes) {
-        let listing = state.catalog.read().await.listing(&parts.headers, origin);
-        let rewritten =
-            prepare_multiagent(state, provider, origin, parts, bytes, model, &listing).await?;
+        let rewritten = prepare_multiagent(state, provider, origin, parts, bytes, model).await?;
         prepared.rewritten = rewritten.or(prepared.rewritten);
     }
     Ok(RequestPlan::Forward(prepared.rewritten))
@@ -216,7 +214,6 @@ pub(super) async fn prepare_multiagent(
     parts: &Parts,
     bytes: &[u8],
     model: Option<&str>,
-    listing: &str,
 ) -> Result<Option<Vec<u8>>> {
     let convert = multiagent::has_convertible_agent_message(bytes).map_err(Error::bad_request)?
         && state
@@ -232,5 +229,5 @@ pub(super) async fn prepare_multiagent(
             )
             .await
             == Some(false);
-    multiagent::prepare_bytes(bytes, convert, listing).map_err(Error::bad_request)
+    multiagent::prepare_bytes(bytes, convert).map_err(Error::bad_request)
 }

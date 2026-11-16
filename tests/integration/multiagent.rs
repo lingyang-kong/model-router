@@ -410,13 +410,10 @@ async fn codex_multiagent_requests_are_rewritten_and_responses_restored() {
     let agent_description = parent_wire[0].body["tools"][0]["tools"][0]["description"]
         .as_str()
         .unwrap();
-    assert!(agent_description.starts_with("Available model overrides"));
-    assert!(agent_description.contains("parent-model"));
-    assert!(agent_description.contains("worker-model"));
-    assert!(agent_description.contains("unknown-model"));
-    assert!(agent_description.contains("Reasoning efforts: high"));
-    assert!(agent_description.contains("Spawns an agent"));
-    assert!(!agent_description.contains("Old native model prefix"));
+    assert_eq!(
+        agent_description,
+        "Old native model prefix. Spawns an agent for delegated work."
+    );
     assert!(
         parent_wire[0].body["input"][0]["tools"][0]["tools"][0]["parameters"]["properties"]["message"]
             .get("encrypted")

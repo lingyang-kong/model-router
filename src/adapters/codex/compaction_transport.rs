@@ -46,7 +46,6 @@ pub(super) async fn summarize(
             &parts,
             &body,
             model.as_deref(),
-            "",
         )
         .await
         .map_err(IntoResponse::into_response)?
