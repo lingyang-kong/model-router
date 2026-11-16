@@ -102,7 +102,7 @@ pub(super) fn sse(
                     work = None;
                     match result {
                         Ok(response) => encode_sse(compaction::events(&response, None)),
-                        Err(response) => encode_sse(vec![failure_event(*response, None).await]),
+                        Err(response) => encode_sse(vec![sse_failure_event(*response).await]),
                     }
                 }
                 _ = heartbeat.tick() => Bytes::from_static(b": compacting\n\n"),
@@ -127,7 +127,21 @@ fn encode_sse(events: Vec<Value>) -> Bytes {
     bytes.into()
 }
 
+async fn sse_failure_event(response: Response) -> Value {
+    let (status, error) = failure_details(response).await;
+    serde_json::json!({"type":"response.failed", "status":status, "response":{"status":"failed", "error":error}})
+}
+
 pub(super) async fn failure_event(response: Response, stream_id: Option<&Value>) -> Value {
+    let (status, error) = failure_details(response).await;
+    let mut event = serde_json::json!({"type":"error", "status":status, "error":error});
+    if let Some(stream_id) = stream_id {
+        event[field::STREAM_ID] = stream_id.clone();
+    }
+    event
+}
+
+async fn failure_details(response: Response) -> (u16, Value) {
     let (parts, body) = response.into_parts();
     let status = parts.status.as_u16();
     let reader = StreamReader::new(body.into_data_stream().map_err(io::Error::other));
@@ -142,11 +156,29 @@ pub(super) async fn failure_event(response: Response, stream_id: Option<&Value>)
     if let Some(code @ Value::Number(_)) = error.get_mut(field::CODE) {
         *code = Value::String(code.to_string());
     }
-    let mut event = serde_json::json!({"type":"error", "status":status, "error":error});
-    if let Some(stream_id) = stream_id {
-        event[field::STREAM_ID] = stream_id.clone();
+    if !error.is_object() {
+        let message = error
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| error.to_string());
+        error = serde_json::json!({"message":message});
     }
-    event
+    if let Some(value) = parts
+        .headers
+        .get(axum::http::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+    {
+        let headers = error
+            .as_object_mut()
+            .unwrap()
+            .entry("headers")
+            .or_insert_with(|| serde_json::json!({}));
+        if !headers.is_object() {
+            *headers = serde_json::json!({});
+        }
+        headers["retry-after"] = Value::String(value.into());
+    }
+    (status, error)
 }
 
 pub(super) fn json(response: Value) -> Response {
@@ -157,6 +189,62 @@ pub(super) fn json(response: Value) -> Response {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn transport_errors_preserve_retry_advice() {
+        fn response() -> Response {
+            Response::builder()
+                .status(StatusCode::SERVICE_UNAVAILABLE)
+                .header("retry-after", "17")
+                .body(Body::from(
+                    r#"{"error":{"code":"server_is_overloaded","message":"busy"}}"#,
+                ))
+                .unwrap()
+        }
+        assert_eq!(
+            sse_failure_event(response()).await,
+            json!({"type":"response.failed", "status":503, "response":{"status":"failed", "error":{
+                "code":"server_is_overloaded", "message":"busy", "headers":{"retry-after":"17"}
+            }}})
+        );
+        assert_eq!(
+            failure_event(response(), Some(&json!("lane"))).await,
+            json!({"type":"error", "status":503, "stream_id":"lane",
+                "error":{"code":"server_is_overloaded", "message":"busy", "headers":{"retry-after":"17"}}})
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_stream_emits_failure_with_http_date_and_existing_metadata() {
+        let response = Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .header("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT")
+            .body(Body::from(r#"{"error":{"code":"server_is_overloaded","message":"busy","headers":{"x-request-id":"abc"}}}"#))
+            .unwrap();
+        let stream = sse(async { Err(Box::new(response)) });
+        assert_eq!(
+            stream.headers()[header::CONTENT_TYPE],
+            media_type::EVENT_STREAM
+        );
+        let bytes = axum::body::to_bytes(stream.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let data = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap();
+        let event: Value = serde_json::from_str(data).unwrap();
+        assert_eq!(event["type"], "response.failed");
+        assert_eq!(
+            event["response"]["error"],
+            json!({
+                "code":"server_is_overloaded", "message":"busy", "headers":{
+                    "x-request-id":"abc", "retry-after":"Wed, 21 Oct 2026 07:28:00 GMT"
+                }
+            })
+        );
+    }
 
     #[tokio::test]
     async fn compressed_text_errors_use_the_decoded_message() {
