@@ -39,26 +39,6 @@ pub(crate) fn request_model(bytes: &[u8]) -> RouterResult<Option<String>> {
     Ok(selector.model)
 }
 
-pub(crate) async fn inspect_body(
-    body: Body,
-    headers: &mut HeaderMap,
-    overrides: &ModelOverrides,
-) -> RouterResult<(Option<String>, reqwest::Body)> {
-    let body = BufferedRequest::collect(body, headers).await?;
-    let model = request_model(body.decoded())?;
-    let resolved = model
-        .as_deref()
-        .map(|model| overrides.resolve(model))
-        .transpose()?;
-    if let Some(target) = resolved.as_deref()
-        && model.as_deref() != Some(target)
-    {
-        let bytes = rewrite_model(body.decoded(), target)?;
-        return Ok((Some(target.to_owned()), rewritten_body(bytes, headers)));
-    }
-    Ok((model, body.into_body()))
-}
-
 /// Replace only the top-level model value, leaving opaque JSON bytes intact.
 pub(crate) fn rewrite_model(bytes: &[u8], target: &str) -> RouterResult<Vec<u8>> {
     #[derive(Deserialize)]
@@ -116,6 +96,22 @@ impl BufferedRequest {
 
     pub(crate) fn decoded(&self) -> &[u8] {
         self.decoded.as_deref().unwrap_or(&self.original)
+    }
+
+    pub(crate) fn resolve_model(
+        &self,
+        overrides: &ModelOverrides,
+    ) -> RouterResult<(Option<String>, Option<Vec<u8>>)> {
+        let bytes = self.decoded();
+        let Some(model) = request_model(bytes)? else {
+            return Ok((None, None));
+        };
+        let resolved = overrides.resolve(&model)?;
+        if resolved == model {
+            return Ok((Some(model), None));
+        }
+        let rewritten = rewrite_model(bytes, &resolved)?;
+        Ok((Some(resolved.into_owned()), Some(rewritten)))
     }
 
     pub(crate) fn into_body(self) -> reqwest::Body {
@@ -267,10 +263,13 @@ mod tests {
         let body = Body::new(http_body_util::StreamBody::new(futures_util::stream::iter(
             frames,
         )));
-        let (model, mut forwarded) =
-            inspect_body(body, &mut HeaderMap::new(), &ModelOverrides::default())
-                .await
-                .unwrap_or_else(|_| panic!("invalid buffered request"));
+        let buffered = BufferedRequest::collect(body, &HeaderMap::new())
+            .await
+            .unwrap();
+        let overrides = toml::from_str("'vendor/*' = ''").unwrap();
+        let (model, rewritten) = buffered.resolve_model(&overrides).unwrap();
+        assert!(rewritten.is_none());
+        let mut forwarded = buffered.into_body();
         assert_eq!(model.as_deref(), Some("vendor/雪"));
         assert_eq!(forwarded.size_hint().exact(), None);
         assert_eq!(

@@ -42,23 +42,12 @@ pub(in crate::adapters) async fn route(
     {
         return WebSocketAction::Forward(Message::Text(text));
     }
-    let original_model = selector.model.as_deref().or(context.model.as_deref());
-    let resolved = match original_model
-        .map(|model| context.state.config.model_overrides.resolve(model))
-        .transpose()
-    {
+    let original_model = selector.model.as_deref();
+    let resolved = match context.state.config.resolve_model(original_model) {
         Ok(resolved) => resolved,
         Err(error) => return failure(error, selector.stream_id),
     };
-    let model = resolved.as_deref();
-    let text = if selector.model.is_some() && model != original_model {
-        match rewrite_model(text.as_bytes(), model.unwrap()) {
-            Ok(bytes) => String::from_utf8(bytes).expect("JSON is UTF-8").into(),
-            Err(error) => return failure(error, selector.stream_id),
-        }
-    } else {
-        text
-    };
+    let model = resolved.as_deref().or(context.model.as_deref());
     let provider = match context
         .state
         .resolve_provider(model, context.origin.as_ref())
@@ -71,6 +60,15 @@ pub(in crate::adapters) async fn route(
         return failure(error, selector.stream_id);
     }
     if Arc::ptr_eq(&provider, &context.provider) {
+        let text = match model {
+            Some(target) if selector.model.is_some() && Some(target) != original_model => {
+                match rewrite_model(text.as_bytes(), target) {
+                    Ok(bytes) => String::from_utf8(bytes).expect("JSON is UTF-8").into(),
+                    Err(error) => return failure(error, selector.stream_id),
+                }
+            }
+            _ => text,
+        };
         return transport::websocket_request(text, context, model, selector.stream_id).await;
     }
     if selector.previous_response_id.is_some() {

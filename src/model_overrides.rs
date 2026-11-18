@@ -56,8 +56,8 @@ impl ModelOverrides {
                 );
             }
             anyhow::ensure!(
-                target.len() > 1 || !target[0].trim().is_empty(),
-                "Model override targets must be nonempty"
+                replacement.is_empty() || target.len() > 1 || !target[0].trim().is_empty(),
+                "Model override targets must not be whitespace only"
             );
             let source = split_wildcards(&pattern, true).ok();
             let (captures, inverse) = if target.len() > 1 {
@@ -98,6 +98,10 @@ impl ModelOverrides {
         self.rules.is_empty()
     }
 
+    pub(crate) fn is_match(&self, model: &str) -> bool {
+        self.patterns.is_match(model)
+    }
+
     pub(crate) fn resolve<'a>(&self, model: &'a str) -> Result<Cow<'a, str>> {
         match self.resolved.get(model) {
             Some(target) => Ok(Cow::Owned(target.clone())),
@@ -107,6 +111,19 @@ impl ModelOverrides {
 
     pub(crate) fn resolved(&self) -> &BTreeMap<String, String> {
         &self.resolved
+    }
+
+    pub(crate) fn into_resolved(self) -> BTreeMap<String, String> {
+        self.resolved
+    }
+
+    pub(crate) fn validate_and_cache(&mut self, model: &str) -> Result<()> {
+        if !self.resolved.contains_key(model)
+            && let Cow::Owned(target) = self.resolve_uncached(model)?
+        {
+            self.resolved.insert(model.to_owned(), target);
+        }
+        Ok(())
     }
 
     fn resolve_uncached<'a>(&self, model: &'a str) -> Result<Cow<'a, str>> {
@@ -130,8 +147,8 @@ impl ModelOverrides {
                 if let Some((previous, pattern)) = &selected {
                     if previous != &target {
                         return Err(Error::bad_request(format!(
-                            "Conflicting model overrides {pattern:?} and {:?} for {:?}",
-                            rule.pattern, current
+                            "Conflicting model overrides {pattern:?} and {:?} for {current:?}",
+                            rule.pattern
                         )));
                     }
                 } else {
@@ -141,17 +158,17 @@ impl ModelOverrides {
             let Some((target, _)) = selected else {
                 return Ok(Some(current));
             };
-            if target == current {
+            if target.is_empty() {
                 return Ok(Some(current));
-            }
-            if transitions == MAX_OVERRIDE_TRANSITIONS {
-                return Ok(None);
             }
             let visited = visited.get_or_insert_with(|| HashSet::from([model.to_owned()]));
             if !visited.insert(target.clone()) {
                 return Err(Error::bad_request(format!(
                     "Model override cycle at {target:?}"
                 )));
+            }
+            if transitions == MAX_OVERRIDE_TRANSITIONS {
+                return Ok(None);
             }
             current = Cow::Owned(target);
             transitions += 1;
@@ -161,11 +178,11 @@ impl ModelOverrides {
 
 impl Rule {
     fn expand(&self, model: &str) -> Result<String> {
-        let result = match &self.captures {
-            Some(regex) => substitute(regex, &self.target, model)
-                .ok_or_else(|| Error::bad_request("Model override capture did not match"))?,
-            None => self.target[0].clone(),
+        let Some(regex) = &self.captures else {
+            return Ok(self.target[0].clone());
         };
+        let result = substitute(regex, &self.target, model)
+            .ok_or_else(|| Error::bad_request("Model override capture did not match"))?;
         if result.trim().is_empty()
             || result.contains(';')
             || result.bytes().any(|b| b.is_ascii_control())
@@ -299,7 +316,10 @@ mod tests {
         );
         assert!(rules(&[("a*", "b"), ("*a", "c")]).is_err());
         assert!(rules(&[("a", "b"), ("b", "a")]).is_err());
-        assert_eq!(rules(&[("*", "*")]).unwrap().resolve("a").unwrap(), "a");
+        assert!(rules(&[("*", "*")]).is_err());
+        let overrides = rules(&[("ab*", "*ba")]).unwrap();
+        let error = overrides.resolve("aba").unwrap_err();
+        assert!(error.to_string().contains("cycle"), "{error}");
         assert!(rules(&[("a*", "b*"), ("b*", "a*")]).is_err());
         assert!(rules(&[("a*", "aa*")]).is_err());
     }

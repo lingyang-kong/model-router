@@ -285,9 +285,10 @@ async fn codex_multiagent_requests_are_rewritten_and_responses_restored() {
     let config = parse_config(&json!({
         "clients":{"codex":{"provider":"parent","format":"codex"},"openai":{"provider":"parent","format":"codex"},"anthropic":{"provider":"parent","format":"codex"}},"providers": {
             "parent":{"base_url":parent_server.url,"auth":"none","http_headers":{"x-upstream-key":"parent-secret"},"catalog":{"file":"parent.json","format":"codex"}},
-            "worker":{"base_url":worker_server.url,"auth":"none","http_headers":{"x-upstream-key":"worker-secret"},"catalog":{"file":"worker.json","format":"codex"},"hidden_models":["hidden-*"]},
+            "worker":{"base_url":worker_server.url,"auth":"none","http_headers":{"x-upstream-key":"worker-secret"},"catalog":{"file":"worker.json","format":"codex"}},
             "unknown":{"base_url":unknown_server.url,"auth":"none","http_headers":{"x-upstream-key":"unknown-secret"},"catalog":{"file":"unknown.json","format":"codex"}}
         },
+        "model_overrides":{"hidden-*":""},
         "routes":[{"path":"/models","action":"catalog"},{"path_prefix":"/responses","action":"model"}]
     }).to_string(), root.path()).unwrap();
     let gateway = serve(router(config).unwrap()).await;

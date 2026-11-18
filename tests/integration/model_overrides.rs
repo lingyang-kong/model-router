@@ -59,7 +59,12 @@ async fn fixture() -> (
 ) {
     fixture_with_overrides(json!({
         "gpt-5.6-*": "gpt-6-*",
-        "gpt-6-sol": "gpt-6.1-sol"
+        "gpt-{6,6.1}-sol": "gpt-6.2-sol",
+        "worker-*": "gpt-6-*",
+        "quick": "Qwen",
+        "Qwen": "qwen-inference",
+        "retired": "hidden",
+        "hidden": ""
     }))
     .await
 }
@@ -78,7 +83,10 @@ async fn fixture_with_overrides(
         "model_overrides": overrides,
         "providers": {
             "old": {"base_url": old.url, "auth": "none", "models": {"gpt-5.6-luna": {}}},
-            "new": {"base_url": new.url, "auth": "none", "models": {"gpt-6-luna": {}, "gpt-6.1-sol": {}}}
+            "new": {
+                "base_url": new.url, "auth": "none",
+                "models": {"gpt-6-luna": {}, "gpt-6.2-sol": {}, "Qwen": {}}
+            }
         },
         "clients": {"codex": {"provider": "old"}, "openai": {"provider": "old"}, "anthropic": {"provider": "old"}},
         "routes": [{"path": "/responses", "action": "model"}, {"action": "forward"}]
@@ -88,7 +96,7 @@ async fn fixture_with_overrides(
 }
 
 #[tokio::test]
-async fn http_override_selects_target_and_preserves_unmatched_and_forward_requests() {
+async fn http_overrides_follow_final_ownership_and_preserve_forward_requests() {
     let (gateway, _old, _new) = fixture().await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     for (header, value) in [
@@ -96,13 +104,20 @@ async fn http_override_selects_target_and_preserves_unmatched_and_forward_reques
         ("originator", "other"),
         ("anthropic-version", "2023-06-01"),
     ] {
-        for (model, target) in [
-            ("gpt-5.6-luna", "gpt-6-luna"),
-            ("gpt-5.6-sol", "gpt-6.1-sol"),
+        for (model, target, provider) in [
+            ("gpt-5.6-luna", "gpt-6-luna", "new"),
+            ("gpt-5.6-sol", "gpt-6.2-sol", "new"),
+            ("gpt-6.1-sol", "gpt-6.2-sol", "new"),
+            ("worker-luna", "gpt-6-luna", "new"),
+            ("worker-unknown", "gpt-6-unknown", "old"),
+            ("quick", "qwen-inference", "old"),
+            ("retired", "hidden", "old"),
+            ("hidden", "hidden", "old"),
         ] {
             let response: Value = client
                 .post(gateway.url.clone() + "/responses")
                 .header(header, value)
+                .header("x-codex-routing-hint", "other=kept;model=gpt-5.6-luna")
                 .json(&json!({"model":model,"input":"hello"}))
                 .send()
                 .await
@@ -112,7 +127,13 @@ async fn http_override_selects_target_and_preserves_unmatched_and_forward_reques
                 .json()
                 .await
                 .unwrap();
-            assert_eq!(response["provider"], "new");
+            assert_eq!(response["provider"], provider);
+            if value == "codex_cli_rs" {
+                assert_eq!(
+                    response["headers"]["x-codex-routing-hint"],
+                    "other=kept;model=gpt-6-luna"
+                );
+            }
             let body: Value = serde_json::from_str(response["body"].as_str().unwrap()).unwrap();
             assert_eq!(body["model"], target);
             assert_eq!(body["input"], "hello");
@@ -174,42 +195,59 @@ async fn websocket_override_rewrites_hint_and_frames_and_switches_provider() {
     request
         .headers_mut()
         .insert("originator", "codex_cli_rs".parse().unwrap());
-    request.headers_mut().insert(
-        "x-codex-routing-hint",
-        "model=gpt-5.6-luna".parse().unwrap(),
-    );
+    request
+        .headers_mut()
+        .insert("x-codex-routing-hint", "model=gpt-5.6-sol".parse().unwrap());
     let (mut socket, _) = connect_async(request).await.unwrap();
     for (body, expected_provider, expected_model, expected_hint) in [
         (
             json!({"type":"response.create", "model":"gpt-5.6-luna"}),
             "new",
             Some("gpt-6-luna"),
-            "model=gpt-6-luna",
+            "model=gpt-6.2-sol",
         ),
         (
             json!({"type":"response.create"}),
             "new",
             None,
-            "model=gpt-6-luna",
+            "model=gpt-6.2-sol",
         ),
         (
-            json!({"type":"response.create", "model":"gpt-5.7-luna"}),
-            "old",
-            Some("gpt-5.7-luna"),
-            "model=gpt-5.7-luna",
+            json!({"type":"response.create", "model":"worker-luna"}),
+            "new",
+            Some("gpt-6-luna"),
+            "model=gpt-6.2-sol",
         ),
         (
             json!({"type":"response.create", "model":"gpt-5.6-sol"}),
             "new",
-            Some("gpt-6.1-sol"),
-            "model=gpt-6.1-sol",
+            Some("gpt-6.2-sol"),
+            "model=gpt-6.2-sol",
+        ),
+        (
+            json!({"type":"response.create", "model":"retired"}),
+            "old",
+            Some("hidden"),
+            "model=hidden",
+        ),
+        (
+            json!({"type":"response.create", "model":"hidden"}),
+            "old",
+            Some("hidden"),
+            "model=hidden",
         ),
         (
             json!({"type":"response.create", "model":"gpt-5.6-luna"}),
             "new",
             Some("gpt-6-luna"),
+            "model=gpt-6-luna",
+        ),
+        (
+            json!({"type":"response.create", "model":"gpt-5.6-sol"}),
+            "new",
+            Some("gpt-6.2-sol"),
             // Both models use this connection; its handshake remains fixed.
-            "model=gpt-6.1-sol",
+            "model=gpt-6-luna",
         ),
     ] {
         socket
@@ -244,6 +282,16 @@ async fn conflicts_outside_startup_analysis_fail_before_http_and_websocket_infer
             assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
             assert!(response.text().await.unwrap().contains(expected_error));
         }
+        let response = client
+            .post(gateway.url.clone() + "/responses")
+            .header("originator", "codex_cli_rs")
+            .header("x-codex-routing-hint", "model=a9x")
+            .json(&json!({"model":"safe"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        assert!(response.text().await.unwrap().contains(expected_error));
         let mut request = (gateway.url.replace("http:", "ws:") + "/responses")
             .into_client_request()
             .unwrap();

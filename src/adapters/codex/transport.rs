@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 
 use crate::protocol::item_type;
 use crate::{
-    body::{BufferedRequest, request_model, rewrite_model, rewritten_body},
+    body::{BufferedRequest, rewritten_body},
     config::Provider,
     error::{Error, Result},
     router::RouterState,
@@ -33,17 +33,8 @@ pub(crate) async fn forward(
     origin: Option<&Arc<Provider>>,
 ) -> Result<Response> {
     let buffered = BufferedRequest::collect(body, &parts.headers).await?;
-    let original_model = request_model(buffered.decoded())?;
-    let resolved = original_model
-        .as_deref()
-        .map(|model| state.config.model_overrides.resolve(model))
-        .transpose()?;
-    let model = resolved.as_deref();
-    let overridden = if model != original_model.as_deref() {
-        Some(rewrite_model(buffered.decoded(), model.unwrap())?)
-    } else {
-        None
-    };
+    let (model, overridden) = buffered.resolve_model(&state.config.model_overrides)?;
+    let model = model.as_deref();
     super::override_model_hint(&mut parts.headers, &state.config.model_overrides)?;
     let decoded = overridden.as_deref().unwrap_or_else(|| buffered.decoded());
     let provider = state.resolve_provider(model, origin).await?;

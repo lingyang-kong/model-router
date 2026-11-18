@@ -13,8 +13,8 @@ use crate::protocol::{header, token};
 use crate::{
     Config,
     adapters::{CatalogFormat, Client, ClientKind},
-    body::{inspect_body, stream_body},
-    catalog::{CatalogState, ModelRegistry, load_manual_models},
+    body::{BufferedRequest, rewritten_body, stream_body},
+    catalog::CatalogState,
     config::{Provider, RouteAction, header_has_token, is_loopback_url, sanitize_headers},
     error::{Error, Result},
     websocket,
@@ -78,17 +78,8 @@ impl RouterState {
     }
 }
 
-pub fn router(config: Config) -> anyhow::Result<Router> {
-    let models = if config
-        .routes
-        .iter()
-        .any(|route| !matches!(route.action, RouteAction::Forward { .. }))
-    {
-        load_manual_models(&config)?
-    } else {
-        ModelRegistry::new()
-    };
-    let catalog = CatalogState::new(&config, models)?;
+pub fn router(mut config: Config) -> anyhow::Result<Router> {
+    let catalog = CatalogState::load(&mut config)?;
     let state = RouterState {
         config,
         catalog: RwLock::new(catalog),
@@ -155,11 +146,19 @@ async fn forward_http(
     format: CatalogFormat,
 ) -> Result<Response> {
     let (mut parts, body) = request.into_parts();
-    let (model, body) = match action {
+    let (provider, body) = match action {
         RouteAction::Catalog {} => {
             return state.catalog_response(parts, origin, format).await;
         }
-        RouteAction::Forward { .. } => (None, stream_body(body)),
+        RouteAction::Forward { provider } => {
+            let provider = provider
+                .as_deref()
+                .map(|name| state.config.provider(name))
+                .transpose()?
+                .or(origin)
+                .expect("forward route has a provider");
+            (Arc::clone(provider), stream_body(body))
+        }
         RouteAction::Model { .. } if adapter.is_some() => {
             return adapter
                 .unwrap()
@@ -167,14 +166,15 @@ async fn forward_http(
                 .await;
         }
         RouteAction::Model { .. } => {
-            inspect_body(body, &mut parts.headers, &state.config.model_overrides).await?
+            let buffered = BufferedRequest::collect(body, &parts.headers).await?;
+            let (model, rewritten) = buffered.resolve_model(&state.config.model_overrides)?;
+            let provider = state.resolve_provider(model.as_deref(), origin).await?;
+            let body = match rewritten {
+                Some(bytes) => rewritten_body(bytes, &mut parts.headers),
+                None => buffered.into_body(),
+            };
+            (provider, body)
         }
-    };
-    let provider = match action {
-        RouteAction::Forward {
-            provider: Some(name),
-        } => Arc::clone(state.config.provider(name)?),
-        _ => state.resolve_provider(model.as_deref(), origin).await?,
     };
     let (client, request) = state.prepare_request(&provider, origin, &parts, body)?;
     let response = client.execute(request).await.map_err(Error::bad_gateway)?;

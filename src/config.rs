@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     env,
     path::{Path, PathBuf},
@@ -7,19 +8,19 @@ use std::{
 
 use anyhow::{Context, bail};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Uri};
-use globset::{GlobSet, GlobSetBuilder};
 use serde::{Deserialize, Deserializer, de::Error as _};
 use serde_json::{Map, Value};
 use url::{Host, Url};
 
+use crate::model_overrides::ModelOverrides;
 use crate::protocol::{header, token};
 use crate::{
     adapters::{CatalogFormat, ClientKind},
     authentication::Authentication,
     capabilities::Capabilities,
+    catalog::CatalogState,
     error::{Error, Result},
 };
-use crate::{model_overrides::ModelOverrides, model_pattern::compile_glob};
 
 const CONFIG_PATH_ENV: &str = "MODEL_ROUTER_CONFIG";
 const CONFIG_TOML_ENV: &str = "MODEL_ROUTER_CONFIG_TOML";
@@ -69,8 +70,6 @@ pub(crate) struct Provider {
     pub defaults: ModelSettings,
     #[serde(default)]
     pub models: BTreeMap<String, ModelSettings>,
-    #[serde(default, deserialize_with = "deserialize_hidden_models")]
-    pub hidden_models: GlobSet,
     #[serde(default, deserialize_with = "deserialize_static_headers")]
     http_headers: Vec<(HeaderName, HeaderValue)>,
     #[serde(default, deserialize_with = "deserialize_headers")]
@@ -78,6 +77,7 @@ pub(crate) struct Provider {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConfigDocument {
     providers: BTreeMap<String, Provider>,
     #[serde(default)]
@@ -142,18 +142,6 @@ pub(crate) enum RouteAction {
     Forward { provider: Option<String> },
     Model {},
     Catalog {},
-}
-
-fn deserialize_hidden_models<'de, D: Deserializer<'de>>(
-    deserializer: D,
-) -> std::result::Result<GlobSet, D::Error> {
-    let invalid =
-        |error: globset::Error| D::Error::custom(format!("Invalid hidden_models: {error}"));
-    let mut builder = GlobSetBuilder::new();
-    for pattern in Vec::<String>::deserialize(deserializer)? {
-        builder.add(compile_glob(&pattern).map_err(invalid)?);
-    }
-    builder.build().map_err(invalid)
 }
 
 fn deserialize_method<'de, D: Deserializer<'de>>(
@@ -231,9 +219,19 @@ pub struct Config {
 }
 
 impl Config {
+    /// Validate startup data and report concrete rewrites, including local catalog models.
+    pub fn check_config(mut self) -> anyhow::Result<BTreeMap<String, String>> {
+        CatalogState::load(&mut self)?;
+        Ok(self.model_overrides.into_resolved())
+    }
+
     /// Concrete override chains resolved at startup; wildcard domains may contain more IDs.
     pub fn resolved_model_overrides(&self) -> &BTreeMap<String, String> {
         self.model_overrides.resolved()
+    }
+
+    pub(crate) fn resolve_model<'a>(&self, model: Option<&'a str>) -> Result<Option<Cow<'a, str>>> {
+        model.map(|id| self.model_overrides.resolve(id)).transpose()
     }
 
     pub fn from_env() -> anyhow::Result<Self> {
@@ -256,7 +254,7 @@ impl Config {
     pub fn from_toml(text: &str, root: &Path) -> anyhow::Result<Self> {
         let ConfigDocument {
             mut providers,
-            model_overrides,
+            mut model_overrides,
             clients,
             routes,
         } = toml::from_str(text).context("Invalid router configuration")?;
@@ -303,6 +301,11 @@ impl Config {
                     }
                     _ => bail!("Catalog sources require exactly one of file or path"),
                 }
+            }
+            for id in provider.models.keys() {
+                model_overrides.validate_and_cache(id).with_context(|| {
+                    format!("Invalid model override for {id:?} in provider {name:?}")
+                })?;
             }
         }
         if routes.is_empty() {
@@ -515,12 +518,13 @@ mod tests {
             [[routes]]
             action = "model"
         "#;
-        for mappings in [r#"a = "b""#, r#"a = "a""#, "a = 'b'\nb = 'c'", ""] {
+        for mappings in [r#"a = "b""#, r#"a = """#, "a = 'b'\nb = 'c'", ""] {
             let text = format!("{base}\n[model_overrides]\n{mappings}");
             assert!(Config::from_toml(&text, Path::new(".")).is_ok());
         }
         for mappings in [
             r#""" = "b""#,
+            r#"a = "a""#,
             r#"a = " ""#,
             "a = 'b'\nb = 'a'",
             "'[' = 'b'",
@@ -599,17 +603,21 @@ mod tests {
     }
 
     #[test]
-    fn hidden_models_compile_globs_with_alternatives_and_escapes() {
+    fn model_overrides_match_globs_with_alternatives_and_escapes() {
         let config = Config::from_toml(
             r#"
             [providers.test]
             base_url = "http://localhost:30000"
             auth = "none"
-            hidden_models = [
-                "gpt-{5.6-*,6-sol}", "vendor/model-?", "variant-[0-2]",
-                "letter-[!0-9]", "model{,-preview}", 'literal-\*',
-                "nested-{a,{b,c}}", "模型/*雪"
-            ]
+            [model_overrides]
+            "gpt-{5.6-*,6-sol}" = ""
+            "vendor/model-?" = ""
+            "variant-[0-2]" = ""
+            "letter-[!0-9]" = ""
+            "model{,-preview}" = ""
+            'literal-\*' = ""
+            "nested-{a,{b,c}}" = ""
+            "模型/*雪" = ""
             [[routes]]
             action = "forward"
             provider = "test"
@@ -617,7 +625,7 @@ mod tests {
             Path::new("."),
         )
         .unwrap();
-        let patterns = &config.providers["test"].hidden_models;
+        let patterns = &config.model_overrides;
         for (id, expected) in [
             ("gpt-5.6-sol", true),
             ("gpt-5.6-", true),
@@ -646,22 +654,25 @@ mod tests {
     }
 
     #[test]
-    fn malformed_hidden_model_patterns_fail_configuration_loading() {
+    fn malformed_model_override_patterns_fail_configuration_loading() {
         for pattern in ["[", "[z-a]", "model-{a,b", "model-}", "model-\\"] {
             let text = format!(
                 r#"
                 [providers.test]
                 base_url = "http://localhost:30000"
                 auth = "none"
-                hidden_models = [{}]
+                [model_overrides]
+                {} = ""
                 [[routes]]
                 action = "forward"
                 provider = "test"
                 "#,
                 toml::Value::String(pattern.to_owned())
             );
-            let error = Config::from_toml(&text, Path::new(".")).err().unwrap();
-            assert!(format!("{error:#}").contains("Invalid hidden_models"));
+            assert!(
+                Config::from_toml(&text, Path::new(".")).is_err(),
+                "{pattern}"
+            );
         }
     }
 }

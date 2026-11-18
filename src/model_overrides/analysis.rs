@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, BTreeSet, VecDeque},
+};
 
 use anyhow::Context;
 
@@ -20,7 +23,7 @@ pub(super) fn analyze(overrides: &ModelOverrides) -> anyhow::Result<BTreeMap<Str
                 witnesses.insert(source.join("x"));
             }
         }
-        if rule.captures.is_none() {
+        if rule.captures.is_none() && !rule.target[0].is_empty() {
             seeds.insert(rule.target[0].clone());
         }
     }
@@ -47,8 +50,8 @@ pub(super) fn analyze(overrides: &ModelOverrides) -> anyhow::Result<BTreeMap<Str
         }
         .with_context(|| format!("Invalid model override for {model:?}"))?;
         let Some(target) = target else { continue };
-        if target != model {
-            resolved.insert(model.clone(), target.into_owned());
+        if let Cow::Owned(target) = target {
+            resolved.insert(model.clone(), target);
         }
         for (index, rule) in overrides.rules.iter().enumerate() {
             if seen.len() >= MAX_CANDIDATES {
@@ -101,9 +104,8 @@ mod tests {
     }
 
     #[test]
-    fn accepts_noops_and_shrinking_rules_and_bounds_reverse_expansion() {
-        assert!(rules(&[("*", "*")]).is_ok());
-        let overrides = rules(&[("aa*", "a*"), ("a", "a")]).unwrap();
+    fn accepts_shrinking_rules_and_bounds_reverse_expansion() {
+        let overrides = rules(&[("aa*", "a*"), ("a", "")]).unwrap();
         assert_eq!(overrides.resolve_uncached("aaaa").unwrap(), "a");
         assert!(analyze(&overrides).unwrap().len() <= MAX_CANDIDATES);
     }

@@ -1,5 +1,6 @@
 use std::{borrow::Cow, io, sync::Arc, time::Duration};
 
+use anyhow::Context;
 use axum::{
     body::Body,
     extract::Request,
@@ -17,7 +18,7 @@ use crate::{
     adapters::CatalogFormat,
     capabilities::{self, Discovery},
     compression::{accepts_gzip, decode_body, encode_body},
-    config::{ModelReference, Provider, header_has_token, remove_body_headers},
+    config::{ModelReference, Provider, RouteAction, header_has_token, remove_body_headers},
     error::{Error, Result},
     router::{RouterState, stream_response},
 };
@@ -54,7 +55,20 @@ pub(crate) struct CatalogState {
 }
 
 impl CatalogState {
-    pub fn new(config: &Config, models: ModelRegistry) -> Result<Self> {
+    pub(crate) fn load(config: &mut Config) -> anyhow::Result<Self> {
+        let models = if config
+            .routes
+            .iter()
+            .any(|route| !matches!(route.action, RouteAction::Forward { .. }))
+        {
+            load_manual_models(config)?
+        } else {
+            ModelRegistry::new()
+        };
+        Ok(Self::new(config, models)?)
+    }
+
+    fn new(config: &Config, models: ModelRegistry) -> Result<Self> {
         let mut local_routes = IndexMap::new();
         let configured = config
             .providers
@@ -129,7 +143,7 @@ fn resolve_metadata(provider: &Provider, model: &Value, format: CatalogFormat) -
     Ok(resolved)
 }
 
-pub(crate) fn load_manual_models(config: &Config) -> Result<ModelRegistry> {
+fn load_manual_models(config: &mut Config) -> anyhow::Result<ModelRegistry> {
     let mut registry = ModelRegistry::new();
     for provider in config.providers.values() {
         let Some(settings) = &provider.catalog else {
@@ -142,6 +156,15 @@ pub(crate) fn load_manual_models(config: &Config) -> Result<ModelRegistry> {
         for model in settings.format.models(&mut document)? {
             let metadata = resolve_metadata(provider, model, settings.format)?;
             let id = settings.format.model_id(&metadata)?.to_owned();
+            config
+                .model_overrides
+                .validate_and_cache(&id)
+                .with_context(|| {
+                    format!(
+                        "Invalid model override for {id:?} in catalog {}",
+                        file.display()
+                    )
+                })?;
             validate_ownership(&registry, &id, provider)?;
             registry.insert(
                 id,
@@ -413,6 +436,7 @@ impl RouterState {
             let donors = &donors;
             let incoming_headers = &incoming_headers;
             async move {
+                let hidden = self.config.model_overrides.is_match(id);
                 if !entry.listed && output == CatalogFormat::Codex {
                     return Ok(None);
                 }
@@ -456,7 +480,7 @@ impl RouterState {
                     base,
                     &capabilities,
                 )?;
-                if output == CatalogFormat::Codex && !entry.provider.hidden_models.is_match(id) {
+                if output == CatalogFormat::Codex && !hidden {
                     let probe_responses_lite = capabilities.responses_lite.is_none()
                         && projected
                             .as_ref()
@@ -532,7 +556,7 @@ impl RouterState {
                         }
                     }
                 }
-                if entry.provider.hidden_models.is_match(id) {
+                if hidden {
                     return Ok(None);
                 }
                 Ok(projected)

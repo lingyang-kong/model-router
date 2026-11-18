@@ -29,9 +29,8 @@ async fn main() -> anyhow::Result<()> {
     };
     let config = Config::from_env()?;
     if check_config {
-        let report =
-            serde_json::json!({"resolved_model_overrides": config.resolved_model_overrides()});
-        let _ = router(config)?;
+        let resolved = config.check_config()?;
+        let report = serde_json::json!({"resolved_model_overrides": resolved});
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }

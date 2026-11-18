@@ -125,10 +125,10 @@ async fn gateway_with_provider_options(
                     "http_headers":{"x-provider-secret":"provider-secret"},
                     "discovery_urls":urls,
                     "capabilities":capabilities,
-                    "hidden_models":hidden_models,
                     "defaults":{"extends":{"provider":"donor","model":"donor-model"}},
                 }
             },
+            "model_overrides":hidden_models.into_iter().map(|model| (model, "")).collect::<std::collections::BTreeMap<_, _>>(),
             "routes":[
                 {"method":"GET","path":"/models","action":"catalog"},
                 {"action":"model"}

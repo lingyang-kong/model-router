@@ -16,8 +16,11 @@ async fn hidden_models_remain_routable_and_cannot_mask_ownership_conflicts() {
         } else {
             ("data", "id")
         };
-        *fixture.live.models.lock().unwrap() =
-            vec![json!({id: "visible-live"}), json!({id: "hidden-live"})];
+        *fixture.live.models.lock().unwrap() = vec![
+            json!({id: "visible-live"}),
+            json!({id: "hidden-live"}),
+            json!({id: "old-live"}),
+        ];
         std::fs::write(
             fixture.root.path().join("models.json"),
             json!({array: [{id: "visible-manual"}, {id: "hidden-manual"}]}).to_string(),
@@ -27,15 +30,14 @@ async fn hidden_models_remain_routable_and_cannot_mask_ownership_conflicts() {
             &json!({"providers": {
                 "live": {
                     "base_url": fixture._live_server.url, "auth": "none",
-                    "catalog": {"path": "/models", "format": format},
-                    "hidden_models": ["hidden-{live,manual}", "visible-manual"]
+                    "catalog": {"path": "/models", "format": format}
                 },
                 "manual": {
                     "base_url": fixture._manual_server.url, "auth": "none",
-                    "catalog": {"file": "models.json", "format": format},
-                    "hidden_models": ["h?dden-[mn]*", "visible-live"]
+                    "catalog": {"file": "models.json", "format": format}
                 }
-            }, "clients": {"openai": {"provider": "live", "format": format}}, "routes": [
+            }, "model_overrides": {"hidden-{live,manual}": "", "old-live": "absent", "live-alias": "visible-live"},
+            "clients": {"openai": {"provider": "live", "format": format}}, "routes": [
                 {"path": "/models", "action": "catalog"},
                 {"action": "model"}
             ]})
@@ -64,6 +66,10 @@ async fn hidden_models_remain_routable_and_cannot_mask_ownership_conflicts() {
             post("hidden-manual").send().await.unwrap().status(),
             StatusCode::OK
         );
+        assert_eq!(
+            post("live-alias").send().await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
         let document: Value = catalog().send().await.unwrap().json().await.unwrap();
         assert_eq!(
             document[array],
@@ -79,6 +85,18 @@ async fn hidden_models_remain_routable_and_cannot_mask_ownership_conflicts() {
             assert_eq!(response["provider"], provider);
             assert_eq!(response["body"], json!({"model": model}).to_string());
         }
+        let response = post("live-alias")
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap();
+        let response: Value = response.json().await.unwrap();
+        assert_eq!(response["provider"], "service-a");
+        assert_eq!(
+            response["body"],
+            json!({"model": "visible-live"}).to_string()
+        );
         *fixture.live.models.lock().unwrap() = vec![
             json!({id: "uncommitted-live"}),
             json!({id: "hidden-manual"}),
@@ -900,7 +918,9 @@ async fn native_catalog_envelopes_and_manual_fields_are_preserved() {
 #[tokio::test]
 async fn client_adapters_and_catalog_formats_are_isolated_on_the_same_endpoint() {
     let fixture = Fixture::new().await;
-    let mut providers = json!({"live":{"base_url":fixture._live_server.url,"auth":"none","catalog":{"path":"/models","format":"codex"}}});
+    let mut providers = json!({"live":{
+        "base_url":fixture._live_server.url,"auth":"none","catalog":{"path":"/models","format":"codex"}
+    }});
     for (format, key, id_key) in [
         ("codex", "models", "slug"),
         ("openai", "data", "id"),
@@ -925,7 +945,7 @@ async fn client_adapters_and_catalog_formats_are_isolated_on_the_same_endpoint()
         providers[format] = provider;
     }
     let config = parse_config(
-        &json!({"providers":providers,"clients":{
+        &json!({"providers":providers,"model_overrides":{"gpt-6-luna":""},"clients":{
             "codex":{"provider":"live"},
             "openai":{"provider":"live"},
             "anthropic":{"provider":"live"}
@@ -961,9 +981,9 @@ async fn client_adapters_and_catalog_formats_are_isolated_on_the_same_endpoint()
         assert_eq!(response.status(), StatusCode::OK);
         let response: Value = response.json().await.unwrap();
         let models = response[key].as_array().unwrap();
-        assert_eq!(models.len(), 5);
+        assert_eq!(models.len(), 4);
         assert!(models.iter().any(|model| model[id_key] == live_id));
-        assert!(models.iter().any(|model| model[id_key] == "gpt-6-luna"));
+        assert!(!models.iter().any(|model| model[id_key] == "gpt-6-luna"));
         for manual in ["codex/manual", "openai/manual", "anthropic/manual"] {
             assert!(models.iter().any(|model| model[id_key] == manual));
         }
@@ -1028,7 +1048,7 @@ async fn client_adapters_and_catalog_formats_are_isolated_on_the_same_endpoint()
     assert_eq!(response.status(), StatusCode::OK);
     let response: Value = response.json().await.unwrap();
     assert!(response.get("data").is_none());
-    assert_eq!(response["models"].as_array().unwrap().len(), 4);
+    assert_eq!(response["models"].as_array().unwrap().len(), 3);
     assert_eq!(fixture.live.seen.lock().unwrap().len(), seen + 1);
 }
 

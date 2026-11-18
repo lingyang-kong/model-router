@@ -34,7 +34,7 @@ pub(crate) struct WebSocketContext {
     pub provider: Arc<Provider>,
     pub headers: HeaderMap,
     pub uri: Uri,
-    /// The client's original handshake model, used when a request omits model.
+    /// The resolved handshake model, used when a request omits model.
     pub model: Option<String>,
     /// Credential owner, independent of the current upstream provider.
     pub origin: Option<Arc<Provider>>,

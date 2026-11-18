@@ -56,27 +56,62 @@ fn check_config_reports_derived_overrides_without_starting_a_listener() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(
-        report["resolved_model_overrides"]["gpt-5.6-sol"],
-        "gpt-6.1-sol"
-    );
-    assert_eq!(
-        report["resolved_model_overrides"]["gpt-6-sol"],
-        "gpt-6.1-sol"
-    );
-    assert!(
-        report["resolved_model_overrides"]
-            .get("gpt-5.6-x")
-            .is_none()
-    );
+    let overrides = &report["resolved_model_overrides"];
+    assert_eq!(overrides["gpt-5.6-astra"], "gpt-6.2-astra");
+    assert_eq!(overrides["gpt-6-astra"], "gpt-6.2-astra");
+    assert!(overrides.get("gpt-5.6-x").is_none());
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn check_config_reports_known_model_resolutions() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("models.json"),
+        r#"{"data":[{"id":"old-file"},{"id":"plain-file"},{"id":"hidden-file"}]}"#,
+    )
+    .unwrap();
+    let config = r#"
+[providers.api]
+base_url = "http://localhost:1"
+auth = "none"
+catalog = { file = "models.json", format = "openai" }
+[providers.api.models.old-configured]
+[providers.api.models.plain-configured]
+[providers.api.models.hidden-configured]
+[model_overrides]
+"old-*" = "new-*"
+"hidden-*" = ""
+[[routes]]
+action = "model"
+"#;
+    let output = command()
+        .arg("--check-config")
+        .current_dir(root.path())
+        .env_remove("MODEL_ROUTER_CONFIG")
+        .env("MODEL_ROUTER_CONFIG_TOML", config)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        report["resolved_model_overrides"],
+        serde_json::json!({
+            "old-configured": "new-configured",
+            "old-file": "new-file"
+        })
+    );
 }
 
 #[test]
 fn wildcard_cycles_and_growth_fail_at_startup() {
     for overrides in ["'a*' = 'b*'\n'b*' = 'a*'", "'a*' = 'aa*'"] {
         let config = format!(
-            "[model_overrides]\n{overrides}\n[providers.api]\nbase_url = 'http://localhost:1'\nauth = 'none'\n[[routes]]\naction = 'model'\n"
+            "[providers.api]\nbase_url = 'http://localhost:1'\nauth = 'none'\n[model_overrides]\n{overrides}\n[[routes]]\naction = 'model'\n"
         );
         for flag in [None, Some("--check-config")] {
             let mut command = command();
@@ -97,6 +132,50 @@ fn wildcard_cycles_and_growth_fail_at_startup() {
                 "{error}"
             );
             assert!(!error.contains("listening"));
+        }
+    }
+}
+
+#[test]
+fn check_config_validates_overrides_for_known_models() {
+    let root = tempfile::tempdir().unwrap();
+    for (id, rules, expected) in [
+        ("a9x", "'a[0-9]*' = 'one'\n'*[0-9]x' = 'two'", "Conflicting"),
+        ("aba", "'ab*' = '*ba'", "cycle"),
+    ] {
+        std::fs::write(
+            root.path().join("models.json"),
+            serde_json::json!({"data": [{"id": id}]}).to_string(),
+        )
+        .unwrap();
+        for (source, route, location) in [
+            (
+                format!("[providers.api.models.'{id}']"),
+                "action = 'forward'\nprovider = 'api'",
+                "provider \"api\"",
+            ),
+            (
+                "catalog = { file = 'models.json', format = 'openai' }".into(),
+                "action = 'model'",
+                "models.json",
+            ),
+        ] {
+            let config = format!(
+                "[providers.api]\nbase_url = 'http://localhost:1'\nauth = 'passthrough'\n{source}\n[model_overrides]\n{rules}\n[[routes]]\n{route}\n"
+            );
+            let output = command()
+                .arg("--check-config")
+                .current_dir(root.path())
+                .env_remove("MODEL_ROUTER_CONFIG")
+                .env("MODEL_ROUTER_CONFIG_TOML", config)
+                .output()
+                .unwrap();
+            assert!(!output.status.success(), "{source} {rules}");
+            let error = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                error.contains(expected) && error.contains(id) && error.contains(location),
+                "{error}"
+            );
         }
     }
 }

@@ -36,16 +36,13 @@ pub(crate) async fn forward(
             return Err(Error::bad_request("Catalog actions use HTTP requests"));
         }
     };
-    let original_model = model.map(str::to_owned);
-    let resolved = model
-        .map(|model| state.config.model_overrides.resolve(model))
-        .transpose()?;
-    let model = resolved.as_deref();
+    let model = state.config.resolve_model(model)?;
+    let model = model.map(std::borrow::Cow::into_owned);
     let provider = match action {
         RouteAction::Forward {
             provider: Some(name),
         } => Arc::clone(state.config.provider(name)?),
-        _ => state.resolve_provider(model, origin).await?,
+        _ => state.resolve_provider(model.as_deref(), origin).await?,
     };
     let mut downstream = hyper::upgrade::on(&mut request);
     let (mut parts, body) = request.into_parts();
@@ -79,7 +76,7 @@ pub(crate) async fn forward(
                 provider: Arc::clone(&provider),
                 headers: parts.headers,
                 uri: parts.uri,
-                model: original_model,
+                model,
                 origin: origin.cloned(),
             },
         )
